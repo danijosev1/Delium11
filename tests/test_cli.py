@@ -72,3 +72,29 @@ def test_bad_config_fails_fast(isolated_env: Path) -> None:
     result = runner.invoke(app, ["portfolio"])
     assert result.exit_code == 1
     assert "Configuration error" in result.output
+
+
+def test_db_init_creates_database(isolated_env: Path) -> None:
+    result = runner.invoke(app, ["db", "init"])
+    assert result.exit_code == 0
+    assert "Database ready" in result.output
+    assert (isolated_env / "data" / "delium.db").exists()
+
+
+def test_db_init_is_idempotent(isolated_env: Path) -> None:
+    first = runner.invoke(app, ["db", "init"])
+    second = runner.invoke(app, ["db", "init"])
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+    assert "up to date" in second.output
+
+
+def test_db_status_before_and_after_init(isolated_env: Path) -> None:
+    before = runner.invoke(app, ["db", "status"])
+    assert before.exit_code == 1
+    assert "No database yet" in before.output
+
+    runner.invoke(app, ["db", "init"])
+    after = runner.invoke(app, ["db", "status"])
+    assert after.exit_code == 0
+    assert "applied" in after.output

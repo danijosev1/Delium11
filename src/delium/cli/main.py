@@ -16,8 +16,9 @@ from rich.console import Console
 
 from delium import __version__
 from delium.config import ConfigError, load_config
+from delium.database import initialize_database
 from delium.utils.logging import configure_logging, get_logger
-from delium.utils.paths import ensure_directories
+from delium.utils.paths import ensure_directories, get_database_path
 
 app = typer.Typer(
     name="delium",
@@ -25,6 +26,8 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+db_app = typer.Typer(help="Database administration: init, status.", no_args_is_help=True)
+app.add_typer(db_app, name="db")
 console = Console()
 log = get_logger(__name__)
 
@@ -66,6 +69,42 @@ def _not_implemented(command: str) -> None:
         "This is project scaffolding — see ARCHITECTURE.md for the build order."
     )
     raise typer.Exit(code=1)
+
+
+@db_app.command("init")
+def db_init() -> None:
+    """Create the database, enable WAL + foreign keys, and apply migrations."""
+    db_path = get_database_path()
+    applied = initialize_database()
+    console.print(f"[green]Database ready[/green] at {db_path}")
+    if applied:
+        console.print(f"Applied {len(applied)} migration(s): {applied}")
+    else:
+        console.print("Already up to date — no migrations to apply.")
+
+
+@db_app.command("status")
+def db_status() -> None:
+    """Show the database location and which migrations have been applied."""
+    from delium.database import discover_migrations, get_applied_versions
+    from delium.database.connection import connect
+
+    db_path = get_database_path()
+    if not db_path.exists():
+        console.print(f"[yellow]No database yet[/yellow] at {db_path} — run `delium db init`.")
+        raise typer.Exit(code=1)
+
+    all_versions = [m.version for m in discover_migrations()]
+    conn = connect()
+    try:
+        applied = get_applied_versions(conn)
+    finally:
+        conn.close()
+
+    console.print(f"Database: {db_path}")
+    for version in all_versions:
+        mark = "[green]applied[/green]" if version in applied else "[yellow]pending[/yellow]"
+        console.print(f"  {version:04d}  {mark}")
 
 
 @app.command()

@@ -21,3 +21,12 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
     monkeypatch.setenv("DELIUM_DB_PATH", str(tmp_path / "data" / "delium.db"))
     monkeypatch.setenv("DELIUM_REPORTS_DIR", str(tmp_path / "reports"))
     yield tmp_path
+
+
+@pytest.fixture
+def initialized_db(isolated_env: Path) -> Path:
+    """An isolated environment with migrations already applied."""
+    from delium.database import initialize_database
+
+    initialize_database()
+    return isolated_env
