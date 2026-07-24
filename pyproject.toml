@@ -78,7 +78,7 @@ disallow_any_expr = false
 minversion = "8.0"
 addopts = "-ra -q --cov=delium --cov-report=term-missing"
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "tests"]
 
 [tool.coverage.run]
 source = ["src/delium"]

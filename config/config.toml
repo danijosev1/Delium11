@@ -8,6 +8,13 @@
 [marketplace]
 country = "US"
 
+[cache]
+product_ttl_hours = 24
+keyword_ttl_days = 7
+serp_ttl_days = 3
+review_ttl_days = 14
+category_ttl_days = 30
+
 [capital]
 max_launch_budget = 15000
 

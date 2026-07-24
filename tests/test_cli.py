@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from delium import __version__
@@ -98,3 +99,35 @@ def test_db_status_before_and_after_init(isolated_env: Path) -> None:
     after = runner.invoke(app, ["db", "status"])
     assert after.exit_code == 0
     assert "applied" in after.output
+
+
+def test_fetch_product_without_api_key_errors(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DELIUM_KEEPA_API_KEY", raising=False)
+    result = runner.invoke(app, ["fetch", "product", "B08EXAMPLE"])
+    assert result.exit_code == 1
+    assert "Provider error" in result.output
+
+
+def test_fetch_product_displays_summary(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import delium.cli.main as cli_main
+    from keepa_support import DEFAULT_ASIN, FakeTransport, keepa_product_body, ok
+
+    monkeypatch.setenv("DELIUM_KEEPA_API_KEY", "test-key")
+    transport = FakeTransport([ok(keepa_product_body())])
+
+    def fake_from_env(**_kwargs: object) -> object:
+        from delium.providers.keepa import KeepaClient
+
+        return KeepaClient("test-key", transport=transport, sleep=lambda _: None)
+
+    monkeypatch.setattr(cli_main.KeepaClient, "from_env", staticmethod(fake_from_env))
+
+    result = runner.invoke(app, ["fetch", "product", DEFAULT_ASIN])
+    assert result.exit_code == 0
+    assert DEFAULT_ASIN in result.output
+    assert "Test Silicone Tray" in result.output
+    assert "$20.99" in result.output  # latest price rendered from cents

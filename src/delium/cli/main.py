@@ -16,7 +16,10 @@ from rich.console import Console
 
 from delium import __version__
 from delium.config import ConfigError, load_config
-from delium.database import initialize_database
+from delium.database import initialize_database, repository
+from delium.database.connection import get_connection
+from delium.providers import ProviderError
+from delium.providers.keepa import KeepaClient
 from delium.utils.logging import configure_logging, get_logger
 from delium.utils.paths import ensure_directories, get_database_path
 
@@ -28,6 +31,8 @@ app = typer.Typer(
 )
 db_app = typer.Typer(help="Database administration: init, status.", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+fetch_app = typer.Typer(help="Fetch and cache raw data from providers.", no_args_is_help=True)
+app.add_typer(fetch_app, name="fetch")
 console = Console()
 log = get_logger(__name__)
 
@@ -105,6 +110,66 @@ def db_status() -> None:
     for version in all_versions:
         mark = "[green]applied[/green]" if version in applied else "[yellow]pending[/yellow]"
         console.print(f"  {version:04d}  {mark}")
+
+
+def _price_str(cents: int | None) -> str:
+    return f"${cents / 100:.2f}" if cents is not None else "—"
+
+
+@fetch_app.command("product")
+def fetch_product_cmd(
+    asin: Annotated[str, typer.Argument(help="Amazon ASIN, e.g. B08XXXXXXX.")],
+    force: Annotated[bool, typer.Option("--force", help="Bypass the cache and refetch.")] = False,
+) -> None:
+    """Fetch a product from Keepa (cache-first), store it, and show a summary."""
+    from delium.ingestion import fetch_product
+
+    initialize_database()  # idempotent — ensures the schema exists
+    config = load_config()
+
+    try:
+        client = KeepaClient.from_env()
+    except ProviderError as exc:
+        console.print(f"[bold red]Provider error:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    with get_connection() as conn:
+        run_id = repository.insert_run(conn, command="fetch.product", input_=asin)
+
+    status = "complete"
+    try:
+        view = fetch_product(asin, run_id=run_id, client=client, config=config, force=force)
+    except ProviderError as exc:
+        with get_connection() as conn:
+            repository.finish_run(conn, run_id, status="failed")
+        console.print(f"[bold red]Fetch failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    with get_connection() as conn:
+        repository.finish_run(
+            conn, run_id, status=status, data_cost_usd=view.cost_usd if view else 0.0
+        )
+
+    if view is None or not view.found:
+        console.print(f"[yellow]ASIN {asin} not found on Keepa.[/yellow]")
+        raise typer.Exit(code=1)
+
+    source = "cache" if view.from_cache else f"Keepa ({view.tokens_used} tokens)"
+    dims = (
+        f"{view.dims['length_mm']}×{view.dims['width_mm']}×{view.dims['height_mm']} mm"
+        if view.dims and {"length_mm", "width_mm", "height_mm"} <= view.dims.keys()
+        else "—"
+    )
+    console.print(f"[bold green]{view.asin}[/bold green]  ({source})")
+    console.print(f"  Title:      {view.title or '—'}")
+    console.print(f"  Brand:      {view.brand or '—'}")
+    console.print(f"  Category:   {view.category_path or '—'}")
+    console.print(f"  Dimensions: {dims}")
+    console.print(f"  Weight:     {f'{view.weight_g} g' if view.weight_g else '—'}")
+    console.print(f"  Images:     {view.images_count if view.images_count is not None else '—'}")
+    console.print(f"  Latest price: {_price_str(view.latest_price_cents)}")
+    console.print(f"  Latest BSR:   {view.latest_bsr if view.latest_bsr is not None else '—'}")
+    console.print(f"  History points: {view.history_points}")
 
 
 @app.command()

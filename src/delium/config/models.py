@@ -24,6 +24,17 @@ class MarketplaceConfig(StrictModel):
     country: str = "US"
 
 
+class CacheConfig(StrictModel):
+    """Per-class cache TTLs (docs/data-layer.md §2). A cached row older than its
+    TTL is refetched; freshness is judged from the newest raw_fetch."""
+
+    product_ttl_hours: float = Field(24, gt=0)
+    keyword_ttl_days: float = Field(7, gt=0)
+    serp_ttl_days: float = Field(3, gt=0)
+    review_ttl_days: float = Field(14, gt=0)
+    category_ttl_days: float = Field(30, gt=0)
+
+
 class CapitalConfig(StrictModel):
     max_launch_budget: float = Field(15000, gt=0)
 
@@ -112,6 +123,7 @@ class DeliumConfig(StrictModel):
     """Root configuration object loaded from config.toml."""
 
     marketplace: MarketplaceConfig = Field(default_factory=MarketplaceConfig)
+    cache: CacheConfig = Field(default_factory=CacheConfig)
     capital: CapitalConfig = Field(default_factory=CapitalConfig)
     preferences: PreferencesConfig = Field(default_factory=PreferencesConfig)
     assumptions: AssumptionsConfig = Field(default_factory=AssumptionsConfig)
