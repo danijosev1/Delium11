@@ -1,282 +1,291 @@
-# Delium — V1 Architecture
+# Delium — Personal AI Amazon Product Research System
 
-**AI Amazon Product Validation Report · MVP spec**
+**Private tool. One user: me. No SaaS, no auth, no billing.**
 
-One product, one mission type, one deliverable: a seller pastes an Amazon URL, ASIN, or keyword, and gets back a decision-ready validation report — opportunity score, demand, competition, review insights, profit estimate, risks, and a verdict. Built and maintained by one person. Target: **paying customers in 4–6 weeks.**
+The system's job: behave like an experienced 7-figure Amazon private-label seller with unlimited patience — scan markets, validate opportunities rigorously, mine customer pain, model profit honestly, and tell me **buy or avoid, why, and how I'd differentiate** — while I stay the decision-maker. It runs on my machine, writes reports to files, and never acts on its own.
 
-Everything in this document exists to answer two questions as cheaply as possible:
-
-1. Can we produce a report a seller trusts for under ~$3 in data + AI cost?
-2. Will a seller pay a monthly subscription for it?
-
-Anything that doesn't serve those questions is out of scope (see §12).
+Prior SaaS-era design docs are superseded (archived in `docs/archive/`). The provider research in `docs/data-economics.md` still applies — the same data stack, now at hobby cost.
 
 ---
 
-## 1. System Overview
+## 1. Design Principles
 
-```
-┌─────────────────────────────────────────────┐
-│              VERCEL (Next.js app)           │
-│  UI (App Router, RSC)  ·  Route handlers    │
-│  Inngest functions (agent workflow)         │
-└──────────┬───────────────────┬──────────────┘
-           │                   │
-           ▼                   ▼
-┌────────────────────┐   ┌──────────────────────────────┐
-│      SUPABASE      │   │          EXTERNAL            │
-│  Postgres + RLS    │   │  Amazon data provider (one)  │
-│  Auth (magic link, │   │  LLM provider (one, 2 tiers) │
-│  Google OAuth)     │   │  Stripe Checkout + webhooks  │
-└────────────────────┘   └──────────────────────────────┘
-```
-
-- **One deployable**: a single Next.js app on Vercel. No monorepo, no packages, no separate workers.
-- **Inngest** runs the multi-step agent workflow durably (retries, step memoization, concurrency limits) — no queue infrastructure to own. Inngest functions are served from a route handler inside the same app.
-- **Supabase** is the entire backend: Postgres, Auth, RLS, file storage if needed later.
-- **No Redis.** Caching lives in Postgres (§8). Add Redis only if a measured problem demands it.
-
-Monthly infra at zero scale: Vercel Hobby/Pro + Supabase Pro + Inngest free tier ≈ **$45–70/mo**, before data/AI usage.
+1. **Simplest thing that produces expert-grade judgment.** A CLI + a pipeline + files. No web app, no queue, no workers, no Docker. If a feature doesn't change a buy/avoid decision, it doesn't exist.
+2. **AI interprets; code calculates.** Every number that goes into a decision — fees, margins, ROI, opportunity score — is deterministic Python with my assumptions in a config file. LLMs never do arithmetic and never invent data.
+3. **Human in the loop by construction.** The system's only outputs are reports and a candidate database. It never orders samples, never messages suppliers, never touches money.
+4. **Evidence or it didn't happen.** Every qualitative claim cites the data behind it (review quotes, BSR history, keyword volumes, fetched-at timestamps). A claim with no citation is discarded before it reaches a report.
+5. **Cheap enough to run daily.** Target running cost: **~$75–110/month total** (Keepa €49 + DataForSEO ~$10 + review scraping ~$10–20 + LLM ~$10–30 at heavy personal use).
 
 ---
 
-## 2. Repository Structure
+## 2. Stack Decision
 
-Single Next.js app. One deliberate boundary: `src/agents/` imports nothing from Next.js, so it can lift into a dedicated worker later without a rewrite. Everything else is ordinary app code.
+**Python.** Next.js earns its keep when there's a UI and users; there's neither. Python wins on data wrangling, quick iteration, and running from cron.
+
+| Component | Choice | Why |
+|---|---|---|
+| Runtime | Python 3.12, single repo, `uv` for deps | One-command setup |
+| CLI | Typer | `delium validate B0XXXXXXX` is the whole UX |
+| Schemas | Pydantic | Every agent output validated; every data payload typed |
+| Storage | **SQLite** (one file, WAL mode) | Postgres/Supabase is unnecessary for one user; SQLite handles caching, candidates, history, full-text search over reviews. Revisit only if a second machine needs concurrent writes |
+| LLM | One vendor, two tiers (fast: Haiku-class / frontier: Sonnet-class), one thin `llm.py` | Same two-tier discipline as before; vendor swap is one line |
+| Data | Keepa API + DataForSEO (Amazon volume + SERP) + Apify/Unwrangle reviews | Verified stack from `docs/data-economics.md`; ~$1–1.50 per deep validation, near-zero for discovery scans |
+| Reports | Markdown files (+ optional self-contained HTML render) in `reports/`, git-ignored | Readable anywhere, diffable, permanent |
+| Scheduling | cron (optional) for watchlist refresh | No queue system |
+
+---
+
+## 3. Repository Layout
 
 ```
 delium/
-├── src/
-│   ├── app/
-│   │   ├── (marketing)/          # Landing + pricing (static)
-│   │   ├── (auth)/               # sign-in, callback
-│   │   ├── (app)/
-│   │   │   ├── dashboard/        # Mission list + "New validation" input
-│   │   │   ├── missions/[id]/    # Progress view → final report
-│   │   │   └── settings/         # Plan, billing portal link, account
-│   │   └── api/
-│   │       ├── inngest/          # Inngest serve endpoint (all agent workflow)
-│   │       └── webhooks/stripe/  # Checkout + subscription lifecycle
-│   ├── agents/                   # ★ Framework-agnostic (no Next.js imports)
-│   │   ├── run.ts                # Step runner: prompt → LLM → tools → zod-validated JSON
-│   │   ├── llm.ts                # One provider, two tiers: fast | frontier
-│   │   ├── orchestrator.ts       # Input parsing + scope decisions
-│   │   ├── product-analyst.ts    # Demand + competition + profit (one combined pass)
-│   │   ├── review-miner.ts       # Review theme extraction
-│   │   ├── report-writer.ts      # Final report composition + verdict
-│   │   ├── tools/                # fetchProduct, fetchKeyword, fetchReviews, feeCalculator
-│   │   └── prompts/              # Versioned prompt files
-│   ├── data/                     # Amazon data access
-│   │   ├── provider.ts           # Single provider adapter, normalized types
-│   │   └── cache.ts              # Read-through: Postgres cache → provider (§8)
-│   ├── lib/                      # supabase clients, auth helper, stripe, env (zod-validated)
-│   └── components/               # shadcn/ui + report blocks + progress UI
-├── supabase/migrations/          # Plain SQL migrations (Supabase CLI)
-├── evals/golden/                 # ~10 saved missions + expected verdicts (manual re-run)
-└── docs/decisions.md             # Running ADR log, one file
+├── delium/
+│   ├── cli.py                 # typer app: discover · validate · pains · watch · portfolio
+│   ├── config.py              # loads config.toml, validates with pydantic
+│   ├── db.py                  # SQLite schema + migrations (executescript on version bump)
+│   ├── data/                  # ALL external data access lives here
+│   │   ├── keepa.py           # products, BSR/price history, rank-drop sales proxy
+│   │   ├── dataforseo.py      # Amazon search volume, related keywords, SERP
+│   │   ├── reviews.py         # review sampling (~100/ASIN cap), graceful degradation
+│   │   └── cache.py           # read-through SQLite cache, TTLs, spend ledger
+│   ├── analysis/              # DETERMINISTIC — no LLM imports allowed here
+│   │   ├── fees.py            # FBA size tiers, fulfillment + referral fees, storage
+│   │   ├── profit.py          # landed cost, PPC drag, margin, ROI, payback
+│   │   ├── demand.py          # BSR-history → monthly-units range, trend, seasonality
+│   │   └── scoring.py         # opportunity score: weighted sub-scores, weights from config
+│   ├── agents/
+│   │   ├── runner.py          # prompt → LLM → pydantic-validated JSON, retry-once, budget caps
+│   │   ├── scout.py           # discovery: niche expansion + candidate triage
+│   │   ├── analyst.py         # market interpretation over fetched data
+│   │   ├── review_miner.py    # pain/praise themes, missing features, quotes
+│   │   ├── strategist.py      # verdict, differentiation plan, risks (frontier)
+│   │   └── prompts/           # versioned prompt text files
+│   └── report/
+│       └── render.py          # verdict → markdown/HTML from typed blocks
+├── config.toml                # my assumptions & preferences (§8)
+├── data/delium.db             # SQLite (git-ignored)
+├── reports/                   # generated reports (git-ignored)
+└── evals/golden/              # ~10 frozen runs for prompt-change sanity checks
 ```
 
+Three hard boundaries, enforced by convention and a lint rule:
+- `analysis/` never imports `agents/` (numbers stay deterministic).
+- `agents/` never calls providers directly — only via `data/` (caching + spend caps are structural).
+- `report/` renders typed blocks only — LLM prose never becomes HTML unescaped.
+
 ---
 
-## 3. The Product Flow
+## 4. The Five Commands (workflows, not services)
+
+### 4.1 `delium discover "<seed niche or keyword>"` — Product Discovery
+
+Find candidates worth validating. Cheap and wide.
 
 ```
-User input (URL | ASIN | keyword)
-   → POST server action: create mission (status=queued), check monthly limit
-   → inngest.send("mission/requested")
-
-Inngest workflow "run-mission":
-   step 1  Orchestrator   parse input → resolve target ASIN(s) + keyword set
-                          (URL→ASIN extraction, keyword→top-N ASINs via provider)
-   step 2  Data fetch     product data, keyword volumes, top-competitor set,
-                          review sample — via data/cache.ts (parallel steps)
-   step 3  Product Analyst demand + competition + profit model → structured JSON
-   step 4  Review Miner   complaint/praise themes + differentiation angles → JSON
-   step 5  Report Writer  compose report blocks, opportunity score (0–100),
-                          verdict (pursue | caution | avoid) + confidence
-   step 6  Persist report, mission status=complete
-
-UI polls mission status every 2s while running (simple SWR refresh — no
-websockets in V1). Median mission target: < 3 minutes.
+seed → DataForSEO: related keywords + volumes (hundreds, ~$0.05)
+     → filter by config thresholds (volume range, trend ≥ flat)
+     → SERP top-10 per surviving keyword → candidate ASIN pool
+     → Keepa quick stats per ASIN (price, BSR, reviews, seller count — flat-rate)
+     → deterministic triage score (demand/competition heuristics)
+     → Scout agent (fast tier): clusters candidates into niches, flags
+       underserved patterns (high volume + weak listings + low review moats),
+       kills obvious traps (brand-dominated, race-to-bottom pricing)
+     → writes candidates to DB + reports/discover-<slug>-<date>.md
+       (ranked shortlist with one-line theses)
 ```
 
-Failure handling is Inngest's: automatic per-step retries, then the workflow marks the mission `failed` with a user-readable reason and **does not count against the monthly limit**.
+Growing-niche detection: volume trend from DataForSEO + Keepa BSR trajectories of incumbents (improving BSR across a cluster = rising tide). Underserved: volume high, top-10 average review count low, listing quality gaps flagged by Scout.
 
----
+### 4.2 `delium validate <ASIN|keyword>` — Full Market Validation
 
-## 4. Database (Postgres, V1 tables only)
-
-All tenant tables carry `user_id` and RLS. One user = one account. No orgs, no teams, no roles.
-
-```sql
--- Tenant data (RLS: user_id = auth.uid())
-profiles          user_id PK → auth.users, email, created_at
-subscriptions     user_id PK, stripe_customer_id, stripe_subscription_id,
-                  plan ('starter'|'pro'), status, current_period_end,
-                  missions_used_this_period int, period_started_at
-missions          id, user_id, input_type ('url'|'asin'|'keyword'), input_raw,
-                  resolved_asin, status ('queued'|'running'|'complete'|'failed'),
-                  failure_reason, created_at, completed_at
-reports           id, user_id, mission_id UNIQUE, title,
-                  opportunity_score int, verdict, confidence numeric,
-                  body jsonb,          -- structured blocks (see §7)
-                  citations jsonb,     -- data points each claim rests on
-                  created_at
-
--- Shared cache, NOT tenant data (no RLS; server-role access only)
-cached_products   asin PK, marketplace, payload jsonb, fetched_at
-cached_keywords   phrase PK, marketplace, payload jsonb, fetched_at
-cached_reviews    asin PK, marketplace, payload jsonb, fetched_at
-
--- Ops
-mission_steps     id, mission_id, name, status, model, tokens_in, tokens_out,
-                  cost_usd numeric, started_at, finished_at
-                  -- cost visibility per mission; this is how we watch unit economics
-```
-
-Notes:
-
-- `missions_used_this_period` is the entire billing meter: incremented in the same transaction that marks a mission `complete`; reset by the Stripe `invoice.paid` webhook at period rollover. No usage_events, no rollups, no credits.
-- `mission_steps.cost_usd` is non-negotiable even in V1 — **cost-per-mission is the metric the business lives or dies on**, and it must be queryable from day one (`select avg(sum) ... group by mission`).
-- Cache tables are plain rows with `fetched_at` TTLs. No partitions, no warehouse, no time series. Historical snapshots come later if a feature needs them.
-
----
-
-## 5. Authentication
-
-- **Supabase Auth**: magic link + Google OAuth. Cookie sessions via `@supabase/ssr`, refreshed in middleware.
-- One helper — `getUser()` — used by every server action and route handler. No other auth code path exists.
-- **RLS on every tenant table** with the single policy pattern `user_id = auth.uid()`. Cache/ops tables are service-role only and contain no PII.
-- Authorization is trivial by construction: a user sees their own missions and reports, full stop. No roles, no invites, no API keys.
-
----
-
-## 6. AI Layer
-
-**One LLM provider. Two tiers.** (Recommendation: Anthropic — `claude-haiku-4-5` as **fast**, `claude-sonnet-5` as **frontier**. The choice is one line in `llm.ts`; what's structural is that there is exactly one vendor and two named tiers.)
-
-| Agent | Tier | Job | Output |
-|---|---|---|---|
-| **Orchestrator** | fast | Parse input, resolve ASIN/keywords, decide fetch scope | scope JSON |
-| **Product Analyst** | fast | Demand, competition, and profit in one pass over fetched data; fee math done by a deterministic calculator tool, not the model | analysis JSON |
-| **Review Miner** | fast | Extract complaint/praise themes + differentiation angles from a capped review sample (~100 reviews) | themes JSON |
-| **Report Writer** | frontier | Compose the report, score the opportunity, issue verdict + confidence, cite the data behind each claim | report blocks JSON |
-
-Rules that keep cost and quality under control:
-
-- **Structured output everywhere**: every agent's output is zod-validated JSON; a validation failure retries once with the error appended, then fails the step.
-- **Hard budgets per step**: max tokens and max tool calls enforced in `run.ts`. A mission has a total cost ceiling; exceeding it fails loudly rather than silently overspending.
-- **Only the Report Writer uses the frontier tier.** Target LLM cost: **< $0.30/mission**; alarm if the 7-day average exceeds $0.50.
-- **Untrusted-input rule**: review text and listing copy are untrusted. Agents that read them (Product Analyst, Review Miner) have read-only tools and their outputs are data, not instructions. Reports render as typed blocks — model output is never rendered as raw HTML.
-- **Profit estimates are deterministic**: FBA/referral fee calculation is a plain function with published fee tables. The model interprets; it never arithmetics.
-
-**Evals**: `evals/golden/` holds ~10 recorded missions (frozen tool outputs + expected verdict/score range). Re-run manually before any prompt or model change. No framework, no CI gate — a script and a diff.
-
----
-
-## 7. The Report (the actual product)
-
-`reports.body` is an ordered list of typed blocks the UI renders natively:
+The deep dive. This is the old "mission," richer now that COGS pressure is personal (~$1.50 data + ~$0.50 LLM per run is fine).
 
 ```
-verdict_banner    { verdict, opportunity_score, confidence, one_line_rationale }
-demand            { est_monthly_units_range, search_volume_summary, trend, seasonality_note }
-competition       { top_competitors[], review_moat_assessment, listing_quality_gaps }
-review_insights   { complaint_themes[], praise_themes[], differentiation_angles[] }
-profit            { price, est_landed_cost_range, fba_fees, referral_fee,
-                    margin_range, breakeven_acos }
-risks             { flags[] : ip | gated | seasonal | fragile | saturated | compliance }
-methodology       { data_sources, fetched_at timestamps, caveats }
+Stage 1  FETCH (parallel, all cached):
+         target + top ~20 competitors (Keepa, with 90-day+ history)
+         keyword set + volumes (DataForSEO), SERP structure
+         reviews: target + top 3 competitors × ~100 (~400 total)
+
+Stage 2  COMPUTE (deterministic):
+         demand.py    → monthly-units range per competitor, market size range,
+                        trend, seasonality flags (from BSR history, not vibes)
+         fees.py      → size tier, FBA + referral fees at market price
+         profit.py    → full unit economics (§6)
+         scoring.py   → sub-scores (§7) — provisional, pre-agent
+
+Stage 3  INTERPRET (agents, in order):
+         Analyst (fast)       → market structure: who wins and why, price bands,
+                                review moats, listing quality gaps, brand dominance
+         Review Miner (fast)  → §5 pain analysis on the fetched review sample
+         Strategist (frontier)→ reads ALL of the above → verdict + rationale +
+                                differentiation plan + risk register + what would
+                                change the verdict
+
+Stage 4  SCORE & RENDER:
+         scoring.py finalizes (differentiation sub-score uses Review Miner output)
+         report/render.py → reports/validate-<asin>-<date>.md
+         run + costs + verdict stored in DB
 ```
 
-- **Estimates are ranges with stated caveats, never false precision.** The `methodology` block is mandatory — trust is the product, and Helium 10 refugees will stress-test the numbers.
-- Every quantitative claim carries a citation id resolving into `reports.citations` (the raw data point + when it was fetched).
-- Export: print-styled page → browser PDF. No PDF pipeline in V1.
+### 4.3 `delium pains <ASIN>` — Customer Pain Deep-Dive
+
+Standalone review mining when I already like a market: fetches up to ~100 reviews each for target + up to 5 competitors, runs Review Miner with a larger budget, outputs a product-improvement brief (complaint frequency table, missing features, quote bank for supplier conversations).
+
+### 4.4 `delium watch` — Watchlist Refresh (cron, optional)
+
+For shortlisted ASINs/niches: re-pull Keepa + volumes weekly, recompute scores, append to history, and flag deltas worth attention ("competitor stockout 3 weeks," "review velocity doubled," "price war started") into `reports/watch-<date>.md`. Read-only; it never re-runs frontier analysis unless a delta trips a threshold.
+
+### 4.5 `delium portfolio` — Cross-Candidate View
+
+Ranks everything validated to date by score, capital required, and payback; surfaces the current top-5 with verdict summaries. Pure DB query + render, zero API cost.
 
 ---
 
-## 8. Amazon Data & Caching
+## 5. The Agents (four, and why not more)
 
-**This is the existential dependency — treat it as week-1 work, before UI.**
+| | **Scout** | **Analyst** | **Review Miner** | **Strategist** |
+|---|---|---|---|---|
+| Persona | Sourcing-savvy niche hunter | Competitive market analyst | Voice-of-customer researcher | 7-figure seller making a capital allocation call |
+| Tier | fast | fast | fast | **frontier (the only one)** |
+| Input | Keyword/volume/SERP tables + Keepa quick stats (as compact JSON) | Full competitor dataset + computed demand/price stats | Review sample (~400 texts) + product context | Every prior output + computed economics + scores |
+| Output (pydantic) | `niche_clusters[]`, `top_candidates[]{asin, thesis, flags}`, `rejected[]{asin, reason}` | `market_structure`, `price_bands`, `review_moat`, `listing_gaps[]`, `brand_dominance`, `citations[]` | `complaints[]{theme, frequency_pct, severity, quotes[]}`, `praise[]`, `missing_features[]`, `improvement_ideas[]`, `citations[]` | `verdict (buy\|avoid\|watch)`, `conviction (1-5)`, `rationale[]`, `differentiation_plan[]`, `risk_register[]{risk, likelihood, impact, mitigation}`, `verdict_changers[]` |
+| Token budget (in/out) | 30k / 3k | 40k / 4k | 60k / 4k | 30k / 5k |
+| ~Cost per run | $0.05 | $0.06 | $0.08 | $0.17 |
+| Tools | none — data pre-fetched into context | none | none | none |
 
-- **One provider** behind `data/provider.ts` with normalized types. Selection criteria, in order: (1) has search-volume + sales-estimate signals, not just page scrapes, (2) per-call price at our volumes, (3) rate limits compatible with a 3-minute mission. Evaluate Keepa + one of Rainforest/DataForSEO in week 1 **with a spreadsheet of real per-mission cost** before committing. SP-API is not part of V1 (not accessible, and doesn't carry research data).
-- **Read-through cache in Postgres** (`data/cache.ts`): check `cached_*` row and `fetched_at` TTL → hit returns instantly, miss calls the provider and upserts. TTLs: product data 24h, keyword volumes 7d, reviews 7d. Popular ASINs get cheap fast; cache hit rate is a dashboard number from day one.
-- **Sales estimates**: V1 uses the provider's estimates, relabeled as ranges with our caveats. We do not build our own BSR→units model yet — but every fetched data point lands in the cache tables, so the raw material accumulates for a proper model later (§13).
-- **Spend guards**: per-mission provider-call cap (Orchestrator sets scope; runner enforces), plus a monthly provider budget env var — at 80% an email alarm, at 100% new missions queue with an honest status message instead of silently failing.
-- Target data cost: **< $1.50/mission uncached**, falling with cache hit rate.
+Deliberate choices:
 
----
+- **No tool-calling.** The pipeline pre-fetches everything; agents receive compact, normalized JSON in context and return JSON. This removes the entire class of agent-loop failures, makes runs reproducible, and makes budgets exact. (If a stage needs more data, the *pipeline* fetches it, not the agent.)
+- **No Orchestrator agent.** The CLI command *is* the orchestration — a fixed pipeline needs no LLM planner. Input parsing (URL→ASIN, keyword detection) is a regex, not a model.
+- **Profit and scoring are not agents** (§6, §7). The Strategist receives their outputs and may *question* assumptions ("your $4.50 landed-cost guess looks optimistic for glass") but cannot alter the numbers.
+- **The Strategist must argue against itself**: its schema requires `verdict_changers` — the specific facts that would flip the verdict — and at least two entries in `risk_register` even on a `buy`. A buy with no named risks fails validation and retries.
 
-## 9. Payments & Billing
-
-- **Stripe Checkout** (hosted page) + **Stripe Customer Portal** (self-serve cancel/upgrade). We build no billing UI beyond two buttons.
-- **Two plans**: Starter (~$29/mo, 10 missions) · Pro (~$79/mo, 40 missions). Prices are hypotheses; the mechanism is fixed — flat monthly, hard mission limits, no overage, no credits, no metering.
-  - Sanity check: at ~$1.80 COGS/mission fully uncached, worst-case Pro gross margin ≈ 9% — real margin depends on cache hit rate and typical usage well under the cap. Watch `mission_steps.cost_usd` weekly and reprice/re-limit as facts arrive.
-- **Free trial**: 2 missions on signup, no card. The report is the demo.
-- **Enforcement**: mission creation checks `status='active'` and `missions_used_this_period < plan limit` → hard stop with upgrade prompt.
-- **Webhooks** (`/api/webhooks/stripe`): verify signature → persist raw event → apply. Handles `checkout.session.completed`, `invoice.paid` (reset counter), `customer.subscription.updated|deleted`. Idempotent by event id.
-
----
-
-## 10. Deployment, Environments, Observability
-
-- **Two environments.** Production and one staging (separate Supabase project, Stripe test mode, capped budgets). Vercel preview deploys point at staging. No per-PR databases.
-- **CI (GitHub Actions)**: typecheck → lint → unit tests (fee calculator, zod schemas, webhook handlers) → deploy. Migrations applied via Supabase CLI before promote; expand-then-contract for breaking changes.
-- **Config**: all env vars zod-validated at boot; missing secret fails the build.
-- **Observability, minimal but real**: Sentry (client + server) · Inngest dashboard (workflow runs, retries, failures — free) · `mission_steps` as the cost ledger. **Three alarms only**: mission failure rate > 10% (daily), avg mission cost > threshold (daily), provider monthly spend > 80% budget.
-- **Rollback**: Vercel instant rollback; migrations forward-safe so app rollback never needs a DB rollback.
+Anti-hallucination, systemwide: agents see only fetched data (no open-ended knowledge questions); every claim needs a `citation_id` referencing a stored data point; numeric fields in agent outputs are cross-checked against source data where possible (a quoted price must exist in the dataset within 1%); one retry with the validation error appended, then the run fails loudly. Missing data degrades explicitly: every report section carries `data_quality: full | partial | missing`, and thin evidence (e.g., 12 reviews retrieved) is stated in the section header, never papered over.
 
 ---
 
-## 11. Security (V1 scope)
+## 6. Profit Analysis (deterministic — `analysis/profit.py`)
 
-- RLS on every tenant table; service-role confined to `data/` and Inngest functions.
-- Stripe webhook signature verification; raw events persisted before processing.
-- PII footprint: email only. Cache tables hold public Amazon data, no PII.
-- Untrusted-content rule from §6: scraped text never gains tool access or renders as HTML.
-- Secrets in Vercel/Supabase env only; zod-validated. No secrets in the repo, ever.
-- Deferred deliberately: SOC 2, audit log, MFA, SSO — none blocks a first paying customer.
+All assumptions live in `config.toml`, versioned per run so every report is auditable against the assumptions that produced it.
 
----
+```
+Inputs:  market price (Keepa median of top-10), product dimensions/weight (Keepa),
+         category → referral fee %, my assumption set (below)
 
-## 12. Explicitly Out of Scope for V1
+Model:   landed_cost   = est. unit cost (config: default % of price, overridable
+                         per-run: --cost 4.20) + freight/unit + duty
+         fba_fees      = size-tier fulfillment fee + monthly storage/unit
+         referral      = category % × price
+         ppc_drag      = assumed TACOS % × price   (config, default conservative 15%)
+         returns       = category return-rate % × price
+         margin/unit   = price − all of the above
+         ROI           = margin ÷ landed_cost
+         payback       = launch capital (inventory + PPC ramp) ÷ monthly profit @ 
+                         conservative unit estimate (low end of demand range)
 
-Cut, with the trigger that brings each back:
+Output:  sensitivity table — margin/ROI across price ±15%, cost ±20%, TACOS 10–25% —
+         because the honest answer is a surface, not a point.
+```
 
-| Cut | Comes back when |
-|---|---|
-| Public API + API keys | An agency asks and offers money |
-| Multi-org, teams, roles, invites | A customer asks to add a teammate (≈1 week to add on top of `user_id` scoping) |
-| Credits, metering, overage billing | Hard limits demonstrably leave money on the table |
-| Multi-LLM routing / second vendor | Primary vendor reliability or cost forces it (one-line tier swap meanwhile) |
-| Critic agent, editable plans, HITL checkpoints | Report-quality complaints point at reasoning errors |
-| Data warehouse, partitions, time series | A feature needs history (trend charts, alerts) |
-| Vector memory / org knowledge | Repeat usage shows personalization demand |
-| Redis, QStash, websockets/Realtime | A measured latency or cost problem Postgres+polling can't solve |
-| Alerts, watchlists, Slack, niche discovery, listing audit | V1 mission retains paying users |
-| Eval framework in CI | Prompt regressions actually bite a customer |
+Hard gates (config): min margin 30%, min ROI 100%, max payback 6 months at the low demand estimate. Failing a gate doesn't hide the product — it caps the profitability sub-score and the Strategist must address it explicitly.
 
 ---
 
-## 13. Roadmap After First Revenue
+## 7. Opportunity Score (deterministic — `analysis/scoring.py`)
 
-1. **v1.1** — second mission type (niche discovery: keyword → ranked opportunity list), report sharing links, trend history on cached data.
-2. **v1.2** — watchlists + weekly re-validation email ("your niche moved"), teams.
-3. **v2** — continuous monitoring agents (the original vision's headline), our own BSR→units estimation model trained on accumulated cache data, public API.
+`score = Σ weightᵢ × sub_scoreᵢ` → 0–100. Weights in config (my risk appetite, not hardcoded):
 
-Each stage is funded by the previous one working. The V1 bet stays narrow on purpose: **one input box, one report, one price — shipped in weeks, instrumented to prove or kill the unit economics fast.**
+| Sub-score | Default weight | Computed from |
+|---|---|---|
+| Demand | 25 | Market size range, volume trend, seasonality penalty |
+| Competition | 25 | Review moat (median reviews top-10), seller count, brand dominance, listing quality gaps |
+| Differentiation | 20 | Review Miner: complaint frequency × severity × addressability of missing features |
+| Profitability | 20 | Margin/ROI/payback vs. gates, sensitivity robustness |
+| Risk | 10 (inverted) | Seasonality, fragility, gating, IP signals, price-war evidence, single-keyword dependence |
+
+Each sub-score's formula is documented in the report's methodology section with the input values, so a score of 71 is checkable by hand. The Strategist's verdict may disagree with the score ("scores 74 but avoid — category is one lawsuit-happy brand away from trouble"); disagreement is surfaced, never averaged away. **Score ranks; Strategist decides; I approve.**
 
 ---
 
-## 14. Build Plan (4–6 weeks)
+## 8. `config.toml` (the system's model of me)
 
-| Week | Deliverable |
-|---|---|
-| 1 | Provider bake-off with real cost spreadsheet · data adapter + Postgres cache · fee calculator |
-| 2 | Agent pipeline end-to-end in Inngest (CLI-triggered, no UI) · first full report JSON · golden fixtures started |
-| 3 | Auth + app shell + mission input + progress + report renderer |
-| 4 | Stripe Checkout + webhooks + limits · staging env · Sentry + alarms |
-| 5 | Prompt tuning against goldens · landing page + pricing · polish |
-| 6 | Buffer · soft launch to 10–20 sellers · watch cost ledger and verdict quality |
+```toml
+[marketplace]      country = "US"
+[capital]          max_launch_budget = 15000        # inventory + PPC ramp
+[preferences]      min_price = 18   max_price = 60  # fee-structure sweet spot
+                   avoid = ["oversized", "glass", "batteries", "topicals", "gated"]
+[assumptions]      default_cogs_pct = 0.25  freight_per_unit = 0.9  duty_pct = 0.05
+                   tacos_pct = 0.15  return_rate_default = 0.04
+[gates]            min_margin = 0.30  min_roi = 1.0  max_payback_months = 6
+[score_weights]    demand = 25  competition = 25  differentiation = 20
+                   profitability = 20  risk = 10
+[budgets]          max_data_usd_per_validate = 3.0  max_llm_usd_per_validate = 1.0
+                   monthly_spend_alarm_usd = 120
+```
 
-*Changes to this document go in `docs/decisions.md` — one paragraph per decision, dated.*
+Scout and Strategist receive `[preferences]` in context — the system learns my constraints from config, not from vector memory.
+
+---
+
+## 9. SQLite Schema (one file, seven tables)
+
+```
+runs            id, command, input, status, started_at, finished_at,
+                data_cost_usd, llm_cost_usd, config_snapshot (json)
+candidates      asin PK, marketplace, niche, source_run_id, triage_score,
+                status (new|shortlist|validated|rejected|watching), updated_at
+validations     id, run_id, asin, opportunity_score, sub_scores (json),
+                verdict, conviction, report_path, created_at
+watch_history   asin, captured_at, price, bsr, review_count, est_units_range
+cached_products asin PK, payload (json), fetched_at        # TTL 24h
+cached_keywords phrase PK, payload (json), fetched_at      # TTL 7d
+cached_reviews  asin PK, payload (json), review_count, fetched_at   # TTL 14d
+```
+
+`runs.config_snapshot` + cached payloads means any past verdict can be re-derived. `watch_history` accumulates my own time-series from day one — after a few months, trend analysis runs on my data before touching APIs.
+
+---
+
+## 10. Reports (the actual product)
+
+`validate` output structure (markdown, ~3–5 pages):
+
+```
+VERDICT BANNER   buy/avoid/watch · conviction 1–5 · opportunity score · one-line thesis
+SNAPSHOT         price band, est. market size range, top-10 table
+DEMAND           units ranges (methodology: Keepa rank-drops), trend, seasonality
+COMPETITION      moat table, brand dominance, listing gaps, who's beatable and why
+CUSTOMER PAIN    complaint table (theme · freq% · severity · sample quotes),
+                 missing features, improvement brief
+UNIT ECONOMICS   full waterfall + sensitivity table + gate results
+DIFFERENTIATION  Strategist's plan: the version of this product I would launch
+RISKS            register with likelihood/impact/mitigation + verdict_changers
+METHODOLOGY      every data source, fetched-at, sample sizes, config snapshot,
+                 sub-score formulas with inputs, all citations resolved
+```
+
+Numbers are always **ranges with stated method**. The methodology section is mandatory and generated, not written by the LLM.
+
+---
+
+## 11. Operating Cost & Cadence
+
+| Activity | Cadence | Cost |
+|---|---|---|
+| Keepa subscription | monthly | ~$54 flat |
+| `discover` run | 2–3/week | ~$0.10–0.30 each |
+| `validate` run | ~5–10/month | ~$1.50–2.50 each |
+| `watch` refresh | weekly cron | ~$0.10 |
+| **Total** | | **~$75–110/month** |
+
+Spend guards: per-run budget caps from config enforced in `data/cache.py` and `agents/runner.py`; monthly ledger in `runs`; alarm printed (and emailed if configured) past the threshold.
+
+---
+
+## 12. Build Order (~2–3 weeks of evenings)
+
+1. **Week 1:** `data/` adapters + SQLite cache + `analysis/fees.py`+`profit.py` (pure functions, unit-tested against Amazon's published fee tables). Manual smoke test: full data pull for 5 known ASINs, spend spreadsheet.
+2. **Week 2:** `validate` pipeline end-to-end — compute stages, then Analyst → Review Miner → Strategist, then the markdown renderer. Calibrate demand estimates against 2–3 products I know the real numbers for.
+3. **Week 3:** `discover` + Scout, `pains`, `watch` cron, `portfolio`, golden fixtures, config polish.
+
+Deferred until the tool earns it: HTML dashboard, supplier-sourcing helpers (Alibaba data), PPC keyword planning, multi-marketplace. Each gets added only when a real sourcing decision demands it.
