@@ -1,0 +1,81 @@
+# Delium configuration — my assumptions, preferences, and risk appetite.
+#
+# This file is the system's model of me (ARCHITECTURE.md §8). It is NOT
+# where API keys go — those live in `.env` (see .env.example). Every value
+# here has a documented default in delium.config.models; you only need to
+# override what you want to change.
+
+[marketplace]
+country = "US"
+
+[capital]
+max_launch_budget = 15000
+
+[preferences]
+min_price = 18
+max_price = 60
+avoid = ["oversized", "glass", "batteries", "topicals", "gated"]
+
+[assumptions]
+default_cogs_pct = 0.25
+cogs_optimistic_pct = 0.20
+cogs_pessimistic_pct = 0.32
+freight_per_unit = 0.90
+duty_pct = 0.05
+tacos_pct = 0.15
+return_rate_default = 0.04
+inventory_months = 2.5
+ppc_ramp_usd = 2000
+fixed_launch_usd = 1500
+packaging_dims_allowance = 0.10
+
+[stress]
+price_delta = -0.10
+cogs_delta = 0.15
+tacos_delta_pts = 0.05
+
+[gates]
+min_margin = 0.30
+min_roi = 1.00
+max_payback_months = 6
+risk_floor = 40
+differentiation_floor = 45
+
+[score_weights]
+demand = 25
+competition = 25
+differentiation = 20
+profitability = 20
+risk = 10
+
+[budgets]
+max_data_usd_per_validate = 3.0
+max_data_usd_per_discover = 0.5
+max_llm_usd_per_validate = 1.0
+monthly_spend_alarm_usd = 120
+
+[kill_rules]
+price_min = 15
+price_max = 70
+max_median_reviews = 3000
+max_brand_slots = 5
+fad_spike_ratio = 3.0
+capital_max = 20000
+capital_min = 2000
+borderline_band = 0.10
+
+[risk_deductions]
+ip = 40
+compliance = 30
+trend = 25
+seasonal = 20
+seasonal_unknown = 10
+returns = 20
+fragility = 20
+kw_concentration = 15
+market_hhi = 15
+supplier = 10
+
+[verdicts]
+buy_min = 75
+test_min = 60
