@@ -191,3 +191,56 @@ class ScenarioSet:
             "stressed": self.stressed,
             "worst_case": self.worst_case,
         }
+
+
+# ---------------------------------------------------------------------------
+# Listing analysis engine
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ListingInput:
+    """Observable, deterministic listing facts (counts/booleans/text lengths).
+
+    Every field is optional: an absent field lowers confidence, it is never
+    guessed. Populated from normalized product data + the Analyst's structured
+    rubric + SERP competitor prices."""
+
+    title: str | None = None
+    bullets: tuple[str, ...] | None = None
+    images_count: int | None = None
+    has_aplus: bool | None = None
+    has_brand_store: bool | None = None
+    has_video: bool | None = None
+    variation_count: int | None = None
+    review_count: int | None = None
+    rating: float | None = None
+    keywords: tuple[str, ...] | None = None  # target keywords for coverage
+    price_cents: int | None = None
+    competitor_prices_cents: tuple[int, ...] | None = None  # from SERP
+    brand: str | None = None
+
+
+@dataclass(frozen=True)
+class Subscore:
+    name: str
+    value: float | None  # None = could not be assessed (input missing)
+    weight: float
+    detail: str  # human-readable explanation of the raw input → value
+
+    @property
+    def available(self) -> bool:
+        return self.value is not None
+
+
+@dataclass(frozen=True)
+class ListingQualityReport:
+    overall_score: float  # 0-100, higher = better listing
+    confidence: Confidence
+    subscores: tuple[Subscore, ...]
+
+    @property
+    def missing(self) -> tuple[str, ...]:
+        return tuple(s.name for s in self.subscores if not s.available)
+
+    @property
+    def assessed(self) -> tuple[str, ...]:
+        return tuple(s.name for s in self.subscores if s.available)

@@ -8,17 +8,21 @@ competition, differentiation, risk, and scoring.
 """
 
 from delium.analysis.fees import FeeError, compute_fees, load_fee_table
+from delium.analysis.listing import compute_listing_quality
 from delium.analysis.models import (
     Confidence,
     Dimensions,
     FeeBreakdown,
     FeeTable,
     LaunchAssumptions,
+    ListingInput,
+    ListingQualityReport,
     ProfitInputs,
     ProfitResult,
     ScenarioAdjustment,
     ScenarioAssumptions,
     ScenarioSet,
+    Subscore,
 )
 from delium.analysis.profit import compute_profit, compute_scenarios, confidence_for
 
@@ -29,12 +33,16 @@ __all__ = [
     "FeeError",
     "FeeTable",
     "LaunchAssumptions",
+    "ListingInput",
+    "ListingQualityReport",
     "ProfitInputs",
     "ProfitResult",
     "ScenarioAdjustment",
     "ScenarioAssumptions",
     "ScenarioSet",
+    "Subscore",
     "compute_fees",
+    "compute_listing_quality",
     "compute_profit",
     "compute_scenarios",
     "confidence_for",
