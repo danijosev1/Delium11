@@ -19,6 +19,7 @@ from delium.config import ConfigError, load_config
 from delium.database import initialize_database, repository
 from delium.database.connection import get_connection
 from delium.providers import ProviderError
+from delium.providers.dataforseo import DataForSeoClient
 from delium.providers.keepa import KeepaClient
 from delium.utils.logging import configure_logging, get_logger
 from delium.utils.paths import ensure_directories, get_database_path
@@ -170,6 +171,59 @@ def fetch_product_cmd(
     console.print(f"  Latest price: {_price_str(view.latest_price_cents)}")
     console.print(f"  Latest BSR:   {view.latest_bsr if view.latest_bsr is not None else '—'}")
     console.print(f"  History points: {view.history_points}")
+
+
+@fetch_app.command("keywords")
+def fetch_keywords_cmd(
+    keyword: Annotated[str, typer.Argument(help="Seed keyword, e.g. 'silicone baby food tray'.")],
+    force: Annotated[bool, typer.Option("--force", help="Bypass the cache and refetch.")] = False,
+) -> None:
+    """Fetch a keyword's volume, related keywords, and Amazon SERP (cache-first)."""
+    from delium.ingestion import fetch_keywords
+
+    initialize_database()  # idempotent
+    config = load_config()
+
+    try:
+        client = DataForSeoClient.from_env()
+    except ProviderError as exc:
+        console.print(f"[bold red]Provider error:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    with get_connection() as conn:
+        run_id = repository.insert_run(conn, command="fetch.keywords", input_=keyword)
+
+    try:
+        result = fetch_keywords(keyword, run_id=run_id, client=client, config=config, force=force)
+    except ProviderError as exc:
+        with get_connection() as conn:
+            repository.finish_run(conn, run_id, status="failed")
+        console.print(f"[bold red]Fetch failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    with get_connection() as conn:
+        repository.finish_run(conn, run_id, status="complete", data_cost_usd=result.cost_usd)
+
+    source = "cache" if result.from_cache else f"DataForSEO (${result.cost_usd:.4f})"
+    volume = f"{result.seed_volume:,}" if result.seed_volume is not None else "—"
+    console.print(f"[bold green]{result.seed}[/bold green]  ({source})")
+    console.print(f"  Search volume: {volume}")
+    console.print("  Competition:   n/a (Amazon volume endpoint returns volume only)")
+
+    console.print("  Top related keywords:")
+    ranked = sorted(result.related, key=lambda k: (k.volume is None, -(k.volume or 0)))
+    for kw in ranked[:10]:
+        vol = f"{kw.volume:,}" if kw.volume is not None else "—"
+        console.print(f"    {kw.phrase}  ({vol})")
+    if not ranked:
+        console.print("    —")
+
+    console.print("  Top Amazon SERP ASINs:")
+    for item in sorted(result.serp, key=lambda s: s.position)[:10]:
+        tag = " [dim](sponsored)[/dim]" if item.sponsored else ""
+        console.print(f"    #{item.position:<3} {item.asin}{tag}")
+    if not result.serp:
+        console.print("    —")
 
 
 @app.command()

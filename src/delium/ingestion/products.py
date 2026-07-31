@@ -14,10 +14,11 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 from delium.config.models import DeliumConfig
 from delium.database import get_connection, repository
+from delium.ingestion.freshness import is_fresh
 from delium.providers.keepa import KeepaClient, NormalizedProduct
 from delium.utils.logging import get_logger
 
@@ -49,16 +50,6 @@ class ProductView:
 
 def _request_key(asin: str) -> str:
     return f"{_PROVIDER}:{_ENDPOINT}:{asin}"
-
-
-def _is_fresh(fetched_at: str, ttl: timedelta, *, now: datetime | None = None) -> bool:
-    """True if a raw_fetch timestamp (SQLite 'YYYY-MM-DD HH:MM:SS', UTC) is within TTL."""
-    current = now or datetime.now(UTC)
-    try:
-        stamped = datetime.strptime(fetched_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-    except ValueError:
-        return False
-    return (current - stamped) < ttl
 
 
 def _latest(rows: list[sqlite3.Row], column: str) -> int | None:
@@ -149,7 +140,7 @@ def fetch_product(
     if not force:
         with get_connection() as conn:
             latest = repository.latest_raw_fetch(conn, _PROVIDER, request_key)
-            if latest is not None and _is_fresh(latest["fetched_at"], ttl):
+            if latest is not None and is_fresh(latest["fetched_at"], ttl):
                 view = _view_from_db(conn, asin, from_cache=True, tokens_used=0, cost_usd=0.0)
                 if view is not None:
                     log.info("Cache hit for %s (fresh within TTL).", asin)

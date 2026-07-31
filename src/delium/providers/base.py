@@ -48,9 +48,15 @@ class HttpResult:
 
 
 class Transport(Protocol):
-    """Minimal HTTP surface an adapter needs: a GET returning parsed JSON."""
+    """Minimal HTTP surface a GET-based adapter needs (Keepa)."""
 
     def request_json(self, url: str, params: Mapping[str, str]) -> HttpResult: ...
+
+
+class PostTransport(Protocol):
+    """HTTP surface a POST+JSON adapter needs (DataForSEO)."""
+
+    def post_json(self, url: str, body: Any, headers: Mapping[str, str]) -> HttpResult: ...
 
 
 class UrllibTransport:
@@ -64,6 +70,19 @@ class UrllibTransport:
     def request_json(self, url: str, params: Mapping[str, str]) -> HttpResult:
         query = urllib.parse.urlencode(dict(params))
         request = urllib.request.Request(f"{url}?{query}", method="GET")
+        return self._send(request)
+
+    def post_json(self, url: str, body: Any, headers: Mapping[str, str]) -> HttpResult:
+        data = json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json", **dict(headers)},
+        )
+        return self._send(request)
+
+    def _send(self, request: urllib.request.Request) -> HttpResult:
         try:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
                 return HttpResult(status=response.status, body=_load_json(response.read()))

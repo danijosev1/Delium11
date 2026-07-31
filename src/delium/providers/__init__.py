@@ -15,11 +15,20 @@ from delium.providers.base import (
     ProviderRateLimitError,
     ProviderResponseError,
 )
+from delium.providers.dataforseo import (
+    DataForSeoClient,
+    DataForSeoFetch,
+    KeywordVolume,
+    SerpItem,
+)
 from delium.providers.keepa import KeepaClient, KeepaFetch, NormalizedProduct, PriceBsrPoint
 
 __all__ = [
+    "DataForSeoClient",
+    "DataForSeoFetch",
     "KeepaClient",
     "KeepaFetch",
+    "KeywordVolume",
     "NormalizedProduct",
     "PriceBsrPoint",
     "ProviderAuthError",
@@ -28,4 +37,5 @@ __all__ = [
     "ProviderNetworkError",
     "ProviderRateLimitError",
     "ProviderResponseError",
+    "SerpItem",
 ]

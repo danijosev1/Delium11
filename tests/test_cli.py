@@ -131,3 +131,37 @@ def test_fetch_product_displays_summary(
     assert DEFAULT_ASIN in result.output
     assert "Test Silicone Tray" in result.output
     assert "$20.99" in result.output  # latest price rendered from cents
+
+
+def test_fetch_keywords_without_creds_errors(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DELIUM_DATAFORSEO_LOGIN", raising=False)
+    monkeypatch.delenv("DELIUM_DATAFORSEO_PASSWORD", raising=False)
+    result = runner.invoke(app, ["fetch", "keywords", "silicone baby food tray"])
+    assert result.exit_code == 1
+    assert "Provider error" in result.output
+
+
+def test_fetch_keywords_displays_summary(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import delium.cli.main as cli_main
+    from dataforseo_support import SEED, FakePostTransport, ok, related_body, serp_body, volume_body
+
+    monkeypatch.setenv("DELIUM_DATAFORSEO_LOGIN", "l")
+    monkeypatch.setenv("DELIUM_DATAFORSEO_PASSWORD", "p")
+    transport = FakePostTransport([ok(volume_body(9400)), ok(related_body()), ok(serp_body())])
+
+    def fake_from_env(**_kwargs: object) -> object:
+        from delium.providers.dataforseo import DataForSeoClient
+
+        return DataForSeoClient("l", "p", transport=transport, sleep=lambda _: None)
+
+    monkeypatch.setattr(cli_main.DataForSeoClient, "from_env", staticmethod(fake_from_env))
+
+    result = runner.invoke(app, ["fetch", "keywords", SEED])
+    assert result.exit_code == 0
+    assert "9,400" in result.output  # seed volume
+    assert "freezer tray silicone" in result.output  # a related keyword
+    assert "B0AAA00001" in result.output  # a SERP ASIN
