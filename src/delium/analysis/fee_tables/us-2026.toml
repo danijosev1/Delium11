@@ -1,0 +1,96 @@
+# Amazon US FBA fee schedule — EXTERNAL DATA, not hardcoded in the engine.
+#
+# Values below are ILLUSTRATIVE (approximate US 2024 standard-size rate card)
+# and MUST be verified against Amazon's current published rate card / Revenue
+# Calculator before real use. Update this file (and bump `version` /
+# `effective_date`) when Amazon changes fees — the engine reads it verbatim.
+#
+# Money is in integer cents. Weights in grams, dimensions in millimeters.
+
+version = "us-2026"
+effective_date = "2026-01-01"
+currency = "USD"
+
+[referral]
+default_percent = 0.15
+min_fee_cents = 30
+
+# category -> referral percentage
+[referral.categories]
+"Home & Kitchen" = 0.15
+"Kitchen" = 0.15
+"Electronics" = 0.08
+"Sports & Outdoors" = 0.15
+"Toys & Games" = 0.15
+"Health & Household" = 0.15
+"Beauty & Personal Care" = 0.15
+"Pet Supplies" = 0.15
+"Office Products" = 0.15
+"Grocery & Gourmet Food" = 0.08
+"Baby" = 0.15
+"Tools & Home Improvement" = 0.15
+
+[closing]
+# Per-item closing fee (media categories). Default: none.
+default_cents = 0
+
+[closing.categories]
+"Books" = 180
+"Music" = 180
+"DVD" = 180
+"Video, DVD & Blu-ray" = 180
+
+[storage]
+# Monthly storage, cents per cubic foot.
+standard_per_cf_cents = 87    # Jan–Sep
+peak_per_cf_cents = 240       # Oct–Dec
+
+[prep]
+default_per_unit_cents = 50
+
+# ---------------------------------------------------------------------------
+# Size tiers — evaluated in order; the first whose dimension AND weight limits
+# are all satisfied wins. Fulfillment fee is the first band whose max_weight_g
+# is >= the unit weight; beyond the last band, `overflow` = base + per_kg.
+# ---------------------------------------------------------------------------
+[[size_tiers]]
+name = "small_standard"
+max_weight_g = 454
+max_longest_mm = 381
+max_median_mm = 305
+max_shortest_mm = 19
+bands = [
+  { max_weight_g = 113, fee_cents = 306 },
+  { max_weight_g = 227, fee_cents = 315 },
+  { max_weight_g = 340, fee_cents = 334 },
+  { max_weight_g = 454, fee_cents = 343 },
+]
+
+[[size_tiers]]
+name = "large_standard"
+max_weight_g = 9072
+max_longest_mm = 457
+max_median_mm = 356
+max_shortest_mm = 203
+bands = [
+  { max_weight_g = 113, fee_cents = 368 },
+  { max_weight_g = 227, fee_cents = 379 },
+  { max_weight_g = 340, fee_cents = 398 },
+  { max_weight_g = 454, fee_cents = 445 },
+  { max_weight_g = 680, fee_cents = 497 },
+  { max_weight_g = 907, fee_cents = 539 },
+  { max_weight_g = 1134, fee_cents = 578 },
+  { max_weight_g = 1361, fee_cents = 609 },
+]
+overflow = { base_cents = 640, per_kg_cents = 16 }
+
+[[size_tiers]]
+name = "large_bulky"
+max_weight_g = 22680
+max_longest_mm = 2591
+max_median_mm = 762
+max_shortest_mm = 762
+bands = [
+  { max_weight_g = 22680, fee_cents = 901 },
+]
+overflow = { base_cents = 901, per_kg_cents = 8 }
