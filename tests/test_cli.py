@@ -165,3 +165,38 @@ def test_fetch_keywords_displays_summary(
     assert "9,400" in result.output  # seed volume
     assert "freezer tray silicone" in result.output  # a related keyword
     assert "B0AAA00001" in result.output  # a SERP ASIN
+
+
+def test_fetch_reviews_without_creds_errors(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DELIUM_UNWRANGLE_API_KEY", raising=False)
+    monkeypatch.delenv("DELIUM_APIFY_API_TOKEN", raising=False)
+    result = runner.invoke(app, ["fetch", "reviews", "B08EXAMPLE"])
+    assert result.exit_code == 1
+    assert "Provider error" in result.output
+
+
+def test_fetch_reviews_displays_summary(
+    isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import delium.cli.main as cli_main
+    from reviews_support import ASIN, FakeGetTransport, get_resp, unwrangle_body
+
+    monkeypatch.setenv("DELIUM_UNWRANGLE_API_KEY", "key")
+    transport = FakeGetTransport([get_resp(unwrangle_body(3))])
+
+    def fake_build(**_kwargs: object) -> object:
+        from delium.providers.reviews import ReviewProviderChain, UnwrangleClient
+
+        return ReviewProviderChain(
+            [UnwrangleClient("key", transport=transport, sleep=lambda _: None)]
+        )
+
+    monkeypatch.setattr(cli_main, "build_review_provider", fake_build)
+
+    result = runner.invoke(app, ["fetch", "reviews", ASIN])
+    assert result.exit_code == 0
+    assert "Total reviews: 3" in result.output
+    assert "Average rating:" in result.output
+    assert "Newest review: 2026-07-03" in result.output

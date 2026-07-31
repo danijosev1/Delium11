@@ -22,14 +22,24 @@ from delium.providers.dataforseo import (
     SerpItem,
 )
 from delium.providers.keepa import KeepaClient, KeepaFetch, NormalizedProduct, PriceBsrPoint
+from delium.providers.reviews import (
+    ApifyClient,
+    NormalizedReview,
+    ReviewFetch,
+    ReviewProviderChain,
+    UnwrangleClient,
+    build_review_provider,
+)
 
 __all__ = [
+    "ApifyClient",
     "DataForSeoClient",
     "DataForSeoFetch",
     "KeepaClient",
     "KeepaFetch",
     "KeywordVolume",
     "NormalizedProduct",
+    "NormalizedReview",
     "PriceBsrPoint",
     "ProviderAuthError",
     "ProviderConfigError",
@@ -37,5 +47,9 @@ __all__ = [
     "ProviderNetworkError",
     "ProviderRateLimitError",
     "ProviderResponseError",
+    "ReviewFetch",
+    "ReviewProviderChain",
     "SerpItem",
+    "UnwrangleClient",
+    "build_review_provider",
 ]

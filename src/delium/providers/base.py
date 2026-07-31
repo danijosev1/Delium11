@@ -44,7 +44,9 @@ class ProviderResponseError(ProviderError):
 @dataclass(frozen=True)
 class HttpResult:
     status: int
-    body: dict[str, Any]
+    # Parsed JSON — usually an object, but some providers (Apify dataset items)
+    # return a top-level array, so this is intentionally `Any`.
+    body: Any
 
 
 class Transport(Protocol):
@@ -92,11 +94,13 @@ class UrllibTransport:
             raise ProviderNetworkError(str(exc)) from exc
 
 
-def _load_json(raw: bytes) -> dict[str, Any]:
+def _load_json(raw: bytes) -> Any:
+    """Parse a JSON body, returning {} on empty/invalid input. A valid array
+    (e.g. Apify dataset items) is returned as-is."""
     if not raw:
         return {}
     try:
         parsed: Any = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return {}
-    return parsed if isinstance(parsed, dict) else {}
+    return parsed if isinstance(parsed, dict | list) else {}

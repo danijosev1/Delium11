@@ -9,10 +9,13 @@ ingestion, dataset assembly for validation runs.
 
 from delium.ingestion.keywords import KeywordFetchResult, fetch_keywords
 from delium.ingestion.products import ProductView, fetch_product
+from delium.ingestion.reviews import ReviewFetchResult, fetch_reviews
 
 __all__ = [
     "KeywordFetchResult",
     "ProductView",
+    "ReviewFetchResult",
     "fetch_keywords",
     "fetch_product",
+    "fetch_reviews",
 ]

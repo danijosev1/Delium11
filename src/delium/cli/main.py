@@ -18,7 +18,7 @@ from delium import __version__
 from delium.config import ConfigError, load_config
 from delium.database import initialize_database, repository
 from delium.database.connection import get_connection
-from delium.providers import ProviderError
+from delium.providers import ProviderError, build_review_provider
 from delium.providers.dataforseo import DataForSeoClient
 from delium.providers.keepa import KeepaClient
 from delium.utils.logging import configure_logging, get_logger
@@ -224,6 +224,58 @@ def fetch_keywords_cmd(
         console.print(f"    #{item.position:<3} {item.asin}{tag}")
     if not result.serp:
         console.print("    —")
+
+
+@fetch_app.command("reviews")
+def fetch_reviews_cmd(
+    asin: Annotated[str, typer.Argument(help="Amazon ASIN, e.g. B08XXXXXXX.")],
+    force: Annotated[bool, typer.Option("--force", help="Bypass the cache and refetch.")] = False,
+) -> None:
+    """Fetch a review sample for an ASIN (Unwrangle → Apify), store, and summarize."""
+    from delium.ingestion import fetch_reviews
+
+    initialize_database()  # idempotent
+    config = load_config()
+
+    try:
+        provider = build_review_provider()
+    except ProviderError as exc:
+        console.print(f"[bold red]Provider error:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    with get_connection() as conn:
+        run_id = repository.insert_run(conn, command="fetch.reviews", input_=asin)
+
+    try:
+        result = fetch_reviews(asin, run_id=run_id, provider=provider, config=config, force=force)
+    except ProviderError as exc:
+        with get_connection() as conn:
+            repository.finish_run(conn, run_id, status="failed")
+        console.print(f"[bold red]Fetch failed:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    with get_connection() as conn:
+        repository.finish_run(conn, run_id, status="complete", data_cost_usd=result.cost_usd)
+
+    reviews = result.reviews
+    source = "cache" if result.from_cache else f"{result.provider} (${result.cost_usd:.4f})"
+    console.print(f"[bold green]{result.asin}[/bold green]  ({source})")
+
+    if not reviews:
+        console.print("  [yellow]No reviews retrieved.[/yellow]")
+        return
+
+    total = len(reviews)
+    avg = sum(r.stars for r in reviews) / total
+    console.print(f"  Total reviews: {total}")
+    console.print(f"  Average rating: {avg:.2f}")
+    console.print("  Rating distribution:")
+    for star in range(5, 0, -1):
+        count = sum(1 for r in reviews if r.stars == star)
+        bar = "█" * count
+        console.print(f"    {star}★ {count:>4}  {bar}")
+    dates = [r.review_date for r in reviews if r.review_date]
+    console.print(f"  Newest review: {max(dates) if dates else '—'}")
 
 
 @app.command()

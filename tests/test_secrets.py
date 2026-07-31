@@ -10,7 +10,8 @@ def test_secrets_default_to_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> 
         "DELIUM_KEEPA_API_KEY",
         "DELIUM_DATAFORSEO_LOGIN",
         "DELIUM_DATAFORSEO_PASSWORD",
-        "DELIUM_REVIEW_PROVIDER_API_KEY",
+        "DELIUM_UNWRANGLE_API_KEY",
+        "DELIUM_APIFY_API_TOKEN",
         "DELIUM_LLM_API_KEY",
     ):
         monkeypatch.delenv(var, raising=False)
@@ -18,6 +19,8 @@ def test_secrets_default_to_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> 
     secrets = get_secrets()
 
     assert secrets.keepa_api_key is None
+    assert secrets.unwrangle_api_key is None
+    assert secrets.apify_api_token is None
     assert secrets.llm_api_key is None
 
 

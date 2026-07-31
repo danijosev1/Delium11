@@ -15,7 +15,8 @@ from delium.providers.base import ProviderNetworkError, UrllibTransport, _load_j
 def test_load_json_variants() -> None:
     assert _load_json(b"") == {}
     assert _load_json(b"not json") == {}
-    assert _load_json(b"[1, 2, 3]") == {}  # non-dict JSON is ignored
+    assert _load_json(b"42") == {}  # scalar JSON is ignored
+    assert _load_json(b"[1, 2, 3]") == [1, 2, 3]  # arrays pass through (Apify)
     assert _load_json(b'{"a": 1}') == {"a": 1}
 
 

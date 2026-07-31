@@ -33,7 +33,8 @@ class DeliumSecrets(BaseSettings):
     keepa_api_key: SecretStr | None = None
     dataforseo_login: SecretStr | None = None
     dataforseo_password: SecretStr | None = None
-    review_provider_api_key: SecretStr | None = None
+    unwrangle_api_key: SecretStr | None = None  # primary review provider
+    apify_api_token: SecretStr | None = None  # fallback review provider
     llm_api_key: SecretStr | None = None
 
 
