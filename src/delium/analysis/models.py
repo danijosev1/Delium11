@@ -395,3 +395,167 @@ class DemandReport:
     @property
     def missing_components(self) -> tuple[str, ...]:
         return tuple(s.name for s in self.components if not s.available)
+
+
+# ---------------------------------------------------------------------------
+# Competition analysis engine
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class PricePoint:
+    date: date
+    price_cents: int
+
+
+@dataclass(frozen=True)
+class CompetitorSnapshot:
+    """One organic top-N competitor. All signals optional; absence lowers
+    confidence and is never guessed. `listing_quality` is the overall_score from
+    listing.py (0-100) — it is NOT recomputed here."""
+
+    asin: str
+    brand: str | None = None
+    review_count: int | None = None
+    rating: float | None = None
+    price_cents: int | None = None
+    listing_quality: float | None = None
+    review_count_90d_ago: int | None = None
+    price_history: tuple[PricePoint, ...] | None = None
+
+
+@dataclass(frozen=True)
+class CompetitionConfig:
+    # C1 review moat
+    review_moat_lo: float = 200
+    review_moat_hi: float = 3000
+    # C2 beatable slots
+    beatable_review_threshold: int = 150
+    beatable_cap: int = 4
+    beatable_per_slot: float = 25
+    weak_listing_threshold: float = 60  # listing quality below this = weak/beatable
+    # C3 review velocity of leaders
+    velocity_lo: float = 20
+    velocity_hi: float = 300
+    velocity_low_class: float = 20  # < → 'low'
+    velocity_high_class: float = 100  # > → 'high'
+    velocity_leaders: int = 3
+    # C4 brand dominance
+    big_brand_penalty: float = 25
+    hhi_flag_threshold: float = 0.30
+    # C5 listing quality advantage
+    listing_advantage_threshold: float = 80  # avg competitor quality below → advantage
+    # C6 price competition
+    price_cv_lo: float = 0.05
+    price_cv_hi: float = 0.25
+    price_war_min_slots: int = 3
+    price_war_recent_days: int = 14
+    price_window_days: int = 90
+    neutral_score: float = 50.0
+    # analysis scope
+    top_n: int = 10
+    # component weights (sum 100) — docs/scoring-model.md §5
+    weight_review_moat: float = 30
+    weight_beatable_slots: float = 20
+    weight_review_velocity: float = 15
+    weight_brand_dominance: float = 15
+    weight_listing_gap: float = 15
+    weight_price_competition: float = 5
+
+
+@dataclass(frozen=True)
+class CompetitionInput:
+    competitors: tuple[CompetitorSnapshot, ...]  # organic top-N, SERP order
+    as_of: date
+    recognized_brands: frozenset[str] = frozenset()  # known dominant brands
+
+
+@dataclass(frozen=True)
+class ReviewMoat:
+    median_reviews: float | None
+    mean_reviews: float | None
+    max_reviews: int | None
+    score: float | None
+    detail: str
+
+
+@dataclass(frozen=True)
+class BeatableSlots:
+    count: int  # top-N with < threshold reviews (doc-exact C2 count)
+    weak_listing_slots: int  # of those, how many also have a weak/unknown listing
+    score: float | None
+    detail: str
+
+
+@dataclass(frozen=True)
+class ReviewVelocity:
+    monthly_velocity: float | None  # median of top-3 leaders' new reviews/month
+    classification: str  # 'low' | 'moderate' | 'high' | 'unknown'
+    leaders_with_history: int
+    score: float | None
+    detail: str
+
+
+@dataclass(frozen=True)
+class BrandConcentration:
+    top_brand: str | None
+    top_brand_slot_share: float | None
+    hhi: float | None
+    recognized_big_brand_present: bool
+    concentration_flag: bool  # HHI > threshold
+    score: float | None
+    detail: str
+
+
+@dataclass(frozen=True)
+class ListingQualityAdvantage:
+    avg_competitor_quality: float | None  # None → no listing data (neutral score used)
+    advantage_score: float  # C5 (neutral fallback when no data)
+    advantage_available: bool
+    coverage: int  # competitors with a listing quality score
+    detail: str
+
+
+@dataclass(frozen=True)
+class PriceCompetition:
+    median_price_cents: int | None
+    price_spread_cents: int | None
+    clustering_cv: float | None  # cross-sectional CV of current prices
+    median_price_cv_90d: float | None  # time-series volatility
+    score: float  # C6 (neutral fallback when no history)
+    price_war_flag: bool
+    competitors_at_recent_low: int
+    detail: str
+
+
+@dataclass(frozen=True)
+class CompetitionConfidence:
+    level: Confidence
+    competitors_analyzed: int
+    review_history_coverage: float
+    listing_quality_coverage: float
+    price_history_coverage: float
+
+
+@dataclass(frozen=True)
+class CompetitionReport:
+    pillar_score: float  # 0-100 competition pillar (higher = more beatable)
+    confidence: CompetitionConfidence
+    review_moat: ReviewMoat
+    beatable_slots: BeatableSlots
+    review_velocity: ReviewVelocity
+    brand_concentration: BrandConcentration
+    listing_quality_advantage: ListingQualityAdvantage
+    price_competition: PriceCompetition
+    components: tuple[Subscore, ...]
+    data_gaps: tuple[str, ...]  # absent input categories
+
+    @property
+    def missing_components(self) -> tuple[str, ...]:
+        return tuple(s.name for s in self.components if not s.available)
+
+    @property
+    def hhi(self) -> float | None:
+        return self.brand_concentration.hhi
+
+    @property
+    def price_war_flag(self) -> bool:
+        return self.price_competition.price_war_flag
