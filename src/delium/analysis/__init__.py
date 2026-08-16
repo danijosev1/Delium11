@@ -9,14 +9,17 @@ competition, differentiation, risk, and scoring.
 
 from delium.analysis.competition import analyze_competition
 from delium.analysis.demand import DemandError, analyze_demand, load_velocity_curves
+from delium.analysis.differentiation import analyze_differentiation
 from delium.analysis.fees import FeeError, compute_fees, load_fee_table
 from delium.analysis.listing import compute_listing_quality
 from delium.analysis.models import (
+    Addressability,
     AsinHistory,
     BeatableSlots,
     BrandConcentration,
     BsrPoint,
     BsrTrend,
+    BundleSignal,
     CompetitionConfidence,
     CompetitionConfig,
     CompetitionInput,
@@ -25,7 +28,14 @@ from delium.analysis.models import (
     Confidence,
     DemandConfig,
     DemandReport,
+    DifferentiationConfidence,
+    DifferentiationConfig,
+    DifferentiationInput,
+    DifferentiationReport,
+    DifferentiationTheme,
+    DiffReview,
     Dimensions,
+    FeatureRequest,
     FeeBreakdown,
     FeeTable,
     KeywordDatum,
@@ -38,6 +48,7 @@ from delium.analysis.models import (
     PricePoint,
     ProfitInputs,
     ProfitResult,
+    RawTheme,
     ReviewMoat,
     ReviewVelocity,
     SalesEstimate,
@@ -46,21 +57,34 @@ from delium.analysis.models import (
     ScenarioSet,
     Seasonality,
     Subscore,
+    ThemeKind,
     VelocityCurves,
 )
 from delium.analysis.profit import compute_profit, compute_scenarios, confidence_for
 
 __all__ = [
+    "Addressability",
     "AsinHistory",
     "BeatableSlots",
     "BrandConcentration",
     "BsrPoint",
     "BsrTrend",
+    "BundleSignal",
     "CompetitionConfidence",
     "CompetitionConfig",
     "CompetitionInput",
     "CompetitionReport",
     "CompetitorSnapshot",
+    "DiffReview",
+    "DifferentiationConfidence",
+    "DifferentiationConfig",
+    "DifferentiationInput",
+    "DifferentiationReport",
+    "DifferentiationTheme",
+    "FeatureRequest",
+    "RawTheme",
+    "ThemeKind",
+    "analyze_differentiation",
     "Confidence",
     "DemandConfig",
     "DemandError",

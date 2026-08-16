@@ -559,3 +559,159 @@ class CompetitionReport:
     @property
     def price_war_flag(self) -> bool:
         return self.price_competition.price_war_flag
+
+
+# ---------------------------------------------------------------------------
+# Differentiation analysis engine
+# ---------------------------------------------------------------------------
+class ThemeKind(StrEnum):
+    COMPLAINT = "complaint"
+    PRAISE = "praise"
+    MISSING_FEATURE = "missing_feature"
+    IMPROVEMENT = "improvement"
+    BUNDLE = "bundle"
+
+
+class Addressability(StrEnum):
+    """Structured Strategist/Miner tag — an enum, never a number the engine
+    trusts. The engine computes the numeric share itself."""
+
+    FIXABLE = "fixable"  # addressable at low COGS delta
+    PARTIAL = "partial"  # partially fixable
+    HARD = "hard"  # not realistically fixable
+    UNKNOWN = "unknown"  # unassessed — never scored optimistically
+
+
+@dataclass(frozen=True)
+class DiffReview:
+    """One review in the eligible sample. Only id + stars are needed here."""
+
+    review_id: str
+    stars: int  # 1-5
+
+
+@dataclass(frozen=True)
+class RawTheme:
+    """A Review Miner theme. `claimed_*` are LLM-supplied and ADVISORY ONLY —
+    the engine recomputes frequency from cited ids and severity from cited stars."""
+
+    theme_id: str
+    kind: ThemeKind
+    label: str
+    supporting_review_ids: tuple[str, ...]
+    addressability: Addressability = Addressability.UNKNOWN
+    cogs_delta: float | None = None  # fraction; ≤ 0.15 required for FIXABLE
+    category: str | None = None  # e.g. 'packaging', 'usage' — for F4 rubric
+    claimed_frequency_pct: float | None = None  # IGNORED for arithmetic
+    claimed_severity: int | None = None  # IGNORED for arithmetic
+
+
+@dataclass(frozen=True)
+class FeatureRequest:
+    feature: str
+    supporting_review_ids: tuple[str, ...]
+    absent_from_competitors: bool | None  # True = confirmed gap, None = unknown
+
+
+@dataclass(frozen=True)
+class BundleSignal:
+    complement: str
+    supporting_review_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DifferentiationConfig:
+    min_quotes: int = 3  # honesty guard: theme needs ≥ this many verified quotes
+    # F1 complaint intensity
+    intensity_lo: float = 10
+    intensity_hi: float = 60
+    severity_high_stars: float = 2.0  # mean cited stars ≤ → severity 3
+    severity_mid_stars: float = 3.0  # mean cited stars ≤ → severity 2
+    # F2 missing features
+    feature_cap: int = 4
+    feature_per: float = 25
+    # F3 addressability weights
+    addressable_cogs_max: float = 0.15
+    weight_fixable: float = 1.0
+    weight_partial: float = 0.5
+    # F4 bundle & packaging rubric (25 pts each)
+    rubric_points: float = 25
+    bundle_freq_threshold: float = 0.03
+    packaging_freq_threshold: float = 0.05
+    usage_freq_threshold: float = 0.05
+    # sample bias (data-layer §1.3)
+    bias_threshold: float = 0.4
+    bias_adjustment: float = 5.0
+    # confidence sample-size bands (analysis-engine §3)
+    sample_high: int = 150
+    sample_medium: int = 30
+    unresolved_ratio_floor: float = 0.5
+    # component weights (docs/scoring-model.md §6) — sum 100
+    weight_complaint_intensity: float = 40
+    weight_missing_features: float = 25
+    weight_addressability: float = 20
+    weight_bundle_packaging: float = 15
+
+
+@dataclass(frozen=True)
+class DifferentiationTheme:
+    theme_id: str
+    label: str
+    supporting_count_claimed: int  # ids supplied
+    verified_count: int  # unique ids present in the sample
+    frequency: float  # recomputed, 0-1
+    severity: int | None  # 1-3 from cited stars; None if unverifiable
+    intensity: float  # frequency_pct × severity
+    addressability: Addressability
+    counted: bool  # passed the ≥ min_quotes guard
+    detail: str
+
+
+@dataclass(frozen=True)
+class DifferentiationConfidence:
+    level: Confidence
+    sample_size: int
+    verified_theme_ratio: float  # resolved ids / claimed ids
+    themes_with_evidence: int
+    feature_evidence: bool
+    sample_bias_flagged: bool
+
+
+@dataclass(frozen=True)
+class DifferentiationInput:
+    target_asin: str
+    reviews: tuple[DiffReview, ...]  # eligible review sample (denominator)
+    themes: tuple[RawTheme, ...] = ()
+    feature_requests: tuple[FeatureRequest, ...] = ()
+    bundle_signals: tuple[BundleSignal, ...] = ()
+    competitors_bundle_complement: bool | None = None  # do top-10 bundle it?
+    listing_rating_avg: float | None = None  # listing's displayed rating
+
+
+@dataclass(frozen=True)
+class DifferentiationReport:
+    pillar_score: float  # 0-100 differentiation pillar
+    confidence: DifferentiationConfidence
+    complaint_intensity_score: float | None  # F1
+    missing_features_score: float | None  # F2
+    addressability_score: float | None  # F3
+    bundle_packaging_score: float | None  # F4
+    themes: tuple[DifferentiationTheme, ...]
+    feature_gap_count: int
+    verified_supporting_reviews: int
+    sample_rating_avg: float | None
+    sample_bias_delta: float | None
+    sample_bias_flag: bool
+    f1_bias_adjustment: float
+    components: tuple[Subscore, ...]
+    data_gaps: tuple[str, ...]
+
+    @property
+    def missing_components(self) -> tuple[str, ...]:
+        return tuple(s.name for s in self.components if not s.available)
+
+    @property
+    def has_buy_quality_evidence(self) -> bool:
+        """True only when there is verified complaint evidence and confidence is
+        not LOW — otherwise the report signals insufficient evidence."""
+        return self.confidence.level != Confidence.LOW and self.confidence.themes_with_evidence >= 1
