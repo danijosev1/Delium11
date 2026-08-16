@@ -8,6 +8,7 @@ ROI, break-even PPC) are floats. See docs/analysis-engine.md §4.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from enum import StrEnum
 
 
@@ -244,3 +245,153 @@ class ListingQualityReport:
     @property
     def assessed(self) -> tuple[str, ...]:
         return tuple(s.name for s in self.subscores if s.available)
+
+
+# ---------------------------------------------------------------------------
+# Demand analysis engine
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class BsrPoint:
+    date: date
+    bsr: int
+
+
+@dataclass(frozen=True)
+class AsinHistory:
+    """A single ASIN's BSR observations (target first, then competitors)."""
+
+    asin: str
+    observations: tuple[BsrPoint, ...]
+
+
+@dataclass(frozen=True)
+class KeywordDatum:
+    phrase: str
+    volume: int | None  # None = volume unknown (excluded from sums, per data-layer §1.2)
+
+
+@dataclass(frozen=True)
+class VelocityAnchor:
+    bsr: int
+    units: int
+
+
+@dataclass(frozen=True)
+class CategoryCurve:
+    name: str
+    base_factor: float
+    multi_unit_factor: float
+    anchors: tuple[VelocityAnchor, ...]
+
+
+@dataclass(frozen=True)
+class VelocityCurves:
+    version: str
+    default: CategoryCurve
+    categories: dict[str, CategoryCurve]
+
+    def resolve(self, category: str | None) -> tuple[CategoryCurve, bool]:
+        """Return (curve, category_known). Falls back to the default curve."""
+        if category is not None and category in self.categories:
+            return self.categories[category], True
+        return self.default, False
+
+
+@dataclass(frozen=True)
+class DemandConfig:
+    # D1 search volume (log-normalized cluster volume)
+    volume_lo: float = 2000
+    volume_hi: float = 40000
+    dedup_substring_weight: float = 0.30
+    # D2 sales-velocity sweet spot (rise_lo, rise_hi, fall_lo, fall_hi, floor)
+    velocity_curve: tuple[float, float, float, float, float] = (150, 300, 1200, 2500, 70)
+    # D3 BSR trend (annual log10 improvement mapped to 0-100)
+    trend_lo: float = -0.20
+    trend_hi: float = 0.40
+    # D4 market growth (YoY keyword volume)
+    growth_lo: float = -0.10
+    growth_hi: float = 0.40
+    # D5 seasonality (peak-8-week concentration)
+    seasonality_lo: float = 0.20
+    seasonality_hi: float = 0.60
+    seasonal_flag_threshold: float = 0.40
+    # sales-estimate bounds
+    low_mult: float = 0.8
+    high_mult: float = 1.6
+    market_share_factor: float = 1.25  # page-1 ≈ 80% of demand
+    # thresholds
+    full_history_days: int = 60
+    partial_history_days: int = 30
+    seasonality_min_days: int = 365
+    seasonality_min_weeks: int = 8
+    full_volumed_phrases: int = 5
+    # component weights (sum 100)
+    weight_search_volume: float = 30
+    weight_sales_velocity: float = 30
+    weight_bsr_trend: float = 20
+    weight_market_growth: float = 10
+    weight_seasonality: float = 10
+
+
+@dataclass(frozen=True)
+class SalesEstimate:
+    asin: str
+    low_units: int
+    expected_units: int
+    high_units: int
+    confidence: Confidence
+    method: str  # 'rank_drop' | 'curve_fallback'
+    observed_days: int
+    n_observations: int
+    drops: int
+    current_bsr: int
+    rank_reference_units: int
+
+
+@dataclass(frozen=True)
+class KeywordDemand:
+    total_volume: int
+    deduplicated_volume: int
+    primary_phrase: str | None
+    primary_volume: int
+    demand_concentration: float  # primary share of total (single-keyword dependence)
+    volumed_phrase_count: int
+    yoy_growth: float | None
+    search_volume_score: float | None
+    market_growth_score: float | None
+
+
+@dataclass(frozen=True)
+class BsrTrend:
+    direction: str  # 'improving' | 'declining' | 'flat' | 'unknown'
+    magnitude: float | None  # abs annual log10 change
+    median_annual_change: float | None  # signed; positive = rank improving
+    score: float | None
+    asins_with_slope: int
+
+
+@dataclass(frozen=True)
+class Seasonality:
+    assessable: bool
+    peak_concentration: float | None
+    seasonal_flag: bool | None
+    score: float | None
+    weeks_observed: int
+
+
+@dataclass(frozen=True)
+class DemandReport:
+    pillar_score: float  # 0-100 demand pillar for scoring.py
+    confidence: Confidence
+    components: tuple[Subscore, ...]
+    sales_estimates: tuple[SalesEstimate, ...]
+    market_units_low: int
+    market_units_expected: int
+    market_units_high: int
+    keyword_demand: KeywordDemand
+    bsr_trend: BsrTrend
+    seasonality: Seasonality
+
+    @property
+    def missing_components(self) -> tuple[str, ...]:
+        return tuple(s.name for s in self.components if not s.available)

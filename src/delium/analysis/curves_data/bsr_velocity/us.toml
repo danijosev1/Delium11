@@ -1,0 +1,58 @@
+# BSR → sales-velocity curves, per top-level US category. EXTERNAL DATA, not
+# hardcoded in the engine (docs/analysis-engine.md §1).
+#
+# Values are ILLUSTRATIVE and MUST be calibrated against real observed sales
+# (see `delium calibrate` in the scoring model) before trusted. Update this file
+# and bump `version` when the curves are recalibrated.
+#
+# Each category provides:
+#   base_factor        multiplier on monthly rank-drops → expected units
+#   multi_unit_factor  extra headroom on the high bound (multi-unit orders)
+#   anchors            piecewise BSR → monthly-units curve (log-log interpolated),
+#                      used as a rank-based reference and thin-history fallback
+
+version = "us-2026"
+
+[default]
+base_factor = 1.0
+multi_unit_factor = 1.25
+anchors = [
+  { bsr = 100, units = 4000 },
+  { bsr = 1000, units = 800 },
+  { bsr = 5000, units = 250 },
+  { bsr = 20000, units = 70 },
+  { bsr = 100000, units = 10 },
+]
+
+[categories."Home & Kitchen"]
+base_factor = 1.0
+multi_unit_factor = 1.3
+anchors = [
+  { bsr = 100, units = 4500 },
+  { bsr = 1000, units = 900 },
+  { bsr = 5000, units = 300 },
+  { bsr = 20000, units = 90 },
+  { bsr = 100000, units = 12 },
+]
+
+[categories."Sports & Outdoors"]
+base_factor = 1.0
+multi_unit_factor = 1.2
+anchors = [
+  { bsr = 100, units = 3000 },
+  { bsr = 1000, units = 600 },
+  { bsr = 5000, units = 190 },
+  { bsr = 20000, units = 55 },
+  { bsr = 100000, units = 8 },
+]
+
+[categories."Toys & Games"]
+base_factor = 1.0
+multi_unit_factor = 1.35
+anchors = [
+  { bsr = 100, units = 5000 },
+  { bsr = 1000, units = 1000 },
+  { bsr = 5000, units = 330 },
+  { bsr = 20000, units = 100 },
+  { bsr = 100000, units = 14 },
+]
