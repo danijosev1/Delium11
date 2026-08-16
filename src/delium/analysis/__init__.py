@@ -51,6 +51,13 @@ from delium.analysis.models import (
     RawTheme,
     ReviewMoat,
     ReviewVelocity,
+    RiskConfidence,
+    RiskConfig,
+    RiskFlag,
+    RiskInput,
+    RiskReport,
+    RiskRules,
+    RiskSeverity,
     SalesEstimate,
     ScenarioAdjustment,
     ScenarioAssumptions,
@@ -61,6 +68,7 @@ from delium.analysis.models import (
     VelocityCurves,
 )
 from delium.analysis.profit import compute_profit, compute_scenarios, confidence_for
+from delium.analysis.risk import RiskError, analyze_risk, load_risk_rules
 
 __all__ = [
     "Addressability",
@@ -83,8 +91,18 @@ __all__ = [
     "DifferentiationTheme",
     "FeatureRequest",
     "RawTheme",
+    "RiskConfidence",
+    "RiskConfig",
+    "RiskError",
+    "RiskFlag",
+    "RiskInput",
+    "RiskReport",
+    "RiskRules",
+    "RiskSeverity",
     "ThemeKind",
     "analyze_differentiation",
+    "analyze_risk",
+    "load_risk_rules",
     "Confidence",
     "DemandConfig",
     "DemandError",

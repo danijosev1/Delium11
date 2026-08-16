@@ -715,3 +715,121 @@ class DifferentiationReport:
         """True only when there is verified complaint evidence and confidence is
         not LOW — otherwise the report signals insufficient evidence."""
         return self.confidence.level != Confidence.LOW and self.confidence.themes_with_evidence >= 1
+
+
+# ---------------------------------------------------------------------------
+# Risk analysis engine (deduction-based; docs/scoring-model.md §8,
+# docs/analysis-engine.md §5)
+# ---------------------------------------------------------------------------
+class RiskSeverity(StrEnum):
+    CRITICAL = "critical"  # deduction ≥ 30
+    HIGH = "high"  # deduction ≥ 20
+    MODERATE = "moderate"  # deduction ≥ 10
+    INFO = "info"  # 0-deduction informational / unassessed
+
+
+@dataclass(frozen=True)
+class RiskRules:
+    """External, versioned risk indicators (loaded from risk_data/*.toml)."""
+
+    version: str
+    ip_categories: frozenset[str]  # design-patent-heavy categories
+    brand_likeness_lexicon: tuple[str, ...]  # trademark-signature terms
+    compliance_map: dict[str, str]  # category → certification requirement
+    high_return_categories: frozenset[str]
+    fragility_materials: tuple[str, ...]  # glass/ceramic/etc.
+    oversized_size_tiers: frozenset[str]  # informational logistics note
+
+
+@dataclass(frozen=True)
+class RiskConfig:
+    # Deductions — EXACTLY as documented (docs/scoring-model.md §8 / analysis §5).
+    deduct_ip: float = 40
+    deduct_compliance: float = 30
+    deduct_trend: float = 25
+    deduct_seasonality_confirmed: float = 20
+    deduct_seasonality_unknown: float = 10
+    deduct_high_returns: float = 20
+    deduct_fragility: float = 20
+    deduct_keyword_concentration: float = 15
+    deduct_market_concentration: float = 15
+    deduct_supplier: float = 10
+    # Documented thresholds.
+    seasonality_peak_threshold: float = 0.40
+    sizing_freq_threshold: float = 0.10
+    damage_freq_threshold: float = 0.08
+    keyword_share_threshold: float = 0.60
+    hhi_threshold: float = 0.30
+    trend_history_months: int = 24
+    trend_fad_ratio: float = 2.0
+    # Severity bands by deduction magnitude.
+    severity_critical: float = 30
+    severity_high: float = 20
+    severity_moderate: float = 10
+    # Confidence: high when ≤ 1 documented rule is unassessed (analysis §5).
+    max_unassessed_high: int = 1
+    max_unassessed_medium: int = 4
+
+
+@dataclass(frozen=True)
+class RiskInput:
+    """Facts consumed from upstream engines/product data — never recomputed here.
+
+    seasonality comes from the demand engine, brand_hhi and price_war_flag from
+    competition, complaint frequencies from differentiation/review themes, size
+    tier from ProductView, keyword_top_share from the keyword cluster."""
+
+    category: str | None = None
+    titles: tuple[str, ...] = ()
+    patent_marked_listings: bool | None = None  # Analyst flag
+    materials: tuple[str, ...] = ()
+    has_firmware: bool | None = None
+    multi_part: bool | None = None
+    sizing_complaint_frequency: float | None = None  # from review themes
+    damage_complaint_frequency: float | None = None
+    keyword_top_share: float | None = None  # from keyword cluster
+    brand_hhi: float | None = None  # from competition
+    volume_history_months: int | None = None
+    current_volume: int | None = None
+    volume_24mo_median: int | None = None
+    seasonality: Seasonality | None = None  # from demand engine
+    price_war_flag: bool | None = None  # from competition (informational)
+    size_tier: str | None = None  # from ProductView (informational)
+    oversized: bool | None = None  # informational logistics note
+
+
+@dataclass(frozen=True)
+class RiskFlag:
+    risk_type: str
+    deduction: float  # points subtracted (≥ 0)
+    severity: RiskSeverity
+    evidence: str  # concrete citation
+    source: str  # the input/rule that triggered it
+    explanation: str
+    assessed: bool = True  # False = could not be evaluated (missing input)
+
+
+@dataclass(frozen=True)
+class RiskConfidence:
+    level: Confidence
+    assessed_rules: int
+    unassessed_rules: int
+    total_rules: int
+
+
+@dataclass(frozen=True)
+class RiskReport:
+    risk_score: float  # 0-100, higher = safer (100 − total deductions, floor 0)
+    total_deduction: float
+    confidence: RiskConfidence
+    flags: tuple[RiskFlag, ...]  # triggered + informational, ordered by deduction
+    unassessed: tuple[str, ...]  # documented rules that could not be evaluated
+    data_gaps: tuple[str, ...]
+
+    @property
+    def risk_adjusted_score(self) -> float:
+        return self.risk_score
+
+    @property
+    def has_critical_risk(self) -> bool:
+        return any(f.severity is RiskSeverity.CRITICAL and f.deduction > 0 for f in self.flags)

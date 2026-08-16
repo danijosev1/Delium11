@@ -1,0 +1,58 @@
+# Deterministic risk indicators — EXTERNAL DATA, not hardcoded in Python
+# (docs/analysis-engine.md §5; same pattern as fee_tables / bsr_velocity).
+#
+# Values are ILLUSTRATIVE and MUST be reviewed/expanded before real use.
+# Update this file and bump `version` when the watchlists change. The risk
+# engine reads it verbatim; it invents no categories or weights.
+
+version = "us-2026"
+
+[ip]
+# Design-patent-heavy / trademark-signature categories → ip_signal (−40).
+design_patent_categories = [
+  "Toys & Games",
+  "Jewelry",
+  "Clothing, Shoes & Jewelry",
+  "Cell Phones & Accessories",
+  "Arts, Crafts & Sewing",
+]
+# Brand-likeness lexicon matched (case-insensitive substring) against titles.
+brand_likeness_lexicon = [
+  "disney",
+  "marvel",
+  "nike",
+  "adidas",
+  "lego",
+  "pokemon",
+  "harry potter",
+  "as seen on tv",
+]
+
+[compliance]
+# Category → certification surface → compliance (−30).
+[compliance.categories]
+"Baby" = "CPSIA / children's product testing"
+"Toys & Games" = "CPSIA / children's product testing"
+"Health & Household" = "FDA-adjacent labeling"
+"Beauty & Personal Care" = "FDA-adjacent (cosmetics)"
+"Grocery & Gourmet Food" = "food-contact / FDA"
+"Electronics" = "electrical UL / FCC"
+"Tools & Home Improvement" = "electrical UL"
+
+[high_returns]
+# Categories with structurally high return rates → high_returns (−20).
+categories = [
+  "Clothing, Shoes & Jewelry",
+  "Shoes",
+  "Apparel",
+  "Watches",
+]
+
+[fragility]
+# Material lexicon → fragility (−20).
+materials = ["glass", "ceramic", "porcelain", "crystal", "stoneware"]
+
+[logistics]
+# Informational only (0 deduction) — oversized handling lives in kill rule K3
+# and the fee/profit engine, not the risk deduction ledger.
+oversized_size_tiers = ["large_bulky", "oversized", "special_oversize"]
