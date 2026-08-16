@@ -833,3 +833,153 @@ class RiskReport:
     @property
     def has_critical_risk(self) -> bool:
         return any(f.severity is RiskSeverity.CRITICAL and f.deduction > 0 for f in self.flags)
+
+
+# ---------------------------------------------------------------------------
+# Final opportunity scoring engine (docs/scoring-model.md §2-§10,
+# docs/analysis-engine.md §6). Pure assembly of the five pillar reports into
+# the composite score, gates, kills, and Buy/Test/Avoid verdict.
+# ---------------------------------------------------------------------------
+class Verdict(StrEnum):
+    BUY = "buy"
+    TEST = "test"
+    AVOID = "avoid"
+
+
+@dataclass(frozen=True)
+class KillResult:
+    """One Stage-0 hard-rejection rule (scoring-model §2). `triggered` and not
+    `demoted` forces AVOID; `demoted` (within the borderline band) caps at TEST;
+    `assessed=False` means the inputs were absent so the rule could not run."""
+
+    rule_id: str  # 'K1'..'K12'
+    name: str
+    triggered: bool
+    demoted: bool  # borderline (within band of threshold) → Test, not kill
+    category: str  # 'price' | 'logistics' | 'brand' | 'moat' | 'ip' | ...
+    actual: str | None  # human-readable observed value
+    threshold: str | None  # human-readable limit
+    evidence: str
+    reason: str
+    assessed: bool = True
+
+    @property
+    def kills(self) -> bool:
+        """True only for an assessed, triggered, non-demoted rule (forces AVOID)."""
+        return self.assessed and self.triggered and not self.demoted
+
+
+@dataclass(frozen=True)
+class GateResult:
+    """One Stage-4 gate (scoring-model §10). A high score cannot buy past a gate.
+    Hard gates (G1/G3) failing → AVOID; soft gates (G2/G4) failing → block Buy
+    (demote to Test). G5 (Strategist) is `passed=None` — pending, checked by the
+    pipeline, never by scoring."""
+
+    gate_id: str  # 'G1'..'G5'
+    name: str
+    passed: bool | None  # None = pending (G5 strategist concurrence)
+    hard: bool  # hard gate failure forces AVOID; soft only blocks Buy
+    actual: str | None
+    threshold: str | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class PillarScore:
+    """One of the five weighted pillars, with full provenance so the composite
+    is hand-auditable: raw report score → sufficiency cap → weighted share."""
+
+    pillar: str  # 'demand' | 'competition' | 'differentiation' | 'profitability' | 'risk'
+    raw_score: float | None  # 0-100 from the underlying report (pre-cap)
+    capped_score: float | None  # after any sufficiency/gate cap
+    weight: float  # configured pillar weight
+    weighted_contribution: float  # capped_score × weight / Σ weights
+    confidence: Confidence
+    available: bool  # False = report absent
+    partial: bool  # True = a sufficiency cap applied (blocks Buy via G2)
+    cap_reason: str | None
+    source: str  # which report produced it
+    components: tuple[Subscore, ...]  # pass-through component provenance
+    evidence: str
+
+
+@dataclass(frozen=True)
+class ScoreConfidence:
+    level: Confidence
+    partial_pillars: tuple[str, ...]
+    missing_pillars: tuple[str, ...]
+    notes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ConfigSnapshot:
+    """Frozen copy of every threshold/weight that decided a score, so an old
+    score stays reproducible after config drift (scoring-model §11.3). Plain
+    numbers only — no config import, no DB dependency; the persistence layer
+    serializes this verbatim."""
+
+    weights: tuple[tuple[str, float], ...]
+    gate_thresholds: tuple[tuple[str, float], ...]
+    kill_thresholds: tuple[tuple[str, float], ...]
+    verdict_thresholds: tuple[tuple[str, float], ...]
+    sufficiency: tuple[tuple[str, float], ...]
+    profit_pillar: tuple[tuple[str, float], ...]
+
+
+@dataclass(frozen=True)
+class ScoringInput:
+    """Everything scoring assembles: the five pillar reports plus the cheap kill
+    facts that aren't owned by any pillar. Absent fields are treated
+    pessimistically (never optimistically) — a missing kill fact means the rule
+    is `unassessed`, a missing pillar makes the candidate insufficient."""
+
+    demand: DemandReport | None = None
+    competition: CompetitionReport | None = None
+    differentiation: DifferentiationReport | None = None
+    profit: ScenarioSet | None = None
+    risk: RiskReport | None = None
+    # Cheap Stage-0 kill facts (scoring-model §2) not derivable from a pillar.
+    market_median_price_cents: int | None = None  # K1/K2
+    oversized: bool | None = None  # K3
+    amazon_in_top5: bool | None = None  # K4
+    market_complaint_rate: float | None = None  # K7 (with listing quality)
+    restricted_category: bool | None = None  # K8
+    ip_signature: bool | None = None  # K9
+    avoid_matches: tuple[str, ...] = ()  # K12 config `avoid` list matches
+    fad_search_volume: int | None = None  # K10
+    fad_volume_12mo_median: int | None = None  # K10
+    volume_history_months: int | None = None  # K10
+    top_n: int = 10
+
+
+@dataclass(frozen=True)
+class ScoredOpportunity:
+    """The persisted, self-contained result — everything needed to regenerate
+    the report and re-derive the verdict without re-running the engines."""
+
+    verdict: Verdict
+    score: float  # composite 0-100 (provisional pending G5 when verdict == BUY)
+    base_weighted_score: float  # composite before any documented top-level caps
+    pillars: tuple[PillarScore, ...]
+    kills: tuple[KillResult, ...]
+    gates: tuple[GateResult, ...]
+    confidence: ScoreConfidence
+    insufficient_data: bool  # any pillar partial/absent → research-later, not bad
+    strategist_pending: bool  # G5 unresolved → a BUY here is provisional
+    verdict_basis: tuple[str, ...]  # which thresholds/gates/kills decided it
+    config_snapshot: ConfigSnapshot
+
+    @property
+    def hard_kill_triggered(self) -> bool:
+        return any(k.kills for k in self.kills)
+
+    @property
+    def failed_gates(self) -> tuple[str, ...]:
+        return tuple(g.gate_id for g in self.gates if g.passed is False)
+
+    @property
+    def bad_opportunity(self) -> bool:
+        """AVOID for a substantive reason (kill / hard gate / low score) rather
+        than merely thin evidence — distinct from `insufficient_data`."""
+        return self.verdict is Verdict.AVOID and not self.insufficient_data
