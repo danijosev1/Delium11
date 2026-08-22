@@ -200,3 +200,143 @@ def test_fetch_reviews_displays_summary(
     assert "Total reviews: 3" in result.output
     assert "Average rating:" in result.output
     assert "Newest review: 2026-07-03" in result.output
+
+
+# --- cross-market command -------------------------------------------------
+def _seed_cross_market_db() -> None:
+    import cross_market_support as seed
+    from delium.database import get_connection
+
+    with get_connection() as conn:
+        run = seed.new_run(conn)
+        seed.seed_strong_source(conn, run, "USASIN1")
+        seed.seed_keyword_volume(conn, run, "AU", seed._SEED, 8000)
+        seed.seed_serp(conn, run, "AU", seed._SEED, ["AUWEAK"])
+        seed.seed_product(conn, run, "AUWEAK", "AU", reviews=40)
+
+
+def test_cross_market_unknown_marketplace(initialized_db: Path) -> None:
+    result = runner.invoke(app, ["cross-market", "US", "ZZ"])
+    assert result.exit_code == 1
+    assert "Unknown marketplace" in result.output
+
+
+def test_cross_market_requires_target(initialized_db: Path) -> None:
+    result = runner.invoke(app, ["cross-market", "US"])
+    assert result.exit_code == 1
+    assert "target" in result.output.lower()
+
+
+def test_cross_market_single_target(initialized_db: Path) -> None:
+    _seed_cross_market_db()
+    result = runner.invoke(app, ["cross-market", "US", "AU"])
+    assert result.exit_code == 0
+    assert "Cross-market discovery" in result.output
+    assert "Buy/Test/Avoid verdict" in result.output  # discovery-signal disclaimer
+    assert "US → AU" in result.output
+    assert "USASIN1" in result.output
+
+
+def test_cross_market_multi_target(initialized_db: Path) -> None:
+    _seed_cross_market_db()
+    result = runner.invoke(app, ["cross-market", "US", "--targets", "AU,IN"])
+    assert result.exit_code == 0
+    assert "US → AU" in result.output
+    assert "US → IN" in result.output  # IN never looked up → insufficient
+
+
+def test_cross_market_rejects_both_target_and_targets(initialized_db: Path) -> None:
+    result = runner.invoke(app, ["cross-market", "US", "AU", "--targets", "IN"])
+    assert result.exit_code == 1
+    assert "not both" in result.output
+
+
+def test_cross_market_no_candidates_message(initialized_db: Path) -> None:
+    result = runner.invoke(app, ["cross-market", "US", "AU"])
+    assert result.exit_code == 0
+    assert "No qualifying candidates" in result.output
+
+
+def test_cross_market_persists_match(initialized_db: Path) -> None:
+    _seed_cross_market_db()
+    runner.invoke(app, ["cross-market", "US", "AU"])
+    from delium.database import get_connection, repository
+
+    with get_connection() as conn:
+        matches = repository.get_matches_for_source(
+            conn, source_asin="USASIN1", source_marketplace="US"
+        )
+    assert len(matches) == 1
+    assert matches[0]["target_marketplace"] == "AU"
+
+
+def test_cross_market_invalid_maturity(initialized_db: Path) -> None:
+    result = runner.invoke(app, ["cross-market", "US", "AU", "--min-source-maturity", "bogus"])
+    assert result.exit_code == 1
+    assert "Unknown maturity" in result.output
+
+
+def test_cross_market_target_same_as_source(initialized_db: Path) -> None:
+    result = runner.invoke(app, ["cross-market", "US", "US"])
+    assert result.exit_code == 1
+    assert "differs from the source" in result.output
+
+
+def test_cross_market_force_without_credentials_degrades(
+    initialized_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_cross_market_db()
+    monkeypatch.delenv("DELIUM_KEEPA_API_KEY", raising=False)
+    monkeypatch.delenv("DELIUM_DATAFORSEO_LOGIN", raising=False)
+    monkeypatch.delenv("DELIUM_DATAFORSEO_PASSWORD", raising=False)
+    result = runner.invoke(app, ["cross-market", "US", "AU", "--force"])
+    assert result.exit_code == 0
+    assert "refresh skipped" in result.output  # no creds → degrade, still discovers
+    assert "US → AU" in result.output
+
+
+def test_fetch_product_marketplace_option_validated(initialized_db: Path) -> None:
+    result = runner.invoke(app, ["fetch", "product", "B0X", "-m", "ZZ"])
+    assert result.exit_code == 1
+    assert "Unknown marketplace" in result.output
+
+
+def test_cross_market_force_refresh_calls_providers(
+    initialized_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --force with working (mocked) providers must refetch source + per-market
+    # keyword data — the CLI → provider → cache marketplace flow.
+    import delium.cli.main as cli_main
+    from dataforseo_support import FakePostTransport, ok, related_body, serp_body, volume_body
+    from delium.providers.dataforseo import DataForSeoClient
+    from delium.providers.keepa import KeepaClient
+    from keepa_support import FakeTransport, keepa_product_body
+    from keepa_support import ok as kok
+
+    _seed_cross_market_db()  # seeds source product + source seed/serp
+    monkeypatch.setenv("DELIUM_KEEPA_API_KEY", "k")
+    monkeypatch.setenv("DELIUM_DATAFORSEO_LOGIN", "l")
+    monkeypatch.setenv("DELIUM_DATAFORSEO_PASSWORD", "p")
+
+    def fake_keepa(**kwargs: object) -> object:
+        mp = str(kwargs.get("marketplace", "US"))
+        return KeepaClient(
+            "k",
+            transport=FakeTransport([kok(keepa_product_body("USASIN1"))]),
+            sleep=lambda _: None,
+            marketplace=mp,
+        )
+
+    def fake_dfs(**kwargs: object) -> object:
+        mp = str(kwargs.get("marketplace", "US"))
+        transport = FakePostTransport(
+            [ok(volume_body(9000)), ok(related_body()), ok(serp_body())] * 2
+        )
+        return DataForSeoClient("l", "p", transport=transport, sleep=lambda _: None, marketplace=mp)
+
+    monkeypatch.setattr(cli_main.KeepaClient, "from_env", staticmethod(fake_keepa))
+    monkeypatch.setattr(cli_main.DataForSeoClient, "from_env", staticmethod(fake_dfs))
+
+    result = runner.invoke(app, ["cross-market", "US", "AU", "--force"])
+    assert result.exit_code == 0
+    assert "US → AU" in result.output

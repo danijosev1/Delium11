@@ -35,12 +35,15 @@ class ProductView:
     asin: str
     found: bool
     from_cache: bool
+    marketplace: str = "US"
     title: str | None = None
     brand: str | None = None
     category_path: str | None = None
     dims: dict[str, int] | None = None
     weight_g: int | None = None
     images_count: int | None = None
+    gtin: str | None = None
+    manufacturer: str | None = None
     latest_price_cents: int | None = None
     latest_bsr: int | None = None
     history_points: int = 0
@@ -48,8 +51,10 @@ class ProductView:
     cost_usd: float = 0.0
 
 
-def _request_key(asin: str) -> str:
-    return f"{_PROVIDER}:{_ENDPOINT}:{asin}"
+def _request_key(marketplace: str, asin: str) -> str:
+    # Marketplace-scoped so a US fetch and an IN fetch of the same ASIN never
+    # share a cache entry (cross-market isolation).
+    return f"{_PROVIDER}:{_ENDPOINT}:{marketplace}:{asin}"
 
 
 def _latest(rows: list[sqlite3.Row], column: str) -> int | None:
@@ -65,11 +70,12 @@ def _view_from_db(
     conn: sqlite3.Connection,
     asin: str,
     *,
+    marketplace: str,
     from_cache: bool,
     tokens_used: int,
     cost_usd: float,
 ) -> ProductView | None:
-    product = repository.get_product(conn, asin)
+    product = repository.get_product(conn, asin, marketplace)
     if product is None:
         return None
     history = repository.get_price_bsr_history(conn, asin)
@@ -82,12 +88,15 @@ def _view_from_db(
         asin=asin,
         found=True,
         from_cache=from_cache,
+        marketplace=product["marketplace"],
         title=product["title"],
         brand=product["brand"],
         category_path=product["category_path"],
         dims=dims,
         weight_g=product["weight_g"],
         images_count=product["images_count"],
+        gtin=product["gtin"],
+        manufacturer=product["manufacturer"],
         latest_price_cents=_latest(history, "price_cents"),
         latest_bsr=_latest(history, "bsr"),
         history_points=len(history),
@@ -110,6 +119,8 @@ def _store_normalized(conn: sqlite3.Connection, product: NormalizedProduct, fetc
         size_tier=None,  # size-tier classification is analysis/fees, not ingestion
         images_count=product.images_count,
         amazon_on_listing=product.amazon_on_listing,
+        gtin=product.gtin,
+        manufacturer=product.manufacturer,
     )
     for point in product.history:
         repository.upsert_price_bsr_history(
@@ -132,21 +143,31 @@ def fetch_product(
     config: DeliumConfig,
     force: bool = False,
 ) -> ProductView | None:
-    """Fetch a product cache-first. Returns a `ProductView`, or None if the ASIN
-    could not be resolved (a not-found is still logged to raw_fetches)."""
-    request_key = _request_key(asin)
+    """Fetch a product cache-first from the client's marketplace. Returns a
+    `ProductView`, or None if the ASIN could not be resolved (a not-found is
+    still logged to raw_fetches). The cache key and stored rows carry the
+    marketplace, so a US fetch never satisfies an IN request."""
+    marketplace = client.marketplace
+    request_key = _request_key(marketplace, asin)
     ttl = timedelta(hours=config.cache.product_ttl_hours)
 
     if not force:
         with get_connection() as conn:
             latest = repository.latest_raw_fetch(conn, _PROVIDER, request_key)
             if latest is not None and is_fresh(latest["fetched_at"], ttl):
-                view = _view_from_db(conn, asin, from_cache=True, tokens_used=0, cost_usd=0.0)
+                view = _view_from_db(
+                    conn,
+                    asin,
+                    marketplace=marketplace,
+                    from_cache=True,
+                    tokens_used=0,
+                    cost_usd=0.0,
+                )
                 if view is not None:
-                    log.info("Cache hit for %s (fresh within TTL).", asin)
+                    log.info("Cache hit for %s [%s] (fresh within TTL).", asin, marketplace)
                     return view
 
-    log.info("Cache miss/stale for %s — calling Keepa.", asin)
+    log.info("Cache miss/stale for %s [%s] — calling Keepa.", asin, marketplace)
     fetch = client.fetch_products([asin])
     per_asin_tokens = fetch.per_asin_tokens(1)
     normalized = fetch.normalized.get(asin)
@@ -164,15 +185,21 @@ def fetch_product(
             http_status=fetch.http_status,
         )
         if normalized is None:
-            log.info("ASIN %s not found on Keepa — recorded in fetch log.", asin)
+            log.info("ASIN %s [%s] not found on Keepa — recorded in fetch log.", asin, marketplace)
             return ProductView(
                 asin=asin,
                 found=False,
                 from_cache=False,
+                marketplace=marketplace,
                 tokens_used=per_asin_tokens,
                 cost_usd=0.0,
             )
         _store_normalized(conn, normalized, fetch_id)
         return _view_from_db(
-            conn, asin, from_cache=False, tokens_used=per_asin_tokens, cost_usd=0.0
+            conn,
+            asin,
+            marketplace=marketplace,
+            from_cache=False,
+            tokens_used=per_asin_tokens,
+            cost_usd=0.0,
         )

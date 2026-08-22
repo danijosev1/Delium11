@@ -98,7 +98,7 @@ def test_stale_serp_refetches_only_serp(initialized_db: Path) -> None:
     config = DeliumConfig()
 
     fetch_keywords(SEED, run_id=_new_run(), client=client, config=config)
-    _age_out(f"dataforseo:serp:{SEED}")  # volume+related stay fresh
+    _age_out(f"dataforseo:serp:US:{SEED}")  # volume+related stay fresh
     result = fetch_keywords(SEED, run_id=_new_run(), client=client, config=config)
 
     assert result.from_cache is False  # serp was refetched
@@ -120,8 +120,10 @@ def test_cost_tracking_recorded_in_raw_fetches(initialized_db: Path) -> None:
     fetch_keywords(SEED, run_id=_new_run(), client=client, config=DeliumConfig())
 
     with get_connection() as conn:
-        volume_fetch = repository.latest_raw_fetch(conn, "dataforseo", f"dataforseo:volume:{SEED}")
-        serp_fetch = repository.latest_raw_fetch(conn, "dataforseo", f"dataforseo:serp:{SEED}")
+        volume_fetch = repository.latest_raw_fetch(
+            conn, "dataforseo", f"dataforseo:volume:US:{SEED}"
+        )
+        serp_fetch = repository.latest_raw_fetch(conn, "dataforseo", f"dataforseo:serp:US:{SEED}")
 
     assert volume_fetch is not None and volume_fetch["cost_usd"] == pytest.approx(0.024)
     assert serp_fetch is not None and serp_fetch["cost_usd"] == pytest.approx(0.006)

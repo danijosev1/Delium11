@@ -154,14 +154,16 @@ def upsert_product(
     size_tier: str | None = None,
     images_count: int | None = None,
     amazon_on_listing: bool = False,
+    gtin: str | None = None,
+    manufacturer: str | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO products
             (asin, marketplace, title, brand, category_path, listing_date,
              dims_json, weight_g, size_tier, images_count, amazon_on_listing,
-             fetch_id, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+             gtin, manufacturer, fetch_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(asin) DO UPDATE SET
             marketplace = excluded.marketplace,
             title = excluded.title,
@@ -173,6 +175,8 @@ def upsert_product(
             size_tier = excluded.size_tier,
             images_count = excluded.images_count,
             amazon_on_listing = excluded.amazon_on_listing,
+            gtin = excluded.gtin,
+            manufacturer = excluded.manufacturer,
             fetch_id = excluded.fetch_id,
             updated_at = datetime('now')
         """,
@@ -188,13 +192,58 @@ def upsert_product(
             size_tier,
             images_count,
             int(amazon_on_listing),
+            gtin,
+            manufacturer,
             fetch_id,
         ),
     )
 
 
-def get_product(conn: sqlite3.Connection, asin: str) -> sqlite3.Row | None:
-    return _one(conn.execute("SELECT * FROM products WHERE asin = ?", (asin,)))
+def get_product(
+    conn: sqlite3.Connection, asin: str, marketplace: str | None = None
+) -> sqlite3.Row | None:
+    """Fetch a product by ASIN. When `marketplace` is given, the stored row is
+    returned only if its marketplace matches — so an IN query never satisfies
+    with a US-stored row (cross-market isolation)."""
+    if marketplace is None:
+        return _one(conn.execute("SELECT * FROM products WHERE asin = ?", (asin,)))
+    return _one(
+        conn.execute(
+            "SELECT * FROM products WHERE asin = ? AND marketplace = ?",
+            (asin, marketplace),
+        )
+    )
+
+
+def get_products_by_marketplace(
+    conn: sqlite3.Connection, marketplace: str, *, limit: int | None = None
+) -> list[sqlite3.Row]:
+    """All products stored for a marketplace, newest first (candidate pool)."""
+    sql = "SELECT * FROM products WHERE marketplace = ? ORDER BY updated_at DESC, asin"
+    params: tuple[Any, ...] = (marketplace,)
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (marketplace, limit)
+    return _all(conn.execute(sql, params))
+
+
+def find_product_by_gtin(
+    conn: sqlite3.Connection, gtin: str, marketplace: str
+) -> sqlite3.Row | None:
+    """A product in `marketplace` whose GTIN matches — the exact identity key."""
+    if not gtin:
+        return None
+    return _one(
+        conn.execute(
+            """
+            SELECT * FROM products
+             WHERE gtin = ? AND marketplace = ?
+             ORDER BY updated_at DESC
+             LIMIT 1
+            """,
+            (gtin, marketplace),
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -325,8 +374,58 @@ def upsert_keyword(
     )
 
 
-def get_keyword(conn: sqlite3.Connection, phrase: str) -> sqlite3.Row | None:
-    return _one(conn.execute("SELECT * FROM keywords WHERE phrase = ?", (phrase,)))
+def get_keyword(
+    conn: sqlite3.Connection, phrase: str, marketplace: str | None = None
+) -> sqlite3.Row | None:
+    """Fetch a keyword row. When `marketplace` is given, the row is returned only
+    if its marketplace matches (cross-market isolation)."""
+    if marketplace is None:
+        return _one(conn.execute("SELECT * FROM keywords WHERE phrase = ?", (phrase,)))
+    return _one(
+        conn.execute(
+            "SELECT * FROM keywords WHERE phrase = ? AND marketplace = ?",
+            (phrase, marketplace),
+        )
+    )
+
+
+def get_serp_keyword_phrases(conn: sqlite3.Connection, asin: str, marketplace: str) -> list[str]:
+    """Distinct keyword phrases whose SERP in `marketplace` ranked this ASIN,
+    best position first. Reads serp_rankings directly (its own marketplace
+    column), independent of the collision-prone keywords PK."""
+    rows = _all(
+        conn.execute(
+            """
+            SELECT keyword_phrase, MIN(position) AS best
+              FROM serp_rankings
+             WHERE asin = ? AND marketplace = ?
+             GROUP BY keyword_phrase
+             ORDER BY best
+            """,
+            (asin, marketplace),
+        )
+    )
+    return [r["keyword_phrase"] for r in rows]
+
+
+def get_keywords_for_asin(
+    conn: sqlite3.Connection, asin: str, marketplace: str
+) -> list[sqlite3.Row]:
+    """Keywords whose SERP in `marketplace` ranked this ASIN — the deterministic
+    product→keyword-cluster link. Both the SERP row and the keyword row must be
+    in `marketplace`, so a US ranking never links an IN keyword."""
+    return _all(
+        conn.execute(
+            """
+            SELECT DISTINCT k.*
+              FROM keywords k
+              JOIN serp_rankings s ON s.keyword_phrase = k.phrase
+             WHERE s.asin = ? AND s.marketplace = ? AND k.marketplace = ?
+             ORDER BY k.volume DESC NULLS LAST, k.phrase
+            """,
+            (asin, marketplace, marketplace),
+        )
+    )
 
 
 def upsert_serp_ranking(
@@ -337,24 +436,40 @@ def upsert_serp_ranking(
     position: int,
     captured_on: str,
     sponsored: bool = False,
+    marketplace: str = "US",
 ) -> None:
     conn.execute(
         """
-        INSERT INTO serp_rankings (keyword_phrase, asin, position, sponsored, captured_on)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO serp_rankings
+            (keyword_phrase, asin, position, sponsored, captured_on, marketplace)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(keyword_phrase, asin, captured_on) DO UPDATE SET
             position = excluded.position,
-            sponsored = excluded.sponsored
+            sponsored = excluded.sponsored,
+            marketplace = excluded.marketplace
         """,
-        (keyword_phrase, asin, position, int(sponsored), captured_on),
+        (keyword_phrase, asin, position, int(sponsored), captured_on, marketplace),
     )
 
 
-def get_serp_rankings(conn: sqlite3.Connection, keyword_phrase: str) -> list[sqlite3.Row]:
+def get_serp_rankings(
+    conn: sqlite3.Connection, keyword_phrase: str, marketplace: str | None = None
+) -> list[sqlite3.Row]:
+    if marketplace is None:
+        return _all(
+            conn.execute(
+                "SELECT * FROM serp_rankings WHERE keyword_phrase = ? ORDER BY position",
+                (keyword_phrase,),
+            )
+        )
     return _all(
         conn.execute(
-            "SELECT * FROM serp_rankings WHERE keyword_phrase = ? ORDER BY position",
-            (keyword_phrase,),
+            """
+            SELECT * FROM serp_rankings
+             WHERE keyword_phrase = ? AND marketplace = ?
+             ORDER BY position
+            """,
+            (keyword_phrase, marketplace),
         )
     )
 
@@ -475,3 +590,97 @@ def insert_review_theme(
 
 def get_review_themes(conn: sqlite3.Connection, asin: str) -> list[sqlite3.Row]:
     return _all(conn.execute("SELECT * FROM review_themes WHERE asin = ? ORDER BY kind", (asin,)))
+
+
+# ---------------------------------------------------------------------------
+# product_matches (cross-marketplace product-family link)
+# ---------------------------------------------------------------------------
+def upsert_product_match(
+    conn: sqlite3.Connection,
+    *,
+    source_asin: str,
+    source_marketplace: str,
+    target_asin: str,
+    target_marketplace: str,
+    match_method: str,
+    match_confidence: str,
+    match_score: float,
+    signals: list[str] | None = None,
+    conflicts: list[str] | None = None,
+    evidence: str | None = None,
+    run_id: str | None = None,
+) -> str:
+    """Persist (or refresh) a deterministic cross-market identity match. Keyed by
+    the (source, target) marketplace pair so a re-run overwrites rather than
+    duplicates. Returns the row id."""
+    match_id = _new_id()
+    conn.execute(
+        """
+        INSERT INTO product_matches
+            (id, run_id, source_asin, source_marketplace, target_asin,
+             target_marketplace, match_method, match_confidence, match_score,
+             signals, conflicts, evidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_asin, source_marketplace, target_asin, target_marketplace)
+        DO UPDATE SET
+            run_id = excluded.run_id,
+            match_method = excluded.match_method,
+            match_confidence = excluded.match_confidence,
+            match_score = excluded.match_score,
+            signals = excluded.signals,
+            conflicts = excluded.conflicts,
+            evidence = excluded.evidence,
+            created_at = datetime('now')
+        """,
+        (
+            match_id,
+            run_id,
+            source_asin,
+            source_marketplace,
+            target_asin,
+            target_marketplace,
+            match_method,
+            match_confidence,
+            match_score,
+            None if signals is None else _dumps(signals),
+            None if conflicts is None else _dumps(conflicts),
+            evidence,
+        ),
+    )
+    return match_id
+
+
+def get_product_match(
+    conn: sqlite3.Connection,
+    *,
+    source_asin: str,
+    source_marketplace: str,
+    target_asin: str,
+    target_marketplace: str,
+) -> sqlite3.Row | None:
+    return _one(
+        conn.execute(
+            """
+            SELECT * FROM product_matches
+             WHERE source_asin = ? AND source_marketplace = ?
+               AND target_asin = ? AND target_marketplace = ?
+            """,
+            (source_asin, source_marketplace, target_asin, target_marketplace),
+        )
+    )
+
+
+def get_matches_for_source(
+    conn: sqlite3.Connection,
+    *,
+    source_asin: str,
+    source_marketplace: str,
+    target_marketplace: str | None = None,
+) -> list[sqlite3.Row]:
+    sql = "SELECT * FROM product_matches WHERE source_asin = ? AND source_marketplace = ?"
+    params: tuple[Any, ...] = (source_asin, source_marketplace)
+    if target_marketplace is not None:
+        sql += " AND target_marketplace = ?"
+        params = (source_asin, source_marketplace, target_marketplace)
+    sql += " ORDER BY match_score DESC"
+    return _all(conn.execute(sql, params))

@@ -42,13 +42,20 @@ class KeywordFetchResult:
     seed: str
     seed_volume: int | None
     from_cache: bool
+    marketplace: str = "US"
     related: list[KeywordVolume] = field(default_factory=list)
     serp: list[SerpItem] = field(default_factory=list)
     cost_usd: float = 0.0
 
 
-def _request_key(endpoint: str, seed: str) -> str:
-    return f"{_PROVIDER}:{endpoint}:{seed}"
+def keyword_request_key(marketplace: str, endpoint: str, seed: str) -> str:
+    """Marketplace-scoped cache key: a US keyword/SERP lookup never satisfies an
+    IN one. `endpoint` is 'volume' | 'related' | 'serp'."""
+    return f"{_PROVIDER}:{endpoint}:{marketplace}:{seed}"
+
+
+# Backwards-compatible private alias used throughout this module.
+_request_key = keyword_request_key
 
 
 @dataclass(frozen=True)
@@ -102,8 +109,10 @@ def fetch_keywords(
     config: DeliumConfig,
     force: bool = False,
 ) -> KeywordFetchResult:
-    """Fetch a seed keyword's volume, related keywords, and SERP — cache-first."""
+    """Fetch a seed keyword's volume, related keywords, and SERP — cache-first,
+    scoped to the client's marketplace."""
     seed_norm = normalize_phrase(seed)
+    marketplace = client.marketplace
     kw_ttl = timedelta(days=config.cache.keyword_ttl_days)
     serp_ttl = timedelta(days=config.cache.serp_ttl_days)
     today = datetime.now(UTC).strftime("%Y-%m-%d")
@@ -113,7 +122,7 @@ def fetch_keywords(
     volume_step = _cached_or_fetch(
         run_id=run_id,
         endpoint="bulk_search_volume",
-        request_key=_request_key("volume", seed_norm),
+        request_key=_request_key(marketplace, "volume", seed_norm),
         ttl=kw_ttl,
         force=force,
         call=lambda: client.search_volume([seed_norm]),
@@ -122,14 +131,18 @@ def fetch_keywords(
     if volume_step.fetch_id is not None:
         with get_connection() as conn:
             repository.upsert_keyword(
-                conn, phrase=seed_norm, fetch_id=volume_step.fetch_id, volume=seed_volume
+                conn,
+                phrase=seed_norm,
+                fetch_id=volume_step.fetch_id,
+                marketplace=marketplace,
+                volume=seed_volume,
             )
 
     # 2. Related keywords.
     related_step = _cached_or_fetch(
         run_id=run_id,
         endpoint="related_keywords",
-        request_key=_request_key("related", seed_norm),
+        request_key=_request_key(marketplace, "related", seed_norm),
         ttl=kw_ttl,
         force=force,
         call=lambda: client.related_keywords(seed_norm),
@@ -139,14 +152,18 @@ def fetch_keywords(
         with get_connection() as conn:
             for kw in related:
                 repository.upsert_keyword(
-                    conn, phrase=kw.phrase, fetch_id=related_step.fetch_id, volume=kw.volume
+                    conn,
+                    phrase=kw.phrase,
+                    fetch_id=related_step.fetch_id,
+                    marketplace=marketplace,
+                    volume=kw.volume,
                 )
 
     # 3. SERP.
     serp_step = _cached_or_fetch(
         run_id=run_id,
         endpoint="amazon_serp",
-        request_key=_request_key("serp", seed_norm),
+        request_key=_request_key(marketplace, "serp", seed_norm),
         ttl=serp_ttl,
         force=force,
         call=lambda: client.serp(seed_norm),
@@ -162,6 +179,7 @@ def fetch_keywords(
                     position=item.position,
                     sponsored=item.sponsored,
                     captured_on=today,
+                    marketplace=marketplace,
                 )
 
     from_cache = volume_step.from_cache and related_step.from_cache and serp_step.from_cache
@@ -178,6 +196,7 @@ def fetch_keywords(
         seed=seed_norm,
         seed_volume=seed_volume,
         from_cache=from_cache,
+        marketplace=marketplace,
         related=related,
         serp=serp,
         cost_usd=total_cost,

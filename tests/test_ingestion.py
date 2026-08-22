@@ -26,7 +26,7 @@ def _age_out_cache(asin: str) -> None:
     with get_connection() as conn:
         conn.execute(
             "UPDATE raw_fetches SET fetched_at = '2000-01-01 00:00:00' WHERE request_key = ?",
-            (f"keepa:product:{asin}",),
+            (f"keepa:product:US:{asin}",),
         )
 
 
@@ -95,7 +95,9 @@ def test_not_found_logs_fetch_and_returns_absent_view(initialized_db: Path) -> N
 
     with get_connection() as conn:
         # The fetch is still logged (audit trail), but no product row exists.
-        assert repository.latest_raw_fetch(conn, "keepa", "keepa:product:B0MISSING01") is not None
+        assert (
+            repository.latest_raw_fetch(conn, "keepa", "keepa:product:US:B0MISSING01") is not None
+        )
         assert repository.get_product(conn, "B0MISSING01") is None
 
 

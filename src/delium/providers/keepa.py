@@ -41,8 +41,31 @@ KEEPA_PRODUCT_URL = "https://api.keepa.com/product"
 # unix_seconds = (keepa_minutes + KEEPA_EPOCH_MINUTES) * 60
 KEEPA_EPOCH_MINUTES = 21564000
 
+# Keepa domain ids per marketplace (Keepa's fixed numbering). Keyed by the
+# marketplace code strings used across ingestion/DB (== analysis Marketplace enum
+# values). Providers stay decoupled from the analysis layer; this table is the
+# provider-side half of the centralized marketplace model.
+_KEEPA_DOMAINS: dict[str, int] = {
+    "US": 1,
+    "UK": 2,
+    "CA": 6,
+    "IN": 10,
+    "AU": 13,
+}
 # Domain id for amazon.com (US). Keepa uses 1 for the US marketplace.
-_DOMAIN_US = 1
+_DOMAIN_US = _KEEPA_DOMAINS["US"]
+
+
+def keepa_domain(marketplace: str) -> int:
+    """Keepa domain id for a marketplace code, or raise for an unsupported one."""
+    try:
+        return _KEEPA_DOMAINS[marketplace]
+    except KeyError as exc:
+        raise ProviderConfigError(
+            f"Keepa: unsupported marketplace {marketplace!r} "
+            f"(known: {', '.join(sorted(_KEEPA_DOMAINS))})."
+        ) from exc
+
 
 # csv[] positional indices we consume (Keepa's fixed layout).
 _CSV_AMAZON = 0  # Amazon price, cents
@@ -82,6 +105,8 @@ class NormalizedProduct:
     weight_g: int | None
     images_count: int | None
     amazon_on_listing: bool
+    gtin: str | None = None  # best barcode (EAN preferred, else UPC) — for identity
+    manufacturer: str | None = None
     history: list[PriceBsrPoint] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -172,6 +197,34 @@ def _extract_category_path(raw: dict[str, Any]) -> str | None:
     return None
 
 
+def _first_barcode(raw: dict[str, Any], key: str) -> str | None:
+    """First non-empty barcode string from a Keepa list field (eanList/upcList)."""
+    values = raw.get(key)
+    if isinstance(values, list):
+        for value in values:
+            text = str(value).strip() if value is not None else ""
+            if text:
+                return text
+    elif isinstance(values, str) and values.strip():
+        return values.strip()
+    return None
+
+
+def _extract_gtin(raw: dict[str, Any]) -> str | None:
+    """Best single barcode for identity matching: EAN (13-digit superset) is
+    preferred over UPC (12-digit). We do NOT invent identifiers — only what
+    Keepa returns. The cross-market matcher normalizes UPC/EAN to digits, so a
+    UPC stored here still matches its EAN-13 counterpart elsewhere."""
+    return _first_barcode(raw, "eanList") or _first_barcode(raw, "upcList")
+
+
+def _clean_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _is_found(raw: dict[str, Any]) -> bool:
     """A Keepa product entry with no title and no history is a dead/absent ASIN."""
     if raw.get("title"):
@@ -224,6 +277,8 @@ def normalize_product(raw: dict[str, Any], marketplace: str = "US") -> Normalize
         weight_g=_positive_or_none(raw.get("packageWeight")),
         images_count=_extract_images_count(raw),
         amazon_on_listing=bool(amazon),
+        gtin=_extract_gtin(raw),
+        manufacturer=_clean_str(raw.get("manufacturer")),
         history=history,
         raw=raw,
     )
@@ -241,25 +296,34 @@ class KeepaClient:
         *,
         transport: Transport | None = None,
         sleep: Callable[[float], None] = time.sleep,
-        domain: int = _DOMAIN_US,
+        marketplace: str = "US",
+        domain: int | None = None,
     ) -> None:
         if not api_key:
             raise ProviderConfigError("Keepa API key is required.")
         self._api_key = api_key
         self._transport = transport or UrllibTransport()
         self._sleep = sleep
-        self._domain = domain
+        self._marketplace = marketplace
+        # `domain` overrides the marketplace mapping when given (back-compat).
+        self._domain = domain if domain is not None else keepa_domain(marketplace)
         self._tokens_left: int | None = None
         self._refill_rate: int | None = None
 
+    @property
+    def marketplace(self) -> str:
+        return self._marketplace
+
     @classmethod
-    def from_env(cls, *, transport: Transport | None = None) -> KeepaClient:
+    def from_env(
+        cls, *, transport: Transport | None = None, marketplace: str = "US"
+    ) -> KeepaClient:
         key = get_secrets().keepa_api_key
         if key is None:
             raise ProviderConfigError(
                 "DELIUM_KEEPA_API_KEY is not set — add it to your environment or .env."
             )
-        return cls(key.get_secret_value(), transport=transport)
+        return cls(key.get_secret_value(), transport=transport, marketplace=marketplace)
 
     def fetch_product(self, asin: str) -> KeepaFetch:
         return self.fetch_products([asin])
@@ -360,7 +424,7 @@ class KeepaClient:
                 continue
             raw_products[asin] = entry
             if _is_found(entry):
-                normalized[asin] = normalize_product(entry, marketplace="US")
+                normalized[asin] = normalize_product(entry, marketplace=self._marketplace)
 
         tokens_consumed = _positive_or_none(body.get("tokensConsumed")) or 0
         return KeepaFetch(

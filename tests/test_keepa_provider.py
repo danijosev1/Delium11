@@ -200,3 +200,51 @@ def test_empty_asin_list_rejected() -> None:
     client = _client([ok(keepa_product_body())])
     with pytest.raises(ValueError, match="at least one ASIN"):
         client.fetch_products([])
+
+
+# --- marketplace + identity (cross-market) --------------------------------
+def test_keepa_domain_mapping() -> None:
+    from delium.providers.keepa import keepa_domain
+
+    assert keepa_domain("US") == 1
+    assert keepa_domain("UK") == 2
+    assert keepa_domain("CA") == 6
+    assert keepa_domain("IN") == 10
+    assert keepa_domain("AU") == 13
+
+
+def test_keepa_unknown_marketplace_rejected() -> None:
+    from delium.providers.base import ProviderConfigError
+    from delium.providers.keepa import keepa_domain
+
+    with pytest.raises(ProviderConfigError, match="unsupported marketplace"):
+        keepa_domain("ZZ")
+
+
+def test_client_marketplace_sets_domain() -> None:
+    client = KeepaClient("k", transport=FakeTransport([ok(keepa_product_body())]), marketplace="AU")
+    assert client.marketplace == "AU"
+    client.fetch_product(DEFAULT_ASIN)
+    # The Keepa domain for AU (13) was sent on the request.
+    transport = client._transport  # type: ignore[attr-defined]
+    assert transport.calls[0]["domain"] == "13"
+
+
+def test_normalize_extracts_gtin_and_manufacturer() -> None:
+    product = normalize_product(keepa_product_body()["products"][0], marketplace="AU")
+    assert product.marketplace == "AU"
+    assert product.gtin == "0012345678905"  # EAN preferred
+    assert product.manufacturer == "Acme Corp"
+
+
+def test_normalize_gtin_falls_back_to_upc() -> None:
+    raw = {"asin": "B0UPC000001", "title": "UPC only", "upcList": ["012345678905"], "csv": []}
+    product = normalize_product(raw)
+    assert product.gtin == "012345678905"
+
+
+def test_normalize_gtin_absent_is_none() -> None:
+    raw = {"asin": "B0NOGTIN001", "title": "No codes", "csv": []}
+    product = normalize_product(raw)
+    assert product.gtin is None
+    assert product.manufacturer is None

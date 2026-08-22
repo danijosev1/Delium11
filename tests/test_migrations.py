@@ -25,6 +25,7 @@ EXPECTED_TABLES = {
     "competitor_sets",
     "reviews",
     "review_themes",
+    "product_matches",
     "schema_migrations",
 }
 
@@ -48,7 +49,7 @@ def test_discover_migrations_are_ordered_and_named() -> None:
 
 def test_initialize_creates_all_tables(isolated_env: Path) -> None:
     applied = initialize_database()
-    assert applied == [1]
+    assert applied == [1, 2]
     assert EXPECTED_TABLES.issubset(_table_names(isolated_env / "data" / "delium.db"))
 
 
@@ -67,7 +68,7 @@ def test_initialize_enables_wal_and_foreign_keys(isolated_env: Path) -> None:
 def test_initialize_is_idempotent(isolated_env: Path) -> None:
     first = initialize_database()
     second = initialize_database()
-    assert first == [1]
+    assert first == [1, 2]
     assert second == []  # nothing new to apply the second time
 
 
@@ -79,8 +80,10 @@ def test_applied_versions_recorded(isolated_env: Path) -> None:
         rows = conn.execute("SELECT version, name FROM schema_migrations").fetchall()
     finally:
         conn.close()
-    assert applied == {1}
-    assert rows[0]["name"] == "0001_initial_schema.sql"
+    assert applied == {1, 2}
+    names = {row["name"] for row in rows}
+    assert "0001_initial_schema.sql" in names
+    assert "0002_cross_market.sql" in names
 
 
 def test_key_indexes_exist(isolated_env: Path) -> None:
@@ -94,6 +97,36 @@ def test_key_indexes_exist(isolated_env: Path) -> None:
     assert "idx_raw_fetches_lookup" in index_names
     assert "idx_reviews_asin" in index_names
     assert "idx_competitor_sets_run" in index_names
+
+
+def _columns(db_path: Path, table: str) -> set[str]:
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    finally:
+        conn.close()
+    return {row["name"] for row in rows}
+
+
+def test_migration_0002_adds_identity_and_matches(isolated_env: Path) -> None:
+    initialize_database()
+    db_path = isolated_env / "data" / "delium.db"
+    product_cols = _columns(db_path, "products")
+    assert {"gtin", "manufacturer"} <= product_cols
+    assert "marketplace" in _columns(db_path, "serp_rankings")
+    match_cols = _columns(db_path, "product_matches")
+    assert {
+        "source_asin",
+        "source_marketplace",
+        "target_asin",
+        "target_marketplace",
+        "match_method",
+        "match_confidence",
+        "match_score",
+        "signals",
+        "conflicts",
+        "evidence",
+    } <= match_cols
 
 
 def test_bad_filename_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -122,7 +155,8 @@ def test_failed_migration_rolls_back(
 
     migration_dir = tmp_path / "m"
     migration_dir.mkdir()
-    (migration_dir / "0002_broken.sql").write_text(
+    # Version 3 (past the real 0001/0002 already applied to initialized_db).
+    (migration_dir / "0003_broken.sql").write_text(
         "CREATE TABLE ok_table (id INTEGER);\nTHIS IS NOT SQL;"
     )
     monkeypatch.setattr(migrations_module, "MIGRATIONS_DIR", migration_dir)
@@ -144,5 +178,5 @@ def test_failed_migration_rolls_back(
     finally:
         conn.close()
 
-    assert 2 not in applied  # broken migration not recorded
+    assert 3 not in applied  # broken migration not recorded
     assert "ok_table" not in tables  # its partial DDL was rolled back

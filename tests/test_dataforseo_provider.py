@@ -141,3 +141,34 @@ def test_empty_credentials_rejected() -> None:
 def test_search_volume_requires_keywords() -> None:
     with pytest.raises(ValueError, match="at least one keyword"):
         _client([ok(volume_body())]).search_volume([])
+
+
+# --- marketplace routing (cross-market) -----------------------------------
+def test_dataforseo_location_mapping() -> None:
+    from delium.providers.dataforseo import dataforseo_location
+
+    assert dataforseo_location("US") == (2840, "en_US")
+    assert dataforseo_location("UK") == (2826, "en_GB")
+    assert dataforseo_location("CA") == (2124, "en_CA")
+    assert dataforseo_location("AU") == (2036, "en_AU")
+    assert dataforseo_location("IN") == (2356, "en_IN")
+
+
+def test_dataforseo_unknown_marketplace_rejected() -> None:
+    from delium.providers.base import ProviderConfigError
+    from delium.providers.dataforseo import dataforseo_location
+
+    with pytest.raises(ProviderConfigError, match="unsupported marketplace"):
+        dataforseo_location("ZZ")
+
+
+def test_client_marketplace_sets_location_in_request() -> None:
+    transport = FakePostTransport([ok(volume_body(6000))])
+    client = DataForSeoClient(
+        "login", "pass", transport=transport, sleep=lambda _: None, marketplace="IN"
+    )
+    assert client.marketplace == "IN"
+    client.search_volume(["baby food tray"])
+    _url, body = transport.calls[0]
+    assert body[0]["location_code"] == 2356
+    assert body[0]["language_code"] == "en_IN"

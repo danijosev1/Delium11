@@ -48,6 +48,9 @@ def keepa_product_body(
             "asin": asin,
             "title": "Test Silicone Tray",
             "brand": "Acme",
+            "manufacturer": "Acme Corp",
+            "eanList": ["0012345678905"],
+            "upcList": ["012345678905"],
             "categoryTree": [
                 {"catId": 1, "name": "Baby"},
                 {"catId": 2, "name": "Feeding"},

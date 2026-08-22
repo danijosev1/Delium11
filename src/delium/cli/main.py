@@ -18,6 +18,7 @@ from delium import __version__
 from delium.config import ConfigError, load_config
 from delium.database import initialize_database, repository
 from delium.database.connection import get_connection
+from delium.ingestion import CrossMarketCandidate
 from delium.providers import ProviderError, build_review_provider
 from delium.providers.dataforseo import DataForSeoClient
 from delium.providers.keepa import KeepaClient
@@ -117,9 +118,25 @@ def _price_str(cents: int | None) -> str:
     return f"${cents / 100:.2f}" if cents is not None else "—"
 
 
+def _validate_marketplace(code: str) -> str:
+    """Normalize and validate a marketplace code against the central registry."""
+    from delium.analysis.models import Marketplace
+
+    normalized = code.strip().upper()
+    try:
+        return Marketplace(normalized).value
+    except ValueError as exc:
+        supported = ", ".join(m.value for m in Marketplace)
+        console.print(f"[bold red]Unknown marketplace {code!r}.[/bold red] Supported: {supported}.")
+        raise typer.Exit(code=1) from exc
+
+
 @fetch_app.command("product")
 def fetch_product_cmd(
     asin: Annotated[str, typer.Argument(help="Amazon ASIN, e.g. B08XXXXXXX.")],
+    marketplace: Annotated[
+        str, typer.Option("--marketplace", "-m", help="Marketplace: US, CA, UK, AU, IN.")
+    ] = "US",
     force: Annotated[bool, typer.Option("--force", help="Bypass the cache and refetch.")] = False,
 ) -> None:
     """Fetch a product from Keepa (cache-first), store it, and show a summary."""
@@ -127,15 +144,18 @@ def fetch_product_cmd(
 
     initialize_database()  # idempotent — ensures the schema exists
     config = load_config()
+    marketplace = _validate_marketplace(marketplace)
 
     try:
-        client = KeepaClient.from_env()
+        client = KeepaClient.from_env(marketplace=marketplace)
     except ProviderError as exc:
         console.print(f"[bold red]Provider error:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
 
     with get_connection() as conn:
-        run_id = repository.insert_run(conn, command="fetch.product", input_=asin)
+        run_id = repository.insert_run(
+            conn, command="fetch.product", input_=f"{marketplace}:{asin}"
+        )
 
     status = "complete"
     try:
@@ -156,6 +176,7 @@ def fetch_product_cmd(
         raise typer.Exit(code=1)
 
     source = "cache" if view.from_cache else f"Keepa ({view.tokens_used} tokens)"
+    console.print(f"[dim]marketplace: {view.marketplace}[/dim]")
     dims = (
         f"{view.dims['length_mm']}×{view.dims['width_mm']}×{view.dims['height_mm']} mm"
         if view.dims and {"length_mm", "width_mm", "height_mm"} <= view.dims.keys()
@@ -176,6 +197,9 @@ def fetch_product_cmd(
 @fetch_app.command("keywords")
 def fetch_keywords_cmd(
     keyword: Annotated[str, typer.Argument(help="Seed keyword, e.g. 'silicone baby food tray'.")],
+    marketplace: Annotated[
+        str, typer.Option("--marketplace", "-m", help="Marketplace: US, CA, UK, AU, IN.")
+    ] = "US",
     force: Annotated[bool, typer.Option("--force", help="Bypass the cache and refetch.")] = False,
 ) -> None:
     """Fetch a keyword's volume, related keywords, and Amazon SERP (cache-first)."""
@@ -183,15 +207,18 @@ def fetch_keywords_cmd(
 
     initialize_database()  # idempotent
     config = load_config()
+    marketplace = _validate_marketplace(marketplace)
 
     try:
-        client = DataForSeoClient.from_env()
+        client = DataForSeoClient.from_env(marketplace=marketplace)
     except ProviderError as exc:
         console.print(f"[bold red]Provider error:[/bold red] {exc}")
         raise typer.Exit(code=1) from exc
 
     with get_connection() as conn:
-        run_id = repository.insert_run(conn, command="fetch.keywords", input_=keyword)
+        run_id = repository.insert_run(
+            conn, command="fetch.keywords", input_=f"{marketplace}:{keyword}"
+        )
 
     try:
         result = fetch_keywords(keyword, run_id=run_id, client=client, config=config, force=force)
@@ -316,6 +343,175 @@ def watch() -> None:
     """Refresh the watchlist: re-pull tracked ASINs/niches and flag deltas."""
     log.info("watch requested")
     _not_implemented("watch")
+
+
+def _refresh_discovery_data(
+    source_mp: str, target_mps: list[str], config: object, asins: list[str], run_id: str
+) -> None:
+    """Best-effort provider refresh for --force: refetch each candidate's source
+    product and re-pull its linked seed keyword cluster in the source and every
+    target marketplace. Requires provider credentials; degrades to a warning if
+    they are absent. This is where the marketplace flows CLI → provider → cache."""
+    from delium.ingestion import fetch_keywords, fetch_product
+
+    try:
+        keepa = KeepaClient.from_env(marketplace=source_mp)
+        dfs_source = DataForSeoClient.from_env(marketplace=source_mp)
+        dfs_targets = {mp: DataForSeoClient.from_env(marketplace=mp) for mp in target_mps}
+    except ProviderError as exc:
+        console.print(f"[yellow]--force refresh skipped:[/yellow] {exc}")
+        return
+
+    for asin in asins:
+        try:
+            fetch_product(asin, run_id=run_id, client=keepa, config=config, force=True)  # type: ignore[arg-type]
+            with get_connection() as conn:
+                seeds = repository.get_serp_keyword_phrases(conn, asin, source_mp)
+            for seed in seeds[:1]:  # primary cluster only
+                fetch_keywords(seed, run_id=run_id, client=dfs_source, config=config, force=True)  # type: ignore[arg-type]
+                for client in dfs_targets.values():
+                    fetch_keywords(seed, run_id=run_id, client=client, config=config, force=True)  # type: ignore[arg-type]
+        except ProviderError as exc:
+            console.print(f"[yellow]refresh failed for {asin}:[/yellow] {exc}")
+
+
+@app.command("cross-market")
+def cross_market_cmd(
+    source: Annotated[str, typer.Argument(help="Source marketplace, e.g. US.")],
+    target: Annotated[
+        str | None,
+        typer.Argument(help="Single target marketplace, e.g. AU. Omit if using --targets."),
+    ] = None,
+    targets: Annotated[
+        str | None,
+        typer.Option("--targets", help="Comma-separated targets, e.g. US,UK,CA,AU,IN."),
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", help="Max source candidates to evaluate.")] = 25,
+    min_source_demand: Annotated[
+        int | None,
+        typer.Option("--min-source-demand", help="Min source est. monthly units to qualify."),
+    ] = None,
+    min_source_maturity: Annotated[
+        str,
+        typer.Option(
+            "--min-source-maturity",
+            help="Min source maturity: emerging, validated, strong, exceptional.",
+        ),
+    ] = "emerging",
+    force: Annotated[
+        bool, typer.Option("--force", help="Refresh provider data before discovery.")
+    ] = False,
+) -> None:
+    """Discover products proven in SOURCE that look underpenetrated in a target.
+
+    Reads already-fetched, marketplace-scoped data (fetch first with
+    `fetch product -m` / `fetch keywords -m`). This is a DISCOVERY SIGNAL — what
+    to VALIDATE next — never a Buy/Test/Avoid verdict (scoring owns that).
+    """
+    from delium.analysis.models import Marketplace, SourceMaturity
+    from delium.ingestion import discover_cross_market
+
+    initialize_database()
+    config = load_config()
+
+    source_mp = _validate_marketplace(source)
+    if target and targets:
+        console.print("[bold red]Pass either a TARGET argument or --targets, not both.[/bold red]")
+        raise typer.Exit(code=1)
+    raw_targets = targets.split(",") if targets else ([target] if target else [])
+    if not raw_targets:
+        console.print("[bold red]Specify a target marketplace (TARGET or --targets).[/bold red]")
+        raise typer.Exit(code=1)
+    target_mps = [_validate_marketplace(t) for t in raw_targets if t.strip()]
+    target_mps = [mp for mp in target_mps if mp != source_mp]
+    if not target_mps:
+        console.print("[bold red]No target marketplace differs from the source.[/bold red]")
+        raise typer.Exit(code=1)
+
+    try:
+        maturity = SourceMaturity(min_source_maturity.strip().lower())
+    except ValueError as exc:
+        console.print(f"[bold red]Unknown maturity {min_source_maturity!r}.[/bold red]")
+        raise typer.Exit(code=1) from exc
+
+    with get_connection() as conn:
+        run_id = repository.insert_run(
+            conn, command="cross-market", input_=f"{source_mp}->{','.join(target_mps)}"
+        )
+
+    if force:
+        with get_connection() as conn:
+            candidate_asins = repository.get_products_by_marketplace(conn, source_mp, limit=limit)
+        _refresh_discovery_data(
+            source_mp, target_mps, config, [r["asin"] for r in candidate_asins], run_id
+        )
+
+    with get_connection() as conn:
+        candidates = discover_cross_market(
+            conn,
+            source_mp=Marketplace(source_mp),
+            target_mps=tuple(Marketplace(mp) for mp in target_mps),
+            config=config,
+            run_id=run_id,
+            limit=limit,
+            min_source_maturity=maturity,
+            min_monthly_units=min_source_demand,
+        )
+        repository.finish_run(conn, run_id, status="complete")
+
+    _render_cross_market(source_mp, target_mps, candidates)
+
+
+def _render_cross_market(
+    source_mp: str, target_mps: list[str], typed: list[CrossMarketCandidate]
+) -> None:
+    console.print(
+        "[bold]Cross-market discovery[/bold] — a signal for what to "
+        "[bold]validate[/bold] next, not a Buy/Test/Avoid verdict."
+    )
+    console.print(f"Source: [cyan]{source_mp}[/cyan]  →  Targets: {', '.join(target_mps)}")
+
+    if not typed:
+        console.print(
+            "\n[yellow]No qualifying candidates.[/yellow] Fetch source products/keywords "
+            "first (`fetch product -m`, `fetch keywords -m`) or relax "
+            "--min-source-maturity / --min-source-demand."
+        )
+        return
+
+    # Best opportunities first, then by score.
+    order = {
+        "strong_opportunity": 0,
+        "opportunity_to_validate": 1,
+        "mature_market": 2,
+        "weak_transfer": 3,
+        "insufficient_data": 4,
+    }
+    typed.sort(key=lambda c: (order.get(c.report.verdict.value, 9), -c.report.score))
+
+    for c in typed:
+        r = c.report
+        se, te = r.source_evidence, r.target_evidence
+        title = (r.match.source.title or c.source_asin)[:60]
+        console.print(
+            f"\n[bold green]{c.source_asin}[/bold green]  {title}"
+            f"\n  {c.source_marketplace.value} → {c.target_marketplace.value}"
+            f"   [bold]{r.verdict.value.replace('_', ' ').upper()}[/bold]"
+            f"  (cross-market score {r.score:.0f}/100, {r.confidence.level.value} confidence)"
+        )
+        console.print(
+            f"  match: {r.match.confidence.value}"
+            f"  · source: {se.maturity.value} ({se.source_success_score:.0f})"
+            f"  · target presence: {te.presence.value}"
+        )
+        demand = f"{te.target_demand_score:.0f}/100" + ("" if te.demand_credible else " (unproven)")
+        console.print(
+            f"  target demand: {demand}"
+            f"  · competition gap: {r.market_gap.competition_gap:.0f}"
+            f"  · transferability: {r.transferability.level.value}"
+        )
+        for line in r.summary[1:4]:
+            console.print(f"    - {line}")
 
 
 @app.command()

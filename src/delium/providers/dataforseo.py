@@ -42,9 +42,28 @@ _PATH_RELATED = "dataforseo_labs/amazon/related_keywords/live"
 _PATH_RANKED = "dataforseo_labs/amazon/ranked_keywords/live"
 _PATH_SERP = "merchant/amazon/products/live/advanced"
 
-# US marketplace defaults.
-_LOCATION_CODE = 2840  # United States
-_LANGUAGE_CODE = "en_US"
+# DataForSEO location/language per marketplace (provider-side half of the
+# centralized marketplace model). Keyed by the marketplace code strings used
+# across ingestion/DB (== analysis Marketplace enum values).
+_MARKETPLACE_LOCATIONS: dict[str, tuple[int, str]] = {
+    "US": (2840, "en_US"),
+    "UK": (2826, "en_GB"),
+    "CA": (2124, "en_CA"),
+    "AU": (2036, "en_AU"),
+    "IN": (2356, "en_IN"),
+}
+
+
+def dataforseo_location(marketplace: str) -> tuple[int, str]:
+    """(location_code, language_code) for a marketplace, or raise if unsupported."""
+    try:
+        return _MARKETPLACE_LOCATIONS[marketplace]
+    except KeyError as exc:
+        raise ProviderConfigError(
+            f"DataForSEO: unsupported marketplace {marketplace!r} "
+            f"(known: {', '.join(sorted(_MARKETPLACE_LOCATIONS))})."
+        ) from exc
+
 
 # DataForSEO status codes in [20000, 30000) are success.
 _SUCCESS_MIN = 20000
@@ -202,6 +221,7 @@ class DataForSeoClient:
         *,
         transport: PostTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        marketplace: str = "US",
     ) -> None:
         if not login or not password:
             raise ProviderConfigError("DataForSEO login and password are required.")
@@ -209,9 +229,17 @@ class DataForSeoClient:
         self._auth_header = f"Basic {token}"
         self._transport = transport or UrllibTransport()
         self._sleep = sleep
+        self._marketplace = marketplace
+        self._location_code, self._language_code = dataforseo_location(marketplace)
+
+    @property
+    def marketplace(self) -> str:
+        return self._marketplace
 
     @classmethod
-    def from_env(cls, *, transport: PostTransport | None = None) -> DataForSeoClient:
+    def from_env(
+        cls, *, transport: PostTransport | None = None, marketplace: str = "US"
+    ) -> DataForSeoClient:
         secrets = get_secrets()
         if secrets.dataforseo_login is None or secrets.dataforseo_password is None:
             raise ProviderConfigError(
@@ -221,6 +249,7 @@ class DataForSeoClient:
             secrets.dataforseo_login.get_secret_value(),
             secrets.dataforseo_password.get_secret_value(),
             transport=transport,
+            marketplace=marketplace,
         )
 
     # -- public endpoint methods --------------------------------------------
@@ -230,8 +259,8 @@ class DataForSeoClient:
         body = [
             {
                 "keywords": [normalize_phrase(k) for k in keywords],
-                "location_code": _LOCATION_CODE,
-                "language_code": _LANGUAGE_CODE,
+                "location_code": self._location_code,
+                "language_code": self._language_code,
             }
         ]
         result = self._post(_PATH_VOLUME, body)
@@ -246,8 +275,8 @@ class DataForSeoClient:
         body = [
             {
                 "keyword": normalize_phrase(seed),
-                "location_code": _LOCATION_CODE,
-                "language_code": _LANGUAGE_CODE,
+                "location_code": self._location_code,
+                "language_code": self._language_code,
                 "depth": depth,
                 "limit": limit,
             }
@@ -265,8 +294,8 @@ class DataForSeoClient:
         body = [
             {
                 "asin": asin,
-                "location_code": _LOCATION_CODE,
-                "language_code": _LANGUAGE_CODE,
+                "location_code": self._location_code,
+                "language_code": self._language_code,
                 "limit": limit,
             }
         ]
@@ -282,8 +311,8 @@ class DataForSeoClient:
         body = [
             {
                 "keyword": normalize_phrase(keyword),
-                "location_code": _LOCATION_CODE,
-                "language_code": _LANGUAGE_CODE,
+                "location_code": self._location_code,
+                "language_code": self._language_code,
             }
         ]
         result = self._post(_PATH_SERP, body)
