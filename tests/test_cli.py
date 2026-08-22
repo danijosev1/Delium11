@@ -32,10 +32,45 @@ def test_version_flag() -> None:
     assert __version__ in result.output
 
 
-def test_discover_command_is_wired_but_unimplemented(isolated_env: Path) -> None:
-    result = runner.invoke(app, ["discover", "silicone baby food tray"])
+def test_discover_requires_some_input(initialized_db: Path) -> None:
+    result = runner.invoke(app, ["discover"])
     assert result.exit_code == 1
-    assert "not implemented" in result.output
+    assert "Nothing to discover" in result.output
+
+
+def test_discover_unknown_marketplace(initialized_db: Path) -> None:
+    result = runner.invoke(app, ["discover", "tray", "-m", "ZZ"])
+    assert result.exit_code == 1
+    assert "Unknown marketplace" in result.output
+
+
+def test_discover_keyword_ranks_over_seeded_data(initialized_db: Path) -> None:
+    import discovery_support as seed
+    from delium.database import get_connection
+
+    with get_connection() as conn:
+        rid = seed.new_run(conn)
+        seed.seed_keyword_market(conn, rid, "US", asins=("A1", "A2", "A3"))
+    result = runner.invoke(app, ["discover", seed.SEED, "-m", "US"])
+    assert result.exit_code == 0
+    assert "Discovery" in result.output
+    assert "Buy/Test/Avoid" in result.output  # discovery-signal disclaimer
+    assert "discovered 3" in result.output
+    # Discovery must never present a BUY at this tier.
+    assert "BUY" not in result.output
+
+
+def test_discover_reports_hard_kills(initialized_db: Path) -> None:
+    import discovery_support as seed
+    from delium.database import get_connection
+
+    with get_connection() as conn:
+        rid = seed.new_run(conn)
+        seed.seed_keyword_market(conn, rid, "US", asins=("C1", "C2"), price_cents=800)
+    result = runner.invoke(app, ["discover", seed.SEED, "-m", "US"])
+    assert result.exit_code == 0
+    assert "Eliminated by hard kills" in result.output
+    assert "K1" in result.output
 
 
 def test_validate_command_is_wired_but_unimplemented(isolated_env: Path) -> None:
@@ -340,3 +375,44 @@ def test_cross_market_force_refresh_calls_providers(
     result = runner.invoke(app, ["cross-market", "US", "AU", "--force"])
     assert result.exit_code == 0
     assert "US → AU" in result.output
+
+
+def test_discover_keyword_hydrates_via_mocked_providers(
+    initialized_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Exercises the CLI keyword-expansion + hydration path (CLI → ingestion →
+    # provider), cache-first, with mocked providers.
+    import delium.cli.main as cli_main
+    from dataforseo_support import FakePostTransport, related_body, serp_body, volume_body
+    from dataforseo_support import ok as dfs_ok
+    from delium.providers.dataforseo import DataForSeoClient
+    from delium.providers.keepa import KeepaClient
+    from keepa_support import FakeTransport, keepa_product_body
+    from keepa_support import ok as kok
+
+    monkeypatch.setenv("DELIUM_KEEPA_API_KEY", "k")
+    monkeypatch.setenv("DELIUM_DATAFORSEO_LOGIN", "l")
+    monkeypatch.setenv("DELIUM_DATAFORSEO_PASSWORD", "p")
+
+    def fake_keepa(**kwargs: object) -> object:
+        mp = str(kwargs.get("marketplace", "US"))
+        return KeepaClient(
+            "k",
+            transport=FakeTransport([kok(keepa_product_body("B0AAA00001"))]),
+            sleep=lambda _: None,
+            marketplace=mp,
+        )
+
+    def fake_dfs(**kwargs: object) -> object:
+        mp = str(kwargs.get("marketplace", "US"))
+        transport = FakePostTransport(
+            [dfs_ok(volume_body(9000)), dfs_ok(related_body()), dfs_ok(serp_body())] * 3
+        )
+        return DataForSeoClient("l", "p", transport=transport, sleep=lambda _: None, marketplace=mp)
+
+    monkeypatch.setattr(cli_main.KeepaClient, "from_env", staticmethod(fake_keepa))
+    monkeypatch.setattr(cli_main.DataForSeoClient, "from_env", staticmethod(fake_dfs))
+
+    result = runner.invoke(app, ["discover", "silicone baby food tray", "-m", "US"])
+    assert result.exit_code == 0
+    assert "Discovery" in result.output

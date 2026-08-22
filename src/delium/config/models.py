@@ -246,6 +246,23 @@ class CrossMarketConfig(StrictModel):
     low_confidence_score_cap: float = Field(55, ge=0, le=100)
 
 
+class DiscoveryConfig(StrictModel):
+    """Discovery / scout orchestration limits (ARCHITECTURE.md §4.1, docs/data-layer
+    §3.2). Cheap-and-wide triage: no review fetching, kill-first funnel."""
+
+    max_candidates: int = Field(150, gt=0)  # total unique candidates per run
+    max_candidates_per_seed: int = Field(20, gt=0)  # SERP asins kept per keyword
+    serp_depth: int = Field(10, gt=0)  # SERP page-1 top-N at discovery
+    max_ranked: int = Field(25, gt=0)  # ranked shortlist size
+    cross_market_enabled: bool = True
+    accept_explicit_asins: bool = True
+    # Cross-market discovery source gating (mirrors [cross_market] semantics).
+    cross_market_min_source_maturity: str = Field(
+        "validated", pattern="^(emerging|validated|strong|exceptional)$"
+    )
+    cross_market_min_source_units: int = Field(0, ge=0)
+
+
 class DeliumConfig(StrictModel):
     """Root configuration object loaded from config.toml."""
 
@@ -264,3 +281,4 @@ class DeliumConfig(StrictModel):
     risk_deductions: RiskDeductionsConfig = Field(default_factory=RiskDeductionsConfig)
     verdicts: VerdictsConfig = Field(default_factory=VerdictsConfig)
     cross_market: CrossMarketConfig = Field(default_factory=CrossMarketConfig)
+    discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)

@@ -684,3 +684,126 @@ def get_matches_for_source(
         params = (source_asin, source_marketplace, target_marketplace)
     sql += " ORDER BY match_score DESC"
     return _all(conn.execute(sql, params))
+
+
+# ---------------------------------------------------------------------------
+# candidates (discovery research queue)
+# ---------------------------------------------------------------------------
+def upsert_candidate(
+    conn: sqlite3.Connection,
+    *,
+    asin: str,
+    marketplace: str,
+    source: str,
+    source_run_id: str,
+    source_ref: str | None = None,
+    evidence: Any = None,
+    triage_score: float | None = None,
+    verdict: str | None = None,
+    status: str = "new",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO candidates
+            (asin, marketplace, source, source_ref, evidence, source_run_id,
+             triage_score, verdict, status, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(asin, marketplace) DO UPDATE SET
+            source = excluded.source,
+            source_ref = excluded.source_ref,
+            evidence = excluded.evidence,
+            source_run_id = excluded.source_run_id,
+            triage_score = excluded.triage_score,
+            verdict = excluded.verdict,
+            status = excluded.status,
+            updated_at = datetime('now')
+        """,
+        (
+            asin,
+            marketplace,
+            source,
+            source_ref,
+            None if evidence is None else _dumps(evidence),
+            source_run_id,
+            triage_score,
+            verdict,
+            status,
+        ),
+    )
+
+
+def get_candidate(conn: sqlite3.Connection, asin: str, marketplace: str) -> sqlite3.Row | None:
+    return _one(
+        conn.execute(
+            "SELECT * FROM candidates WHERE asin = ? AND marketplace = ?",
+            (asin, marketplace),
+        )
+    )
+
+
+def get_candidates_for_run(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
+    return _all(
+        conn.execute(
+            """
+            SELECT * FROM candidates
+             WHERE source_run_id = ?
+             ORDER BY triage_score DESC NULLS LAST, asin
+            """,
+            (run_id,),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# validations (scored opportunities)
+# ---------------------------------------------------------------------------
+def upsert_validation(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    asin: str,
+    marketplace: str,
+    opportunity_score: float | None = None,
+    verdict: str | None = None,
+    confidence: str | None = None,
+    insufficient_data: bool = False,
+    scored: Any = None,
+) -> str:
+    validation_id = _new_id()
+    conn.execute(
+        """
+        INSERT INTO validations
+            (id, run_id, asin, marketplace, opportunity_score, verdict,
+             confidence, insufficient_data, scored)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_id, asin, marketplace) DO UPDATE SET
+            opportunity_score = excluded.opportunity_score,
+            verdict = excluded.verdict,
+            confidence = excluded.confidence,
+            insufficient_data = excluded.insufficient_data,
+            scored = excluded.scored
+        """,
+        (
+            validation_id,
+            run_id,
+            asin,
+            marketplace,
+            opportunity_score,
+            verdict,
+            confidence,
+            int(insufficient_data),
+            None if scored is None else _dumps(scored),
+        ),
+    )
+    return validation_id
+
+
+def get_validation(
+    conn: sqlite3.Connection, *, run_id: str, asin: str, marketplace: str
+) -> sqlite3.Row | None:
+    return _one(
+        conn.execute(
+            "SELECT * FROM validations WHERE run_id = ? AND asin = ? AND marketplace = ?",
+            (run_id, asin, marketplace),
+        )
+    )

@@ -9,6 +9,7 @@ deliberately left as stubs here.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Annotated
 
 import typer
@@ -305,13 +306,180 @@ def fetch_reviews_cmd(
     console.print(f"  Newest review: {max(dates) if dates else '—'}")
 
 
+def _build_provider_factories() -> tuple[
+    Callable[[str], object] | None, Callable[[str], object] | None
+]:
+    """Marketplace-scoped provider factories, or None each if credentials are
+    absent — discovery then runs on already-cached data only."""
+    keepa: Callable[[str], object] | None
+    dfs: Callable[[str], object] | None
+    try:
+        KeepaClient.from_env()  # probe credentials
+        keepa = lambda mp: KeepaClient.from_env(marketplace=mp)  # noqa: E731
+    except ProviderError:
+        keepa = None
+    try:
+        DataForSeoClient.from_env()  # probe credentials
+        dfs = lambda mp: DataForSeoClient.from_env(marketplace=mp)  # noqa: E731
+    except ProviderError:
+        dfs = None
+    return keepa, dfs
+
+
 @app.command()
 def discover(
-    seed: Annotated[str, typer.Argument(help="Seed niche or keyword to expand from.")],
+    seed: Annotated[
+        str | None,
+        typer.Argument(help="Seed keyword (shorthand for --keyword). Optional."),
+    ] = None,
+    keyword: Annotated[
+        list[str] | None,
+        typer.Option("--keyword", "-k", help="Seed keyword (repeatable)."),
+    ] = None,
+    asin: Annotated[
+        list[str] | None,
+        typer.Option("--asin", help="Explicit ASIN to evaluate (repeatable)."),
+    ] = None,
+    marketplace: Annotated[
+        str, typer.Option("--marketplace", "-m", help="Marketplace: US, CA, UK, AU, IN.")
+    ] = "US",
+    source_marketplace: Annotated[
+        str | None,
+        typer.Option(
+            "--source-marketplace", help="Cross-market source (defaults to --marketplace)."
+        ),
+    ] = None,
+    target_marketplace: Annotated[
+        list[str] | None,
+        typer.Option("--target-marketplace", help="Cross-market target(s), repeatable."),
+    ] = None,
+    limit: Annotated[
+        int | None, typer.Option("--limit", help="Max ranked candidates to show.")
+    ] = None,
 ) -> None:
-    """Scan a niche/keyword for candidate products worth validating."""
-    log.info("discover requested: seed=%r", seed)
-    _not_implemented("discover")
+    """Discover candidate products worth validating (cheap & wide triage).
+
+    Modes (combinable): keyword/SERP, explicit ASIN, and cross-market. Output is
+    a deterministic triage ranking — a research queue, NOT a Buy recommendation.
+    """
+    from delium.analysis.models import Marketplace
+    from delium.discovery import run_discovery
+
+    initialize_database()
+    config = load_config()
+
+    # --source-marketplace, when given, is the marketplace we discover FROM.
+    mp_code = _validate_marketplace(source_marketplace or marketplace)
+    marketplace_enum = Marketplace(mp_code)
+    keywords = [*(keyword or [])]
+    if seed:
+        keywords.append(seed)
+    asins = [*(asin or [])]
+    targets = tuple(Marketplace(_validate_marketplace(t)) for t in (target_marketplace or []))
+
+    if not keywords and not asins and not targets:
+        console.print(
+            "[bold red]Nothing to discover.[/bold red] Provide a seed keyword, "
+            "--keyword, --asin, or --target-marketplace."
+        )
+        raise typer.Exit(code=1)
+
+    with get_connection() as conn:
+        run_id = repository.insert_run(
+            conn, command="discover", input_=f"{mp_code}:{','.join(keywords) or asins or targets}"
+        )
+
+    keepa_factory, dfs_factory = _build_provider_factories()
+
+    # Keyword expansion: fetch each seed's SERP up front so candidates exist,
+    # cache-first, in the requested marketplace (CLI → ingestion → provider).
+    if keywords and dfs_factory is not None:
+        from delium.ingestion import fetch_keywords
+
+        for kw in keywords:
+            try:
+                fetch_keywords(
+                    kw,
+                    run_id=run_id,
+                    client=dfs_factory(mp_code),  # type: ignore[arg-type]
+                    config=config,
+                )
+            except ProviderError as exc:
+                console.print(f"[yellow]keyword fetch failed for {kw!r}:[/yellow] {exc}")
+
+    with get_connection() as conn:
+        report = run_discovery(
+            conn,
+            marketplace=marketplace_enum,
+            config=config,
+            run_id=run_id,
+            keywords=keywords,
+            asins=asins,
+            cross_market_targets=targets,
+            keepa_factory=keepa_factory,
+            dfs_factory=dfs_factory,
+        )
+        repository.finish_run(conn, run_id, status="complete")
+
+    _render_discovery(report, limit or config.discovery.max_ranked)
+
+
+def _render_discovery(report: object, limit: int) -> None:
+    from delium.analysis.models import Verdict
+    from delium.discovery.models import DiscoveryReport
+
+    assert isinstance(report, DiscoveryReport)
+    console.print(
+        "[bold]Discovery[/bold] — a deterministic triage ranking (research queue), "
+        "[bold]not[/bold] a Buy/Test/Avoid recommendation."
+    )
+    console.print(
+        f"Marketplace: [cyan]{report.marketplace.value}[/cyan]  ·  "
+        f"discovered {report.discovered_count}  ·  "
+        f"ranked {len(report.ranked)}  ·  killed {len(report.killed)}  ·  "
+        f"unresolved {len(report.unresolved)}"
+    )
+
+    if report.ranked:
+        console.print("\n[bold]Ranked candidates[/bold] (opportunity score DESC):")
+        for i, ec in enumerate(report.ranked[:limit], start=1):
+            s = ec.scored
+            assert s is not None
+            flag = " [yellow](needs more data)[/yellow]" if s.insufficient_data else ""
+            sources = ",".join(src.value for src in ec.candidate.sources)
+            console.print(
+                f"  {i:>2}. [green]{ec.asin}[/green] [{ec.marketplace.value}]  "
+                f"score {s.score:.0f}  ·  {s.verdict.value.upper()}  ·  "
+                f"{s.confidence.level.value} conf  ·  via {sources}{flag}"
+            )
+    else:
+        console.print("\n[yellow]No candidates survived to scoring.[/yellow]")
+
+    if report.killed:
+        console.print("\n[bold]Eliminated by hard kills[/bold]:")
+        for ec in report.killed:
+            reason = ec.notes[0] if ec.notes else ""
+            console.print(
+                f"  [red]{ec.asin}[/red] [{ec.marketplace.value}]  {ec.kill_rule}: {reason}"
+            )
+
+    needs_data = [
+        ec for ec in report.ranked if ec.scored is not None and ec.scored.insufficient_data
+    ]
+    if report.unresolved or needs_data:
+        console.print("\n[bold]Needs more data[/bold] (revisit at validate tier):")
+        for ec in report.unresolved:
+            console.print(f"  [yellow]{ec.asin}[/yellow] [{ec.marketplace.value}]  not fetched")
+        for ec in needs_data:
+            console.print(
+                f"  [yellow]{ec.asin}[/yellow] [{ec.marketplace.value}]  "
+                f"partial: {', '.join(ec.scored.confidence.partial_pillars)}"  # type: ignore[union-attr]
+            )
+
+    if any(
+        ec.scored is not None and ec.scored.verdict is not Verdict.AVOID for ec in report.ranked
+    ):
+        pass  # discovery never emits BUY; scoring caps at TEST without validate-tier data
 
 
 @app.command()

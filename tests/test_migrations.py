@@ -26,6 +26,8 @@ EXPECTED_TABLES = {
     "reviews",
     "review_themes",
     "product_matches",
+    "candidates",
+    "validations",
     "schema_migrations",
 }
 
@@ -49,7 +51,7 @@ def test_discover_migrations_are_ordered_and_named() -> None:
 
 def test_initialize_creates_all_tables(isolated_env: Path) -> None:
     applied = initialize_database()
-    assert applied == [1, 2]
+    assert applied == [1, 2, 3]
     assert EXPECTED_TABLES.issubset(_table_names(isolated_env / "data" / "delium.db"))
 
 
@@ -68,7 +70,7 @@ def test_initialize_enables_wal_and_foreign_keys(isolated_env: Path) -> None:
 def test_initialize_is_idempotent(isolated_env: Path) -> None:
     first = initialize_database()
     second = initialize_database()
-    assert first == [1, 2]
+    assert first == [1, 2, 3]
     assert second == []  # nothing new to apply the second time
 
 
@@ -80,10 +82,11 @@ def test_applied_versions_recorded(isolated_env: Path) -> None:
         rows = conn.execute("SELECT version, name FROM schema_migrations").fetchall()
     finally:
         conn.close()
-    assert applied == {1, 2}
+    assert applied == {1, 2, 3}
     names = {row["name"] for row in rows}
     assert "0001_initial_schema.sql" in names
     assert "0002_cross_market.sql" in names
+    assert "0003_discovery.sql" in names
 
 
 def test_key_indexes_exist(isolated_env: Path) -> None:
@@ -155,8 +158,8 @@ def test_failed_migration_rolls_back(
 
     migration_dir = tmp_path / "m"
     migration_dir.mkdir()
-    # Version 3 (past the real 0001/0002 already applied to initialized_db).
-    (migration_dir / "0003_broken.sql").write_text(
+    # Version 4 (past the real 0001/0002/0003 already applied to initialized_db).
+    (migration_dir / "0004_broken.sql").write_text(
         "CREATE TABLE ok_table (id INTEGER);\nTHIS IS NOT SQL;"
     )
     monkeypatch.setattr(migrations_module, "MIGRATIONS_DIR", migration_dir)
@@ -178,5 +181,5 @@ def test_failed_migration_rolls_back(
     finally:
         conn.close()
 
-    assert 3 not in applied  # broken migration not recorded
+    assert 4 not in applied  # broken migration not recorded
     assert "ok_table" not in tables  # its partial DDL was rolled back
