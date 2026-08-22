@@ -157,6 +157,95 @@ class VerdictsConfig(StrictModel):
     test_min: float = Field(60, ge=0, le=100)
 
 
+class CrossMarketConfig(StrictModel):
+    """Cross-market discovery thresholds/weights (docs/cross-market.md). A
+    discovery signal, independent of the five opportunity pillars."""
+
+    # --- product matching ---
+    match_title_weight: float = Field(0.45, ge=0)
+    match_brand_weight: float = Field(0.20, ge=0)
+    match_dims_weight: float = Field(0.20, ge=0)
+    match_category_weight: float = Field(0.15, ge=0)
+    match_exact_min: float = Field(0.90, ge=0, le=1)
+    match_strong_min: float = Field(0.72, ge=0, le=1)
+    match_probable_min: float = Field(0.55, ge=0, le=1)
+    match_weak_min: float = Field(0.35, ge=0, le=1)
+    match_dims_tolerance: float = Field(0.15, ge=0)  # fractional agreement band
+    match_weight_tolerance: float = Field(0.15, ge=0)
+    match_brand_mismatch_penalty: float = Field(0.15, ge=0)  # non-generic brand clash
+
+    # --- source-market success ---
+    src_velocity_lo: float = 150
+    src_velocity_hi: float = 2000
+    src_keyword_lo: float = 2000
+    src_keyword_hi: float = 40000
+    src_growth_lo: float = -0.10
+    src_growth_hi: float = 0.40
+    src_history_lo: float = 6
+    src_history_hi: float = 24
+    src_reviews_lo: float = 50
+    src_reviews_hi: float = 3000
+    w_src_velocity: float = 30
+    w_src_keyword: float = 25
+    w_src_growth: float = 15
+    w_src_history: float = 15
+    w_src_reviews: float = 15
+    src_emerging_max: float = Field(40, ge=0, le=100)
+    src_validated_max: float = Field(60, ge=0, le=100)
+    src_strong_max: float = Field(80, ge=0, le=100)
+    src_min_signals: int = Field(2, ge=1)
+
+    # --- target-market demand ---
+    tgt_keyword_lo: float = 500
+    tgt_keyword_hi: float = 20000
+    tgt_growth_lo: float = -0.10
+    tgt_growth_hi: float = 0.50
+    w_tgt_keyword: float = 70
+    w_tgt_growth: float = 20
+    w_tgt_serp: float = 10
+    tgt_demand_credible_min: float = Field(35, ge=0, le=100)
+    tgt_min_signals: int = Field(2, ge=1)
+
+    # --- target-market competition weakness (higher = weaker/easier) ---
+    tgt_reviews_lo: float = 50
+    tgt_reviews_hi: float = 2000
+    w_cw_reviews: float = 40
+    w_cw_listing: float = 25
+    w_cw_beatable: float = 20
+    w_cw_hhi: float = 15
+    empty_market_weakness: float = Field(75, ge=0, le=100)  # 0 listings, inferred
+
+    # --- presence classification ---
+    mature_reviews: float = 800
+    saturated_reviews: float = 1500
+    mature_min_listings: int = 8
+    demand_high: float = Field(60, ge=0, le=100)
+
+    # --- transferability ---
+    transfer_uncertain_penalty: float = 15
+    transfer_unfavorable_penalty: float = 35
+    transfer_favorable_min: float = Field(80, ge=0, le=100)
+    transfer_uncertain_min: float = Field(45, ge=0, le=100)
+    seasonality_uncertain_threshold: float = Field(0.40, ge=0, le=1)
+
+    # --- cross-market composite weights (sum 100) ---
+    w_source_success: float = 25
+    w_target_demand: float = 25
+    w_competition_gap: float = 20
+    w_maturity_gap: float = 15
+    w_transferability: float = 15
+
+    # --- risk penalties (surfaced, not recomputed) ---
+    compliance_risk_penalty: float = Field(25, ge=0)
+    unfavorable_transfer_penalty: float = Field(15, ge=0)
+
+    # --- verdict thresholds ---
+    strong_opportunity_min: float = Field(70, ge=0, le=100)
+    validate_min: float = Field(45, ge=0, le=100)
+    strong_competition_gap_min: float = Field(55, ge=0, le=100)
+    low_confidence_score_cap: float = Field(55, ge=0, le=100)
+
+
 class DeliumConfig(StrictModel):
     """Root configuration object loaded from config.toml."""
 
@@ -174,3 +263,4 @@ class DeliumConfig(StrictModel):
     profit_pillar: ProfitPillarConfig = Field(default_factory=ProfitPillarConfig)
     risk_deductions: RiskDeductionsConfig = Field(default_factory=RiskDeductionsConfig)
     verdicts: VerdictsConfig = Field(default_factory=VerdictsConfig)
+    cross_market: CrossMarketConfig = Field(default_factory=CrossMarketConfig)

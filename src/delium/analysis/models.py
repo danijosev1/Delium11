@@ -983,3 +983,262 @@ class ScoredOpportunity:
         """AVOID for a substantive reason (kill / hard gate / low score) rather
         than merely thin evidence — distinct from `insufficient_data`."""
         return self.verdict is Verdict.AVOID and not self.insufficient_data
+
+
+# ---------------------------------------------------------------------------
+# Cross-market discovery engine (docs/cross-market.md). Detects products proven
+# in one Amazon marketplace that look underpenetrated but credibly demanded in
+# another. A discovery SIGNAL — NOT one of the five opportunity pillars, and
+# never a second BUY/TEST/AVOID system. Pure types only.
+# ---------------------------------------------------------------------------
+class Marketplace(StrEnum):
+    """Amazon marketplaces. Values match the `marketplace` strings already used
+    across ingestion/DB. Add entries here and in `analysis.marketplaces` — the
+    engine never hardcodes a marketplace."""
+
+    US = "US"
+    CA = "CA"
+    UK = "UK"
+    AU = "AU"
+    IN = "IN"
+
+
+@dataclass(frozen=True)
+class MarketplaceInfo:
+    """Static reference data for one marketplace (centralized in
+    `analysis.marketplaces`). Not user-tunable config — reference facts."""
+
+    code: Marketplace
+    country: str
+    currency: str
+    locale: str
+    domain: str
+    marketplace_id: str
+    unit_system: str  # 'imperial' | 'metric'
+    language: str
+
+
+class MatchConfidence(StrEnum):
+    EXACT = "exact"  # GTIN/UPC/EAN agree
+    STRONG = "strong"
+    PROBABLE = "probable"
+    WEAK = "weak"
+    UNMATCHED = "unmatched"
+
+
+@dataclass(frozen=True)
+class MarketplaceProduct:
+    """A product's identity + coarse snapshot in ONE marketplace. ASINs are
+    marketplace-specific, so identity is matched on observable signals, never
+    assumed equal across marketplaces."""
+
+    marketplace: Marketplace
+    asin: str
+    title: str | None = None
+    brand: str | None = None
+    manufacturer: str | None = None
+    gtin: str | None = None  # UPC/EAN/GTIN when known — the only exact key
+    dims: Dimensions | None = None
+    weight_g: int | None = None
+    category_path: str | None = None
+    price_cents: int | None = None
+    generic: bool | None = None  # private-label/generic → brand mismatch tolerated
+
+
+@dataclass(frozen=True)
+class ProductMatch:
+    source: MarketplaceProduct
+    target: MarketplaceProduct
+    confidence: MatchConfidence
+    score: float  # 0-1 fuzzy identity score (1.0 for GTIN-exact)
+    signals_used: tuple[str, ...]
+    conflicting_signals: tuple[str, ...]
+    detail: str
+
+    @property
+    def matched(self) -> bool:
+        return self.confidence is not MatchConfidence.UNMATCHED
+
+
+class SourceMaturity(StrEnum):
+    INSUFFICIENT = "insufficient"  # too little evidence to classify
+    EMERGING = "emerging"
+    VALIDATED = "validated"
+    STRONG = "strong"
+    EXCEPTIONAL = "exceptional"
+
+
+@dataclass(frozen=True)
+class SourceMarketInput:
+    """Normalized source-market facts fed from demand/competition/scoring. Every
+    field optional; absence lowers confidence and is never guessed."""
+
+    monthly_units: int | None = None  # median top-10 est. velocity (demand)
+    keyword_volume: int | None = None  # primary cluster volume (demand)
+    keyword_growth: float | None = None  # YoY (demand D4)
+    history_months: int | None = None  # length of demand history
+    review_count: float | None = None  # median top-10 reviews (competition C1)
+    review_velocity: float | None = None  # leaders' new reviews/mo (competition C3)
+    competition_score: float | None = None  # competition pillar (higher = weaker)
+    opportunity_score: float | None = None  # scoring.py composite, if available
+
+
+@dataclass(frozen=True)
+class SourceMarketEvidence:
+    marketplace: Marketplace
+    source_success_score: float  # 0-100
+    maturity: SourceMaturity
+    confidence: Confidence
+    components: tuple[Subscore, ...]
+    reasons: tuple[str, ...]
+    signals_present: int
+
+
+class TargetPresence(StrEnum):
+    UNKNOWN = "unknown"  # insufficient data
+    NOT_PRESENT = "not_present"  # no credible matching listing
+    EARLY = "early"  # some presence, immature
+    UNDERPENETRATED = "underpenetrated"  # exists but weak vs demand
+    MATURE = "mature"  # established
+    SATURATED = "saturated"  # strong demand AND strong incumbents
+
+
+@dataclass(frozen=True)
+class TargetMarketInput:
+    """Normalized target-market facts. `listings_found is None` = not looked up
+    (UNKNOWN); `listings_found == 0` = looked up, none found (NOT_PRESENT).
+    These are NOT the same, and neither implies opportunity."""
+
+    listings_found: int | None = None
+    median_reviews: float | None = None  # competition C1 input
+    avg_listing_quality: float | None = None  # 0-100 (listing engine)
+    beatable_slots: int | None = None  # competition C2 input
+    brand_hhi: float | None = None  # competition C4 input
+    keyword_volume: int | None = None  # target demand (DataForSEO)
+    keyword_growth: float | None = None
+    serp_presence: bool | None = None  # any organic SERP results for the cluster
+    review_velocity: float | None = None
+
+
+@dataclass(frozen=True)
+class TargetMarketEvidence:
+    marketplace: Marketplace
+    presence: TargetPresence
+    target_demand_score: float  # 0-100
+    demand_credible: bool  # >= configured credibility floor
+    competition_weakness_score: float  # 0-100 (higher = weaker/easier target)
+    target_maturity_score: float  # 0-100 (higher = more established)
+    confidence: Confidence
+    components: tuple[Subscore, ...]
+    reasons: tuple[str, ...]
+    signals_present: int
+
+
+@dataclass(frozen=True)
+class MarketGap:
+    maturity_gap: float  # 0-100 (source_success − target_maturity, floored 0)
+    competition_gap: float  # 0-100 (how much easier the target looks vs source)
+    demand_gap: float | None  # target demand relative to source demand, if both known
+    detail: str
+
+
+class TransferabilityLevel(StrEnum):
+    FAVORABLE = "favorable"
+    UNCERTAIN = "uncertain"
+    UNFAVORABLE = "unfavorable"
+
+
+@dataclass(frozen=True)
+class TransferabilityInput:
+    """Observable/structured transfer signals — never cultural speculation."""
+
+    category_compatible: bool | None = None
+    oversized: bool | None = None  # logistics
+    price_positioning_ok: bool | None = None  # within target band
+    compliance_risk: bool | None = None  # regulatory surface in target
+    seasonality_concentration: float | None = None  # peak-8-week share (demand D5)
+    electrical_or_plug_dependent: bool | None = None
+    unit_system_differs: bool = False
+    language_differs: bool = False
+    keyword_localization_needed: bool | None = None
+    surfaced_risk_flags: tuple[str, ...] = ()  # from risk engine — surfaced, not recomputed
+
+
+@dataclass(frozen=True)
+class TransferabilityFactor:
+    name: str
+    level: TransferabilityLevel
+    evidence: str
+
+
+@dataclass(frozen=True)
+class LocalizationFlag:
+    kind: str
+    evidence: str
+
+
+@dataclass(frozen=True)
+class Transferability:
+    level: TransferabilityLevel
+    score: float  # 0-100
+    factors: tuple[TransferabilityFactor, ...]
+    localization_flags: tuple[LocalizationFlag, ...]
+    surfaced_risk_flags: tuple[str, ...]
+    detail: str
+
+
+@dataclass(frozen=True)
+class CrossMarketComponent:
+    name: str
+    raw: str  # human-readable raw input
+    normalized: float  # 0-100
+    weight: float
+    weighted_contribution: float
+    evidence: str
+    confidence: Confidence
+
+
+class CrossMarketVerdict(StrEnum):
+    STRONG_OPPORTUNITY = "strong_opportunity"
+    OPPORTUNITY_TO_VALIDATE = "opportunity_to_validate"
+    MATURE_MARKET = "mature_market"
+    WEAK_TRANSFER = "weak_transfer"
+    INSUFFICIENT_DATA = "insufficient_data"
+
+
+@dataclass(frozen=True)
+class CrossMarketConfidence:
+    level: Confidence
+    match_confidence: MatchConfidence
+    source_confidence: Confidence
+    target_confidence: Confidence
+    notes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CrossMarketReport:
+    """One source → one target cross-market assessment. A discovery signal for
+    later validation — deliberately cautious, never a promise of sales."""
+
+    source_marketplace: Marketplace
+    target_marketplace: Marketplace
+    verdict: CrossMarketVerdict
+    score: float  # 0-100 attractiveness of investigating this transfer
+    base_score: float  # weighted component score before risk penalties/caps
+    match: ProductMatch
+    source_evidence: SourceMarketEvidence
+    target_evidence: TargetMarketEvidence
+    market_gap: MarketGap
+    transferability: Transferability
+    components: tuple[CrossMarketComponent, ...]
+    confidence: CrossMarketConfidence
+    risk_penalty: float
+    summary: tuple[str, ...]  # cautious, evidence-based rationale lines
+    weights_snapshot: tuple[tuple[str, float], ...]  # component weights used
+
+    @property
+    def is_opportunity(self) -> bool:
+        return self.verdict in (
+            CrossMarketVerdict.STRONG_OPPORTUNITY,
+            CrossMarketVerdict.OPPORTUNITY_TO_VALIDATE,
+        )
