@@ -181,6 +181,8 @@ Gates are pass/fail checks applied **after** scoring — a high score cannot buy
 
 **Score/Strategist disagreement is surfaced, never averaged**: "scores 78 — Strategist says avoid: category shows design-patent enforcement pattern" appears verbatim at the top of the report. When they disagree, the pessimist wins the default and I make the final call.
 
+**G5 implementation note (`analysis/scoring.py`).** `score_opportunity` takes the *resolved* Strategist concurrence as a validated input (`StrategistConcurrence`: `pending | concur | dissent | unavailable`) — the LLM never sets the verdict; scoring.py evaluates the gate. G5 is a **Buy gate only**: it can block a would-be Buy but can never manufacture a Buy nor change a non-Buy verdict. `concur` confirms a qualifying Buy; `dissent` or `unavailable` caps a would-be Buy at **Test** (not Avoid) with the disagreement surfaced — this reconciles the "hard gate → Avoid" phrasing above with the agent-layer rule that a missing/withheld Strategist means "no Buy can be issued," and guarantees the agent layer can only ever make the system *more* cautious. `pending` (the default / agents-off) leaves a provisional Buy, matching the pre-agent behavior. A hard kill or a failed G1/G3 still forces Avoid regardless of concurrence.
+
 ---
 
 ## 11. Calibration & Honesty Rules

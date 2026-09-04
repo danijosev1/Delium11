@@ -11,7 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from delium.analysis.models import Marketplace, ScoredOpportunity
+from delium.agents.schemas import MinerReport, StrategistVerdict
+from delium.analysis.models import DifferentiationReport, Marketplace, ScoredOpportunity
 from delium.discovery.assembly import AssemblyProvenance
 from delium.discovery.models import DiscoveryEvidence
 
@@ -51,17 +52,37 @@ class ValidationRequest:
 
 @dataclass(frozen=True)
 class ReviewEvidence:
-    """What the review layer supplied to the differentiation engine. The Review
-    Miner (LLM, INTERPRET stage) is NOT run here — so `miner_pending` is True and
-    `themes_available` counts only already-persisted `review_themes` rows. The
-    real review *sample* (the differentiation denominator) is always assembled
-    from persisted reviews; no AI output is fabricated."""
+    """What the review layer supplied to the differentiation engine. The real
+    review *sample* (the differentiation denominator) is always assembled from
+    persisted reviews. `miner_pending` is True only when the LLM Review Miner did
+    NOT run for this evidence (agents off / unavailable) — the themes/features/
+    bundles then come from whatever was already persisted, never fabricated."""
 
     asin: str
     sample_size: int  # eligible (de-duplicated) reviews in the differentiation sample
     themes_available: int  # persisted review_themes rows fed as RawThemes
     listing_rating_avg: float | None  # target's displayed rating (sample-bias check)
+    feature_requests: int = 0  # persisted feature_requests fed to F2
+    bundle_signals: int = 0  # persisted bundle_signals fed to F4
     miner_pending: bool = True
+
+
+@dataclass(frozen=True)
+class AgentRunInfo:
+    """Audit record for one LLM agent invocation — provenance for the report and
+    the persisted `agent_runs` row. Carries no evidence itself; the validated
+    output lives in the typed report objects and the DB."""
+
+    agent: str  # 'review_miner' | 'strategist'
+    status: str  # 'ok' | 'degraded' | 'failed'
+    model: str | None = None
+    provider: str | None = None
+    cost_usd: float = 0.0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    dropped: int = 0
+    total: int = 0
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,6 +92,7 @@ class HydrationOutcome:
     fetching early (budget or provider-failure ceiling)."""
 
     data_cost_usd: float = 0.0
+    llm_cost_usd: float = 0.0
     product_from_cache: bool | None = None
     reviews_from_cache: bool | None = None
     review_provider: str | None = None
@@ -99,13 +121,23 @@ class ValidationReport:
     provenance: AssemblyProvenance = field(default_factory=AssemblyProvenance)
     from_candidate: bool = False  # a persisted discovery candidate was upgraded
     discovery_evidence: tuple[DiscoveryEvidence, ...] = ()  # provenance incl. cross-market signal
+    # Agent layer (validated outputs only; never freeform model text):
+    miner_report: MinerReport | None = None
+    strategist_verdict: StrategistVerdict | None = None
+    differentiation: DifferentiationReport | None = None  # recomputed themes for the report
+    agent_runs: tuple[AgentRunInfo, ...] = ()
     notes: tuple[str, ...] = ()
 
     @property
     def strategist_pending(self) -> bool:
-        """G5 is never resolved deterministically — always pending here."""
+        """A Buy is provisional while G5 is unresolved (Strategist off or degraded);
+        the deterministic scored result is the authority."""
         return self.scored.strategist_pending if self.scored is not None else True
 
     @property
     def data_cost_usd(self) -> float:
         return self.hydration.data_cost_usd
+
+    @property
+    def llm_cost_usd(self) -> float:
+        return self.hydration.llm_cost_usd

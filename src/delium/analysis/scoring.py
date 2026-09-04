@@ -31,6 +31,7 @@ from delium.analysis.models import (
     ScoreConfidence,
     ScoredOpportunity,
     ScoringInput,
+    StrategistConcurrence,
     Subscore,
     Verdict,
 )
@@ -786,16 +787,29 @@ def _gate_differentiation(diff_pillar: PillarScore, cfg: DeliumConfig) -> GateRe
     )
 
 
-def _gate_strategist() -> GateResult:
-    """G5 Strategist concurrence — pending; checked by the pipeline, not scoring."""
+def _gate_strategist(concurrence: StrategistConcurrence) -> GateResult:
+    """G5 Strategist concurrence (scoring-model §10). A *validated* concurrence
+    signal resolved deterministically here — the LLM never sets the verdict. G5 is
+    a BUY gate: it can only block a would-be Buy, never manufacture one. PENDING
+    (default) leaves a provisional Buy allowed; CONCUR passes; DISSENT/UNAVAILABLE
+    cap a would-be Buy at Test with the reason surfaced."""
+    passed: bool | None
+    if concurrence is StrategistConcurrence.CONCUR:
+        passed, actual = True, "strategist concurs (buy)"
+    elif concurrence is StrategistConcurrence.DISSENT:
+        passed, actual = False, "strategist does not concur"
+    elif concurrence is StrategistConcurrence.UNAVAILABLE:
+        passed, actual = None, "strategist unavailable (degraded)"
+    else:  # PENDING
+        passed, actual = None, "pending"
     return GateResult(
         "G5",
         "Strategist concurrence",
-        None,
+        passed,
         True,
-        "pending",
+        actual,
         "frontier verdict = buy",
-        "checked downstream after the Strategist runs; a Buy here is provisional",
+        "a Buy requires Strategist concurrence; G5 can only block a Buy, never create one",
     )
 
 
@@ -828,6 +842,7 @@ def _decide_verdict(
     score: float,
     kills: tuple[KillResult, ...],
     gates: tuple[GateResult, ...],
+    concurrence: StrategistConcurrence,
     cfg: DeliumConfig,
 ) -> tuple[Verdict, tuple[str, ...]]:
     v = cfg.verdicts
@@ -835,7 +850,10 @@ def _decide_verdict(
 
     hard_kills = [k for k in kills if k.kills]
     demoted = [k for k in kills if k.assessed and k.triggered and k.demoted]
-    hard_gate_fail = [g for g in gates if g.hard and g.passed is False]
+    # G5 is a BUY gate handled separately below — it can only block a would-be Buy,
+    # never force AVOID on a Test/Avoid. So it is excluded from the blanket
+    # hard-gate-fail rule that turns G1/G3 failures into AVOID.
+    hard_gate_fail = [g for g in gates if g.hard and g.passed is False and g.gate_id != "G5"]
     soft_gate_fail = [g for g in gates if not g.hard and g.passed is False]
 
     if hard_kills:
@@ -849,8 +867,22 @@ def _decide_verdict(
         return Verdict.AVOID, tuple(basis)
 
     if score >= v.buy_min and not soft_gate_fail and not demoted:
-        basis.append(f"score {score:.1f} ≥ {v.buy_min:.0f}, all deterministic gates pass")
-        return Verdict.BUY, tuple(basis)
+        # A Buy requires Strategist concurrence (G5). PENDING (not yet evaluated)
+        # leaves a provisional Buy; CONCUR confirms it. DISSENT or UNAVAILABLE
+        # blocks the Buy → capped at Test (never AVOID), disagreement surfaced.
+        if concurrence in (StrategistConcurrence.PENDING, StrategistConcurrence.CONCUR):
+            note = (
+                "all deterministic gates pass; Strategist concurs"
+                if concurrence is StrategistConcurrence.CONCUR
+                else "all deterministic gates pass (G5 provisional — Strategist pending)"
+            )
+            basis.append(f"score {score:.1f} ≥ {v.buy_min:.0f}, {note}")
+            return Verdict.BUY, tuple(basis)
+        basis.append(
+            f"score {score:.1f} ≥ {v.buy_min:.0f} but G5 not met "
+            f"({concurrence.value}) → capped at Test"
+        )
+        return Verdict.TEST, tuple(basis)
 
     if soft_gate_fail:
         basis.append("soft gate(s) failed: " + ", ".join(g.gate_id for g in soft_gate_fail))
@@ -930,12 +962,22 @@ def _snapshot(cfg: DeliumConfig) -> ConfigSnapshot:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def score_opportunity(inp: ScoringInput, config: DeliumConfig) -> ScoredOpportunity:
+def score_opportunity(
+    inp: ScoringInput,
+    config: DeliumConfig,
+    *,
+    strategist: StrategistConcurrence = StrategistConcurrence.PENDING,
+) -> ScoredOpportunity:
     """Assemble the five pillar reports into the final opportunity score.
 
     Runs the four-stage funnel in order (§1) and returns a fully self-contained,
-    hand-auditable `ScoredOpportunity`. Pure: same inputs + same config →
-    identical output. `config` supplies every threshold; nothing is hardcoded.
+    hand-auditable `ScoredOpportunity`. Pure: same inputs + same config +
+    same `strategist` → identical output. `config` supplies every threshold;
+    nothing is hardcoded.
+
+    `strategist` is the resolved G5 concurrence (default PENDING = provisional,
+    the agents-off behavior). It is a validated boolean-like signal, never the LLM
+    setting the verdict: G5 is a BUY gate that can only block a would-be Buy.
     """
     # Stage 0 — hard kills.
     kills = _run_kills(inp, config)
@@ -988,12 +1030,20 @@ def score_opportunity(inp: ScoringInput, config: DeliumConfig) -> ScoredOpportun
         _gate_data_quality(partial_pillars),
         _gate_risk_floor(inp, config),
         _gate_differentiation(differentiation_p, config),
-        _gate_strategist(),
+        _gate_strategist(strategist),
     )
 
-    verdict, basis = _decide_verdict(score=composite, kills=kills, gates=gates, cfg=config)
+    verdict, basis = _decide_verdict(
+        score=composite, kills=kills, gates=gates, concurrence=strategist, cfg=config
+    )
     confidence = _score_confidence(pillars_t)
     insufficient = len(partial_pillars) > 0
+    # A Buy is provisional only while G5 is unresolved (pending) or the Strategist
+    # could not run (unavailable); a concur/dissent verdict is final.
+    strategist_pending = strategist in (
+        StrategistConcurrence.PENDING,
+        StrategistConcurrence.UNAVAILABLE,
+    )
 
     return ScoredOpportunity(
         verdict=verdict,
@@ -1004,7 +1054,7 @@ def score_opportunity(inp: ScoringInput, config: DeliumConfig) -> ScoredOpportun
         gates=gates,
         confidence=confidence,
         insufficient_data=insufficient,
-        strategist_pending=True,
+        strategist_pending=strategist_pending,
         verdict_basis=basis,
         config_snapshot=_snapshot(config),
     )

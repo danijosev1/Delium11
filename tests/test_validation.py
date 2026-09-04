@@ -378,6 +378,7 @@ def test_analysis_layer_does_not_import_validation() -> None:
         "delium.database",
         "delium.discovery",
         "delium.validation",
+        "delium.agents",
         "delium.cli",
     )
     for path in root.glob("*.py"):

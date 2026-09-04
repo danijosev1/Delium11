@@ -1,5 +1,12 @@
-"""Report rendering: typed blocks → markdown (docs/agent-layer.md §6).
+"""Report rendering: typed blocks → Markdown (docs/agent-layer.md §6).
 
-Not yet implemented. Renders only from typed objects (ScoredOpportunity +
-validated agent reports) — never from freeform model text.
+`render_validation` composes a report from typed objects only (the
+`ValidationReport`: deterministic `ScoredOpportunity` + validated agent outputs) —
+never from freeform model text. Deterministic numbers are separated from advisory
+Strategist narrative, model/review text is neutralized (untrusted-text firewall),
+and a report is regenerable from stored data with no LLM call.
 """
+
+from delium.reports.render import quote_ids, render_validation
+
+__all__ = ["quote_ids", "render_validation"]

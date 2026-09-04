@@ -566,13 +566,20 @@ def insert_review_theme(
     quote_review_ids: list[str],
     frequency_pct: float | None = None,
     severity: int | None = None,
+    addressability: str | None = None,
+    cogs_delta: float | None = None,
+    category: str | None = None,
 ) -> str:
+    """Persist one Review Miner theme. `frequency_pct`/`severity` are advisory
+    (the differentiation engine recomputes both from the cited review ids);
+    `addressability`/`cogs_delta`/`category` are the structured fields F3/F4 read."""
     theme_id = _new_id()
     conn.execute(
         """
         INSERT INTO review_themes
-            (id, run_id, asin, kind, theme, frequency_pct, severity, quote_review_ids)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (id, run_id, asin, kind, theme, frequency_pct, severity, quote_review_ids,
+             addressability, cogs_delta, category)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             theme_id,
@@ -583,6 +590,9 @@ def insert_review_theme(
             frequency_pct,
             severity,
             _dumps(quote_review_ids),
+            addressability,
+            cogs_delta,
+            category,
         ),
     )
     return theme_id
@@ -590,6 +600,160 @@ def insert_review_theme(
 
 def get_review_themes(conn: sqlite3.Connection, asin: str) -> list[sqlite3.Row]:
     return _all(conn.execute("SELECT * FROM review_themes WHERE asin = ? ORDER BY kind", (asin,)))
+
+
+def delete_review_themes(conn: sqlite3.Connection, asin: str) -> None:
+    """Clear an ASIN's mined themes before a fresh Review Miner run replaces them
+    (durable history lives in `agent_runs`; this table holds current evidence)."""
+    conn.execute("DELETE FROM review_themes WHERE asin = ?", (asin,))
+
+
+# ---------------------------------------------------------------------------
+# feature_requests (Review Miner missing-feature evidence → differentiation F2)
+# ---------------------------------------------------------------------------
+def insert_feature_request(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    asin: str,
+    feature: str,
+    supporting_review_ids: list[str],
+    absent_from_competitors: bool | None = None,
+) -> str:
+    request_id = _new_id()
+    conn.execute(
+        """
+        INSERT INTO feature_requests
+            (id, run_id, asin, feature, supporting_review_ids, absent_from_competitors)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            request_id,
+            run_id,
+            asin,
+            feature,
+            _dumps(supporting_review_ids),
+            None if absent_from_competitors is None else int(absent_from_competitors),
+        ),
+    )
+    return request_id
+
+
+def get_feature_requests(conn: sqlite3.Connection, asin: str) -> list[sqlite3.Row]:
+    return _all(
+        conn.execute("SELECT * FROM feature_requests WHERE asin = ? ORDER BY feature", (asin,))
+    )
+
+
+def delete_feature_requests(conn: sqlite3.Connection, asin: str) -> None:
+    conn.execute("DELETE FROM feature_requests WHERE asin = ?", (asin,))
+
+
+# ---------------------------------------------------------------------------
+# bundle_signals (Review Miner bundle/complement evidence → differentiation F4)
+# ---------------------------------------------------------------------------
+def insert_bundle_signal(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    asin: str,
+    complement: str,
+    supporting_review_ids: list[str],
+) -> str:
+    signal_id = _new_id()
+    conn.execute(
+        """
+        INSERT INTO bundle_signals (id, run_id, asin, complement, supporting_review_ids)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (signal_id, run_id, asin, complement, _dumps(supporting_review_ids)),
+    )
+    return signal_id
+
+
+def get_bundle_signals(conn: sqlite3.Connection, asin: str) -> list[sqlite3.Row]:
+    return _all(
+        conn.execute("SELECT * FROM bundle_signals WHERE asin = ? ORDER BY complement", (asin,))
+    )
+
+
+def delete_bundle_signals(conn: sqlite3.Connection, asin: str) -> None:
+    conn.execute("DELETE FROM bundle_signals WHERE asin = ?", (asin,))
+
+
+# ---------------------------------------------------------------------------
+# agent_runs (LLM agent audit + reproducibility)
+# ---------------------------------------------------------------------------
+def insert_agent_run(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    asin: str,
+    marketplace: str,
+    agent: str,
+    status: str,
+    model: str | None = None,
+    provider: str | None = None,
+    cost_usd: float = 0.0,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+    output: Any = None,
+    error: str | None = None,
+) -> str:
+    agent_run_id = _new_id()
+    conn.execute(
+        """
+        INSERT INTO agent_runs
+            (id, run_id, asin, marketplace, agent, model, provider, status,
+             cost_usd, tokens_in, tokens_out, output, error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            agent_run_id,
+            run_id,
+            asin,
+            marketplace,
+            agent,
+            model,
+            provider,
+            status,
+            cost_usd,
+            tokens_in,
+            tokens_out,
+            None if output is None else _dumps(output),
+            error,
+        ),
+    )
+    return agent_run_id
+
+
+def get_agent_runs(conn: sqlite3.Connection, asin: str, marketplace: str) -> list[sqlite3.Row]:
+    return _all(
+        conn.execute(
+            """
+            SELECT * FROM agent_runs
+             WHERE asin = ? AND marketplace = ?
+             ORDER BY created_at DESC, rowid DESC
+            """,
+            (asin, marketplace),
+        )
+    )
+
+
+def get_latest_agent_run(
+    conn: sqlite3.Connection, *, asin: str, marketplace: str, agent: str
+) -> sqlite3.Row | None:
+    return _one(
+        conn.execute(
+            """
+            SELECT * FROM agent_runs
+             WHERE asin = ? AND marketplace = ? AND agent = ?
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT 1
+            """,
+            (asin, marketplace, agent),
+        )
+    )
 
 
 # ---------------------------------------------------------------------------

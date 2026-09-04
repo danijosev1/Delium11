@@ -30,8 +30,10 @@ from delium.analysis.differentiation import analyze_differentiation
 from delium.analysis.listing import compute_listing_quality
 from delium.analysis.models import (
     Addressability,
+    BundleSignal,
     DifferentiationReport,
     DiffReview,
+    FeatureRequest,
     ListingInput,
     RawTheme,
     ThemeKind,
@@ -69,11 +71,23 @@ def _diff_reviews(conn: sqlite3.Connection, asin: str) -> tuple[DiffReview, ...]
     return tuple(DiffReview(review_id=r["review_id"], stars=int(r["stars"])) for r in rows)
 
 
+def _addressability(raw: str | None) -> Addressability:
+    """Persisted addressability string → enum. Absent/unknown → UNKNOWN, which the
+    engine never scores optimistically (F3 weight 0)."""
+    if not raw:
+        return Addressability.UNKNOWN
+    try:
+        return Addressability(raw)
+    except ValueError:
+        return Addressability.UNKNOWN
+
+
 def _raw_themes(conn: sqlite3.Connection, asin: str) -> tuple[RawTheme, ...]:
-    """Persisted Review Miner themes → engine `RawTheme`s. Addressability is not
-    persisted, so it is UNKNOWN (never counted as fixable); the persisted
-    frequency/severity are attached as advisory-only fields the engine ignores in
-    favor of recomputing from the cited review ids."""
+    """Persisted Review Miner themes → engine `RawTheme`s. Addressability / cogs
+    delta / category are read from the persisted structured fields (UNKNOWN when
+    absent — never optimistic); the persisted frequency/severity are attached as
+    advisory-only fields the engine ignores in favor of recomputing from the cited
+    review ids."""
     out: list[RawTheme] = []
     for row in repository.get_review_themes(conn, asin):
         kind = _theme_kind(row["kind"])
@@ -85,12 +99,43 @@ def _raw_themes(conn: sqlite3.Connection, asin: str) -> tuple[RawTheme, ...]:
                 kind=kind,
                 label=row["theme"],
                 supporting_review_ids=_parse_ids(row["quote_review_ids"]),
-                addressability=Addressability.UNKNOWN,
+                addressability=_addressability(row["addressability"]),
+                cogs_delta=row["cogs_delta"],
+                category=row["category"],
                 claimed_frequency_pct=row["frequency_pct"],  # advisory only (ignored)
                 claimed_severity=row["severity"],  # advisory only (ignored)
             )
         )
     return tuple(out)
+
+
+def _bool_or_none(value: object) -> bool | None:
+    return None if value is None else bool(value)
+
+
+def _feature_requests(conn: sqlite3.Connection, asin: str) -> tuple[FeatureRequest, ...]:
+    """Persisted Review Miner missing-feature requests → engine FeatureRequests
+    (differentiation F2). `absent_from_competitors` stays None (unknown) until an
+    Analyst feature matrix confirms it — unknown never counts as a confirmed gap."""
+    return tuple(
+        FeatureRequest(
+            feature=row["feature"],
+            supporting_review_ids=_parse_ids(row["supporting_review_ids"]),
+            absent_from_competitors=_bool_or_none(row["absent_from_competitors"]),
+        )
+        for row in repository.get_feature_requests(conn, asin)
+    )
+
+
+def _bundle_signals(conn: sqlite3.Connection, asin: str) -> tuple[BundleSignal, ...]:
+    """Persisted Review Miner bundle/complement signals → engine BundleSignals (F4a)."""
+    return tuple(
+        BundleSignal(
+            complement=row["complement"],
+            supporting_review_ids=_parse_ids(row["supporting_review_ids"]),
+        )
+        for row in repository.get_bundle_signals(conn, asin)
+    )
 
 
 def _latest_rating(conn: sqlite3.Connection, asin: str) -> float | None:
@@ -101,12 +146,15 @@ def _latest_rating(conn: sqlite3.Connection, asin: str) -> float | None:
 
 
 def build_differentiation(
-    conn: sqlite3.Connection, asin: str, config: object
+    conn: sqlite3.Connection, asin: str, config: object, *, miner_ran: bool = False
 ) -> tuple[DifferentiationReport | None, ReviewEvidence | None]:
-    """Assemble the differentiation input from persisted reviews + themes and run
-    the engine. Returns (None, None) when no reviews were fetched — then the
-    differentiation pillar is genuinely absent (blocks Buy via G4), not faked.
+    """Assemble the differentiation input from persisted reviews + Review Miner
+    evidence (themes, feature requests, bundle signals) and run the engine.
+    Returns (None, None) when no reviews were fetched — then the differentiation
+    pillar is genuinely absent (blocks Buy via G4), not faked.
 
+    `miner_ran` records whether the LLM Review Miner produced this run's evidence,
+    so the report can show its status; the deterministic engine is unaffected.
     `config` is accepted for symmetry with the other assemblers (the engine uses
     its own `DifferentiationConfig` defaults); it is intentionally unused here."""
     from delium.analysis.models import DifferentiationInput
@@ -117,16 +165,17 @@ def build_differentiation(
         return None, None
 
     themes = _raw_themes(conn, asin)
+    feature_requests = _feature_requests(conn, asin)
+    bundle_signals = _bundle_signals(conn, asin)
     listing_rating = _latest_rating(conn, asin)
     data = DifferentiationInput(
         target_asin=asin,
         reviews=reviews,
         themes=themes,
-        # feature_requests / bundle_signals are Review Miner (LLM) outputs; they
-        # are not persisted deterministically, so they stay empty until the Miner
-        # runs. Left empty, never invented.
-        feature_requests=(),
-        bundle_signals=(),
+        feature_requests=feature_requests,
+        bundle_signals=bundle_signals,
+        # Confirmed absence of a complement across the top-10 is an Analyst
+        # observation (not built here) — left unknown, never assumed.
         competitors_bundle_complement=None,
         listing_rating_avg=listing_rating,
     )
@@ -135,8 +184,10 @@ def build_differentiation(
         asin=asin,
         sample_size=report.confidence.sample_size,
         themes_available=len(themes),
+        feature_requests=len(feature_requests),
+        bundle_signals=len(bundle_signals),
         listing_rating_avg=listing_rating,
-        miner_pending=True,
+        miner_pending=not miner_ran,
     )
     return report, evidence
 

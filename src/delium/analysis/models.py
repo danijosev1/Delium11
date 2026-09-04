@@ -846,6 +846,28 @@ class Verdict(StrEnum):
     AVOID = "avoid"
 
 
+class StrategistConcurrence(StrEnum):
+    """The resolved G5 (Strategist concurrence) input to scoring (scoring-model
+    §10). Deterministic scoring stays the sole verdict owner; this is a *validated*
+    concurrence signal (like risk flags or mined themes are LLM-sourced inputs),
+    not the LLM setting a verdict. G5 is a BUY gate: it can only BLOCK a would-be
+    Buy, never manufacture one or change a non-Buy verdict.
+
+    - PENDING: not evaluated (default) — a provisional Buy is allowed, marked
+      `strategist_pending` (the agents-off / pre-Strategist baseline).
+    - CONCUR: Strategist ran and returned `buy` with the required register →
+      G5 passes, a qualifying Buy is confirmed.
+    - DISSENT: Strategist ran and did NOT concur with `buy` → G5 not met, a
+      would-be Buy is capped at Test and the disagreement is surfaced.
+    - UNAVAILABLE: Strategist could not run (error/degraded) → G5 unmet, a
+      would-be Buy is capped at Test (no Buy without a Strategist review)."""
+
+    PENDING = "pending"
+    CONCUR = "concur"
+    DISSENT = "dissent"
+    UNAVAILABLE = "unavailable"
+
+
 @dataclass(frozen=True)
 class KillResult:
     """One Stage-0 hard-rejection rule (scoring-model §2). `triggered` and not

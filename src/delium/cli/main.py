@@ -530,13 +530,15 @@ def validate(
         bool, typer.Option("--force", help="Bypass caches and refetch (per ingestion policy).")
     ] = False,
 ) -> None:
-    """Run the full deterministic validation on a target ASIN/URL/keyword.
+    """Run the full validation on a target ASIN/URL/keyword.
 
-    Fetches cache-first (Keepa + DataForSEO + reviews), assembles the five pillar
-    reports with real review evidence, and lets scoring.py issue the final
-    Buy/Test/Avoid verdict. The LLM Strategist (G5) is a downstream stage and is
-    always reported as pending — a BUY here is deterministic and provisional.
+    Fetches cache-first (Keepa + DataForSEO + reviews), runs the LLM Review Miner
+    and Strategist when credentials are present (degrading cleanly to the
+    deterministic result otherwise), and lets scoring.py issue the final
+    Buy/Test/Avoid verdict — the Strategist's concurrence is only the G5 gate and
+    can never manufacture a Buy.
     """
+    from delium.agents import build_llm_client
     from delium.analysis.models import Marketplace
     from delium.validation import Clients, ValidationRequest, ValidationStatus, run_validation
 
@@ -546,7 +548,12 @@ def validate(
     dims_mm = _parse_dims(dims)
 
     keepa_factory, dfs_factory = _build_provider_factories()
-    clients = Clients(keepa=keepa_factory, dfs=dfs_factory, reviews=_build_review_provider_probe())
+    clients = Clients(
+        keepa=keepa_factory,
+        dfs=dfs_factory,
+        reviews=_build_review_provider_probe(),
+        llm=build_llm_client(config.agents),
+    )
 
     with get_connection() as conn:
         run_id = repository.insert_run(conn, command="validate", input_=f"{mp_code}:{target}")
@@ -569,7 +576,13 @@ def validate(
             run_status = "degraded" if report.hydration.degraded else "complete"
         else:
             run_status = "failed"
-        repository.finish_run(conn, run_id, status=run_status, data_cost_usd=report.data_cost_usd)
+        repository.finish_run(
+            conn,
+            run_id,
+            status=run_status,
+            data_cost_usd=report.data_cost_usd,
+            llm_cost_usd=report.llm_cost_usd,
+        )
 
     _render_validation(report)
     if not terminal:
@@ -577,107 +590,50 @@ def validate(
 
 
 def _render_validation(report: object) -> None:
-    from delium.validation import ValidationReport, ValidationStatus
+    """Render the validation report (deterministic numbers + advisory Strategist
+    narrative, clearly separated) and save a Markdown copy. Model/review text is
+    printed literally (markup disabled) so it can never inject terminal markup."""
+    from datetime import date
+
+    from delium.reports.render import quote_ids, render_validation
+    from delium.utils.paths import get_reports_dir
+    from delium.validation import ValidationReport
 
     assert isinstance(report, ValidationReport)
-    status = report.status
-    console.print(
-        "[bold]Validation[/bold] — the final Buy/Test/Avoid verdict is owned by "
-        "scoring.py; the LLM Strategist (G5) is a downstream, pending stage."
-    )
-    console.print(
-        f"Target: [cyan]{report.request.target}[/cyan]  →  "
-        f"ASIN [green]{report.asin or '—'}[/green] [{report.marketplace.value}]  ·  "
-        f"status [bold]{status.value}[/bold]"
-    )
-    if report.from_candidate:
-        srcs = ", ".join(sorted({e.source.value for e in report.discovery_evidence})) or "candidate"
-        console.print(f"  [dim]upgraded discovery candidate (via {srcs})[/dim]")
+    title = _product_title(report.asin, report.marketplace.value) if report.asin else None
+    quotes = _review_quotes(report.asin, quote_ids(report)) if report.asin else {}
+
+    text = render_validation(report, product_title=title, quotes=quotes)
+    console.print(text, markup=False)
 
     if report.asin is not None:
-        title = _product_title(report.asin, report.marketplace.value)
-        if title:
-            console.print(f"  Product: {title}")
-
-    if status not in (ValidationStatus.SCORED, ValidationStatus.HARD_KILLED):
-        console.print(f"\n[yellow]No verdict produced ({status.value}).[/yellow]")
-        for note in report.notes:
-            console.print(f"  - {note}")
-        return
-
-    scored = report.scored
-    assert scored is not None
-
-    if status is ValidationStatus.HARD_KILLED:
-        kill = next((k for k in scored.kills if k.kills), None)
-        if kill is not None:
-            console.print(
-                f"\n[red]Hard kill {kill.rule_id} ({kill.name})[/red]: {kill.reason}"
-                f"  [dim]{kill.actual} vs {kill.threshold}[/dim]"
-            )
-        console.print("[dim]Review spend skipped — killed before enrichment.[/dim]")
-
-    # Verdict line — echoes scoring.py exactly; never upgraded here.
-    suff = "insufficient data" if scored.insufficient_data else "sufficient"
-    console.print(
-        f"\n[bold]Verdict: {scored.verdict.value.upper()}[/bold]  ·  "
-        f"opportunity score {scored.score:.0f}/100  ·  "
-        f"{scored.confidence.level.value} confidence  ·  {suff}"
-    )
-
-    console.print("\n[bold]Pillars[/bold] (raw → capped × weight = contribution):")
-    for p in scored.pillars:
-        if not p.available:
-            console.print(f"  {p.pillar:<15} [yellow]absent[/yellow]  ({p.cap_reason})")
-            continue
-        raw = "—" if p.raw_score is None else f"{p.raw_score:.0f}"
-        capped = "—" if p.capped_score is None else f"{p.capped_score:.0f}"
-        flag = " [yellow](partial)[/yellow]" if p.partial else ""
-        console.print(
-            f"  {p.pillar:<15} {raw:>3} → {capped:>3}  × {p.weight:.0f} = "
-            f"{p.weighted_contribution:5.1f}  ·  {p.confidence.value} conf{flag}"
-        )
-
-    triggered = [k for k in scored.kills if k.kills]
-    demoted = [k for k in scored.kills if k.assessed and k.triggered and k.demoted]
-    unassessed = sum(1 for k in scored.kills if not k.assessed)
-    console.print(
-        f"\n[bold]Hard kills[/bold]: {len(triggered)} triggered, "
-        f"{len(demoted)} borderline (→Test), {unassessed} unassessed"
-    )
-    for k in triggered:
-        console.print(f"  [red]{k.rule_id}[/red] {k.name}: {k.actual} vs {k.threshold}")
-
-    console.print("[bold]Gates[/bold]:")
-    for g in scored.gates:
-        if g.passed is None:
-            console.print(f"  {g.gate_id} {g.name}: [yellow]pending[/yellow] ({g.actual})")
-        else:
-            mark = "[green]pass[/green]" if g.passed else "[red]fail[/red]"
-            kind = "hard" if g.hard else "soft"
-            console.print(f"  {g.gate_id} {g.name} ({kind}): {mark}  [dim]{g.actual}[/dim]")
-
-    if report.review_evidence is not None:
-        re_ = report.review_evidence
-        console.print(
-            f"\n[bold]Review evidence[/bold]: sample {re_.sample_size}, "
-            f"{re_.themes_available} persisted theme(s)  ·  "
-            "[yellow]Review Miner (LLM) pending[/yellow]"
-        )
-    console.print(
-        f"[dim]G5 Strategist: pending (not run). Data cost this run: "
-        f"${report.data_cost_usd:.4f}.[/dim]"
-    )
-    if scored.verdict.value == "buy":
-        console.print(
-            "[dim]BUY is deterministic and provisional — confirm with the Strategist (G5).[/dim]"
-        )
+        reports_dir = get_reports_dir()
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        path = reports_dir / f"validate-{report.asin}-{date.today().isoformat()}.md"
+        path.write_text(text, encoding="utf-8")
+        console.print(f"\n[dim]Report written to {path}[/dim]")
 
 
 def _product_title(asin: str, marketplace: str) -> str | None:
     with get_connection() as conn:
         row = repository.get_product(conn, asin, marketplace)
     return row["title"] if row is not None else None
+
+
+def _review_quotes(asin: str | None, ids: list[str]) -> dict[str, tuple[int, str]]:
+    """Fetch (stars, text) for the wanted review ids from the DB — quotes shown in
+    the report come from stored reviews by id, never from model output."""
+    if not asin or not ids:
+        return {}
+    wanted = set(ids)
+    with get_connection() as conn:
+        rows = repository.get_reviews_for_asin(conn, asin)
+    out: dict[str, tuple[int, str]] = {}
+    for row in rows:
+        rid = row["review_id"]
+        if rid in wanted:
+            out[rid] = (int(row["stars"]), row["body"] or row["title"] or "")
+    return out
 
 
 @app.command()

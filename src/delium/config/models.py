@@ -263,6 +263,32 @@ class DiscoveryConfig(StrictModel):
     cross_market_min_source_units: int = Field(0, ge=0)
 
 
+class AgentsConfig(StrictModel):
+    """LLM agent layer (docs/agent-layer.md). Model *tier* is config, not code:
+    `fast` (Haiku-class) for Scout/Analyst/Review Miner, `frontier` (Sonnet-class)
+    for the Strategist only. Agents run only when an LLM client is available;
+    missing credentials or a provider/validation failure degrades to the
+    deterministic result and is never fabricated. Pricing lives here (external),
+    never hardcoded in the client, so cost accounting stays auditable."""
+
+    enabled: bool = True  # master switch; False → agents never run (deterministic-only)
+    review_miner_enabled: bool = True
+    strategist_enabled: bool = True
+    fast_model: str = "claude-haiku-4-5"  # Scout / Analyst / Review Miner
+    frontier_model: str = "claude-sonnet-5"  # Strategist only
+    max_output_tokens_fast: int = Field(4096, gt=0)
+    max_output_tokens_frontier: int = Field(5120, gt=0)
+    temperature: float = Field(0.0, ge=0.0, le=1.0)  # 0 → reproducible agent output
+    max_retries: int = Field(1, ge=0)  # one retry on validation failure (agent-layer §5.2)
+    # Per-1M-token USD pricing for cost accounting (Haiku 4.5 / Sonnet 5 defaults).
+    fast_input_usd_per_mtok: float = Field(1.0, ge=0)
+    fast_output_usd_per_mtok: float = Field(5.0, ge=0)
+    frontier_input_usd_per_mtok: float = Field(2.0, ge=0)
+    frontier_output_usd_per_mtok: float = Field(10.0, ge=0)
+    evidence_drop_threshold: float = Field(0.20, ge=0, le=1)  # >this dropped → fail (§5.3)
+    min_quote_ids: int = Field(3, ge=1)  # a theme needs ≥ this many supporting reviews
+
+
 class DeliumConfig(StrictModel):
     """Root configuration object loaded from config.toml."""
 
@@ -282,3 +308,4 @@ class DeliumConfig(StrictModel):
     verdicts: VerdictsConfig = Field(default_factory=VerdictsConfig)
     cross_market: CrossMarketConfig = Field(default_factory=CrossMarketConfig)
     discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
+    agents: AgentsConfig = Field(default_factory=AgentsConfig)

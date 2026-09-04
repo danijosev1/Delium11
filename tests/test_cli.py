@@ -435,12 +435,14 @@ def test_validate_scores_over_cached_data(initialized_db: Path) -> None:
         vs.seed_reviews(conn, rid, "B0VALID001", n=40)
     result = runner.invoke(app, ["validate", "B0VALID001", "-m", "US"])
     assert result.exit_code == 0
-    assert "Verdict:" in result.output
-    assert "Pillars" in result.output
+    assert "## Verdict" in result.output
+    assert "## Pillars" in result.output
+    # Review Miner did not run (no LLM client) → shown as such, not faked.
+    assert "Review Miner" in result.output and "not run" in result.output
     # G5 (LLM Strategist) must be shown as pending, never resolved here.
     assert "G5" in result.output and "pending" in result.output
-    # Discovery/validate-tier data without mined themes must not present a BUY.
-    assert "Verdict: BUY" not in result.output
+    # Discovery/validate-tier data without a Strategist must not present a BUY.
+    assert "**BUY**" not in result.output
 
 
 def test_validate_unknown_marketplace(initialized_db: Path) -> None:

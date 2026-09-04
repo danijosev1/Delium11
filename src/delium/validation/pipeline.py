@@ -2,19 +2,23 @@
 §3.1). Turns a candidate (explicit ASIN, Amazon URL, keyword, or a persisted
 discovery candidate) into a fully-scored, persisted opportunity.
 
-Funnel (hard-kill-first, so the expensive review spend is never wasted):
+Funnel (hard-kill-first, so the expensive review + LLM spend is never wasted):
   resolve target → target Keepa (cheap) → cheap hard kills → stop if killed
   → cluster + competitors (Keepa, cheap) → competitor-aware hard kills → stop if killed
-  → reviews (target + top-3, the validate-tier spend) → differentiation + listing quality
-  → full ScoringInput → scoring.py → persist validation + upgrade candidate
+  → reviews (target + top-3) → Review Miner (LLM) → persist structured evidence
+  → differentiation (recomputed) → scoring.py (provisional) → Strategist (LLM) → G5
+  → scoring.py (final) → persist validation + agent runs + upgrade candidate
 
 Boundaries this module keeps:
 - scoring.py is the SOLE owner of the Buy/Test/Avoid verdict; nothing here
-  re-implements a score, kill, or gate.
-- providers are reached only through ingestion (cache-first), never directly.
-- the LLM Review Miner / Strategist (G5) are NOT run — differentiation uses the
-  real review sample with whatever themes are already persisted, and G5 stays
-  pending. No AI output is invented or relabeled as deterministic.
+  re-implements a score, kill, or gate. The Strategist only supplies the G5
+  concurrence, which scoring.py evaluates and which can only block a would-be Buy.
+- providers/LLM are reached only through ingestion/the agent layer; the LLM never
+  runs on a hard-killed candidate (those return above the agent phase) and never
+  runs when its required inputs are missing.
+- LLM output is validated, evidence-resolved, and its numbers recomputed
+  deterministically — a Miner/Strategist failure degrades to the deterministic
+  result and never fabricates evidence or raises confidence.
 - no randomness, no wall-clock feeds a scoring decision (`as_of` is data-derived).
 """
 
@@ -22,8 +26,21 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 
-from delium.analysis.models import Marketplace, ScoredOpportunity
+from pydantic import BaseModel
+
+from delium.agents.miner import persist_miner_output, run_review_miner
+from delium.agents.runner import AgentResult
+from delium.agents.schemas import MinerReport, StrategistVerdict
+from delium.agents.strategist import derive_concurrence, run_strategist
+from delium.analysis.models import (
+    DifferentiationReport,
+    Marketplace,
+    ScoredOpportunity,
+    ScoringInput,
+    StrategistConcurrence,
+)
 from delium.analysis.scoring import score_opportunity
 from delium.config.models import DeliumConfig
 from delium.database import repository
@@ -39,6 +56,7 @@ from delium.validation.hydration import (
     resolve_target,
 )
 from delium.validation.models import (
+    AgentRunInfo,
     HydrationOutcome,
     ReviewEvidence,
     ValidationReport,
@@ -49,6 +67,19 @@ from delium.validation.models import (
 log = get_logger(__name__)
 
 _REVIEW_COMPETITORS = 3  # target + top-3 competitors (~400 reviews; data-layer §3.1)
+
+
+@dataclass(frozen=True)
+class _AgentsOutcome:
+    """Result of the LLM agent phase — validated outputs, audit records, and cost.
+    scoring.py still owns the verdict; `concurrence` is only the G5 gate input."""
+
+    miner_report: MinerReport | None = None
+    strategist_verdict: StrategistVerdict | None = None
+    concurrence: StrategistConcurrence = StrategistConcurrence.PENDING
+    runs: tuple[AgentRunInfo, ...] = ()
+    llm_cost_usd: float = 0.0
+    miner_ran: bool = False
 
 
 def run_validation(
@@ -78,7 +109,10 @@ def run_validation(
         hydration: HydrationOutcome | None = None,
         from_candidate: bool = False,
         discovery_evidence: tuple[DiscoveryEvidence, ...] = (),
+        agents: _AgentsOutcome | None = None,
+        differentiation: DifferentiationReport | None = None,
     ) -> ValidationReport:
+        agents = agents or _AgentsOutcome()
         return ValidationReport(
             request=request,
             asin=asin,
@@ -90,6 +124,10 @@ def run_validation(
             hydration=hydration or HydrationOutcome(data_cost_usd=cost, notes=tuple(notes)),
             from_candidate=from_candidate,
             discovery_evidence=discovery_evidence,
+            miner_report=agents.miner_report,
+            strategist_verdict=agents.strategist_verdict,
+            differentiation=differentiation,
+            agent_runs=agents.runs,
             notes=tuple(notes),
         )
 
@@ -181,7 +219,8 @@ def run_validation(
             )
 
     # 5. Reviews — the validate-tier spend — only for survivors.
-    review_asins = [asin, *_top_competitors(conn, asin, resolution.seed, mp, _REVIEW_COMPETITORS)]
+    competitor_review_asins = _top_competitors(conn, asin, resolution.seed, mp, _REVIEW_COMPETITORS)
+    review_asins = [asin, *competitor_review_asins]
     reviews = hydrate_reviews(
         review_asins,
         config,
@@ -193,10 +232,15 @@ def run_validation(
     cost += reviews.cost_usd
     notes.extend(reviews.notes)
 
-    # 6. Differentiation from the real review sample + persisted themes (Miner pending).
-    differentiation, review_evidence = build_differentiation(conn, asin, config)
+    # 6. Review Miner (LLM) — persists structured evidence the engine recomputes.
+    agents = _run_miner(conn, request, config, clients, asin, competitor_review_asins, notes)
 
-    # 7. Full ScoringInput → scoring.py (the sole verdict owner).
+    # 7. Differentiation from the real review sample + (Miner-persisted) evidence.
+    differentiation, review_evidence = build_differentiation(
+        conn, asin, config, miner_ran=agents.miner_ran
+    )
+
+    # 8. Full ScoringInput → scoring.py (provisional, G5 pending).
     full_input, provenance = build_scoring_input(
         conn,
         asin,
@@ -213,19 +257,35 @@ def run_validation(
             from_candidate=from_candidate,
             discovery_evidence=discovery_evidence,
         )
-    scored = score_opportunity(full_input, config)
+    provisional = score_opportunity(full_input, config)
 
-    # 8. Persist last (single writer): validation snapshot + upgraded candidate.
+    # 9. Strategist (LLM, frontier) → G5 concurrence → FINAL deterministic score.
+    agents = _run_strategist(
+        conn,
+        request,
+        config,
+        clients,
+        asin,
+        full_input,
+        provisional,
+        agents,
+        discovery_evidence,
+        notes,
+    )
+    scored = score_opportunity(full_input, config, strategist=agents.concurrence)
+
+    # 10. Persist last (single writer): validation snapshot + upgraded candidate.
     _persist(conn, request, asin, scored, candidate_row)
 
     hydration = HydrationOutcome(
         data_cost_usd=cost,
+        llm_cost_usd=agents.llm_cost_usd,
         product_from_cache=product.from_cache,
         reviews_from_cache=reviews.from_cache,
         review_provider=reviews.provider,
         competitors_hydrated=cluster.count,
         reviews_fetched=reviews.count,
-        degraded=reviews.degraded,
+        degraded=reviews.degraded or any(r.status == "failed" for r in agents.runs),
         notes=tuple(notes),
     )
     return _report(
@@ -237,7 +297,191 @@ def run_validation(
         hydration=hydration,
         from_candidate=from_candidate,
         discovery_evidence=discovery_evidence,
+        agents=agents,
+        differentiation=differentiation,
     )
+
+
+# ---------------------------------------------------------------------------
+# Agent phase (LLM) — never runs on hard-killed candidates (they returned above)
+# ---------------------------------------------------------------------------
+def _run_miner(
+    conn: sqlite3.Connection,
+    request: ValidationRequest,
+    config: DeliumConfig,
+    clients: Clients,
+    asin: str,
+    competitor_asins: list[str],
+    notes: list[str],
+) -> _AgentsOutcome:
+    """Run the Review Miner when enabled + affordable + there are reviews. Persists
+    its validated evidence (replacing stale) and an audit row. On any failure the
+    deterministic pipeline continues on whatever evidence is already persisted —
+    no fabrication, and a missing Miner never raises confidence."""
+    ac = config.agents
+    if clients.llm is None or not ac.enabled or not ac.review_miner_enabled:
+        return _AgentsOutcome()
+    if not repository.get_reviews_for_asin(conn, asin):
+        return _AgentsOutcome()  # nothing to mine → differentiation stays evidence-thin
+    if config.budgets.max_llm_usd_per_validate <= 0:
+        notes.append("review miner skipped — LLM budget is zero")
+        return _AgentsOutcome()
+
+    miner_run = run_review_miner(
+        conn,
+        clients.llm,
+        target_asin=asin,
+        competitor_asins=competitor_asins,
+        config=ac,
+        listing_rating_avg=_target_rating(conn, asin),
+    )
+    result = miner_run.result
+    info = _agent_run_info("review_miner", result)
+    _persist_agent_run(conn, request, asin, "review_miner", result)
+
+    miner_report: MinerReport | None = None
+    miner_ran = False
+    if result.ok and result.output is not None:
+        persist_miner_output(conn, run_id=request.run_id, asin=asin, report=result.output)
+        miner_report = result.output
+        miner_ran = True
+        if result.status == "degraded":
+            notes.append(f"review miner degraded — {result.dropped}/{result.total} items dropped")
+    else:
+        notes.append(f"review miner unavailable — {result.error}")
+
+    return _AgentsOutcome(
+        miner_report=miner_report,
+        runs=(info,),
+        llm_cost_usd=result.cost_usd,
+        miner_ran=miner_ran,
+    )
+
+
+def _run_strategist(
+    conn: sqlite3.Connection,
+    request: ValidationRequest,
+    config: DeliumConfig,
+    clients: Clients,
+    asin: str,
+    inp: ScoringInput,
+    provisional: ScoredOpportunity,
+    agents: _AgentsOutcome,
+    discovery_evidence: tuple[DiscoveryEvidence, ...],
+    notes: list[str],
+) -> _AgentsOutcome:
+    """Run the Strategist and derive the G5 concurrence. It never sets the verdict:
+    concurrence can only block a would-be Buy (scoring.py applies the gate).
+    Agents-off leaves PENDING (provisional Buy allowed); an enabled-but-unavailable
+    Strategist yields UNAVAILABLE (no Buy without a review)."""
+    ac = config.agents
+    if clients.llm is None or not ac.enabled or not ac.strategist_enabled:
+        return agents  # PENDING — the agents-off baseline
+    remaining = config.budgets.max_llm_usd_per_validate - agents.llm_cost_usd
+    if remaining <= 0:
+        notes.append("strategist skipped — LLM budget exhausted; a Buy cannot be confirmed")
+        return _replace_concurrence(agents, StrategistConcurrence.UNAVAILABLE)
+
+    result = run_strategist(
+        clients.llm,
+        scored=provisional,
+        inp=inp,
+        miner_report=agents.miner_report,
+        config=config,
+        cross_market=_cross_market_signals(discovery_evidence),
+    )
+    info = _agent_run_info("strategist", result)
+    _persist_agent_run(conn, request, asin, "strategist", result)
+    concurrence = derive_concurrence(result)
+    if not result.ok:
+        notes.append(f"strategist unavailable — {result.error}; a Buy cannot be confirmed")
+
+    return _AgentsOutcome(
+        miner_report=agents.miner_report,
+        strategist_verdict=result.output,
+        concurrence=concurrence,
+        runs=(*agents.runs, info),
+        llm_cost_usd=agents.llm_cost_usd + result.cost_usd,
+        miner_ran=agents.miner_ran,
+    )
+
+
+def _replace_concurrence(
+    agents: _AgentsOutcome, concurrence: StrategistConcurrence
+) -> _AgentsOutcome:
+    return _AgentsOutcome(
+        miner_report=agents.miner_report,
+        strategist_verdict=agents.strategist_verdict,
+        concurrence=concurrence,
+        runs=agents.runs,
+        llm_cost_usd=agents.llm_cost_usd,
+        miner_ran=agents.miner_ran,
+    )
+
+
+def _agent_run_info[R: BaseModel](agent: str, result: AgentResult[R]) -> AgentRunInfo:
+    return AgentRunInfo(
+        agent=agent,
+        status=result.status,
+        model=result.model,
+        provider=result.provider,
+        cost_usd=result.cost_usd,
+        tokens_in=result.tokens_in,
+        tokens_out=result.tokens_out,
+        dropped=result.dropped,
+        total=result.total,
+        error=result.error,
+    )
+
+
+def _persist_agent_run[R: BaseModel](
+    conn: sqlite3.Connection,
+    request: ValidationRequest,
+    asin: str,
+    agent: str,
+    result: AgentResult[R],
+) -> None:
+    """Persist the audit + reproducibility row for one agent invocation, including
+    the VALIDATED structured output (never raw model text)."""
+    output = result.output.model_dump() if result.output is not None else None
+    repository.insert_agent_run(
+        conn,
+        run_id=request.run_id,
+        asin=asin,
+        marketplace=request.marketplace.value,
+        agent=agent,
+        status=result.status,
+        model=result.model,
+        provider=result.provider,
+        cost_usd=result.cost_usd,
+        tokens_in=result.tokens_in,
+        tokens_out=result.tokens_out,
+        output=output,
+        error=result.error,
+    )
+
+
+def _cross_market_signals(
+    discovery_evidence: tuple[DiscoveryEvidence, ...],
+) -> list[dict[str, object]]:
+    """Compact cross-market context for the Strategist — a discovery signal only,
+    never a scoring input."""
+    return [
+        {
+            "source": e.source.value,
+            "reference": e.reference,
+            "cross_market_score": e.cross_market_score,
+        }
+        for e in discovery_evidence
+        if e.cross_market_score is not None
+    ]
+
+
+def _target_rating(conn: sqlite3.Connection, asin: str) -> float | None:
+    for row in reversed(repository.get_price_bsr_history(conn, asin)):
+        if row["rating"] is not None:
+            return float(row["rating"])
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from delium.agents.llm import LlmClient
 from delium.analysis.models import Marketplace
 from delium.config.models import DeliumConfig
 from delium.database import repository
@@ -40,11 +41,13 @@ _URL_ASIN_RE = re.compile(r"/(?:dp|gp/product|product|gp/aw/d)/([A-Z0-9]{10})", 
 @dataclass(frozen=True)
 class Clients:
     """Provider factories/clients injected by the CLI (real) or tests (fakes).
-    Any may be None — hydration then runs on already-cached data only."""
+    Any may be None — hydration then runs on already-cached data only, and a None
+    `llm` means the agent layer never runs (deterministic-only, `miner_pending`)."""
 
     keepa: KeepaFactory | None = None
     dfs: DfsFactory | None = None
     reviews: ReviewSource | None = None
+    llm: LlmClient | None = None
 
 
 @dataclass(frozen=True)

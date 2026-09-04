@@ -288,3 +288,107 @@ def test_reviews_and_themes_roundtrip(initialized_db: Path) -> None:
     assert themes[0]["id"] == theme_id
     assert themes[0]["severity"] == 3
     assert json.loads(themes[0]["quote_review_ids"]) == ["r0", "r1", "r2"]
+
+
+def test_agent_runs_roundtrip(initialized_db: Path) -> None:
+    with get_connection() as conn:
+        run_id = repository.insert_run(conn, command="validate", input_="B0X")
+        repository.upsert_product(
+            conn,
+            asin="B0X",
+            fetch_id=repository.insert_raw_fetch(
+                conn,
+                run_id=run_id,
+                provider="keepa",
+                endpoint="product",
+                request_key="keepa:product:US:B0X",
+                payload={},
+            ),
+        )
+        repository.insert_agent_run(
+            conn,
+            run_id=run_id,
+            asin="B0X",
+            marketplace="US",
+            agent="review_miner",
+            status="degraded",
+            model="claude-haiku-4-5",
+            provider="anthropic",
+            cost_usd=0.0075,
+            tokens_in=1000,
+            tokens_out=300,
+            output={"complaints": []},
+            error=None,
+        )
+        repository.insert_agent_run(
+            conn,
+            run_id=run_id,
+            asin="B0X",
+            marketplace="US",
+            agent="strategist",
+            status="ok",
+            model="claude-sonnet-5",
+            provider="anthropic",
+            cost_usd=0.02,
+        )
+    with get_connection() as conn:
+        runs = repository.get_agent_runs(conn, "B0X", "US")
+        latest_miner = repository.get_latest_agent_run(
+            conn, asin="B0X", marketplace="US", agent="review_miner"
+        )
+    assert len(runs) == 2
+    assert latest_miner is not None
+    assert latest_miner["status"] == "degraded"
+    assert latest_miner["cost_usd"] == 0.0075
+    assert json.loads(latest_miner["output"]) == {"complaints": []}
+
+
+def test_review_theme_structured_columns_roundtrip(initialized_db: Path) -> None:
+    with get_connection() as conn:
+        run_id = repository.insert_run(conn, command="validate", input_="B0Y")
+        repository.upsert_product(
+            conn,
+            asin="B0Y",
+            fetch_id=repository.insert_raw_fetch(
+                conn,
+                run_id=run_id,
+                provider="keepa",
+                endpoint="product",
+                request_key="keepa:product:US:B0Y",
+                payload={},
+            ),
+        )
+        repository.insert_review_theme(
+            conn,
+            run_id=run_id,
+            asin="B0Y",
+            kind="complaint",
+            theme="leaks",
+            quote_review_ids=["r0", "r1", "r2"],
+            addressability="fixable",
+            cogs_delta=0.10,
+            category="packaging",
+        )
+        fid = repository.insert_feature_request(
+            conn,
+            run_id=run_id,
+            asin="B0Y",
+            feature="lid",
+            supporting_review_ids=["r0", "r1", "r2"],
+            absent_from_competitors=None,
+        )
+        bid = repository.insert_bundle_signal(
+            conn,
+            run_id=run_id,
+            asin="B0Y",
+            complement="bag",
+            supporting_review_ids=["r0", "r1", "r2"],
+        )
+    with get_connection() as conn:
+        theme = repository.get_review_themes(conn, "B0Y")[0]
+        feature = repository.get_feature_requests(conn, "B0Y")[0]
+        bundle = repository.get_bundle_signals(conn, "B0Y")[0]
+    assert theme["addressability"] == "fixable" and theme["cogs_delta"] == 0.10
+    assert theme["category"] == "packaging"
+    assert feature["id"] == fid and feature["absent_from_competitors"] is None
+    assert bundle["id"] == bid and bundle["complement"] == "bag"
