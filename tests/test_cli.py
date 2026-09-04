@@ -73,16 +73,19 @@ def test_discover_reports_hard_kills(initialized_db: Path) -> None:
     assert "K1" in result.output
 
 
-def test_validate_command_is_wired_but_unimplemented(isolated_env: Path) -> None:
+def test_validate_command_runs_pipeline(isolated_env: Path) -> None:
+    # Implemented: with no provider and nothing cached, it runs the pipeline and
+    # reports a clean status rather than the old "not implemented" stub.
     result = runner.invoke(app, ["validate", "B0EXAMPLE1"])
     assert result.exit_code == 1
-    assert "not implemented" in result.output
+    assert "not implemented" not in result.output
+    assert "Validation" in result.output
 
 
 def test_validate_accepts_optional_overrides(isolated_env: Path) -> None:
     result = runner.invoke(app, ["validate", "B0EXAMPLE1", "--cogs", "4.20", "--freight", "1.10"])
-    assert result.exit_code == 1
-    assert "not implemented" in result.output
+    assert result.exit_code == 1  # missing product (no provider/cache), but overrides parsed
+    assert "not implemented" not in result.output
 
 
 def test_pains_command_is_wired_but_unimplemented(isolated_env: Path) -> None:
@@ -416,3 +419,56 @@ def test_discover_keyword_hydrates_via_mocked_providers(
     result = runner.invoke(app, ["discover", "silicone baby food tray", "-m", "US"])
     assert result.exit_code == 0
     assert "Discovery" in result.output
+
+
+# =========================================================================
+# validate command (deterministic, over cached data — no providers)
+# =========================================================================
+def test_validate_scores_over_cached_data(initialized_db: Path) -> None:
+    import discovery_support as seed
+    import validation_support as vs
+    from delium.database import get_connection
+
+    with get_connection() as conn:
+        rid = seed.new_run(conn)
+        seed.seed_keyword_market(conn, rid, "US", asins=("B0VALID001", "B0VALID002"))
+        vs.seed_reviews(conn, rid, "B0VALID001", n=40)
+    result = runner.invoke(app, ["validate", "B0VALID001", "-m", "US"])
+    assert result.exit_code == 0
+    assert "Verdict:" in result.output
+    assert "Pillars" in result.output
+    # G5 (LLM Strategist) must be shown as pending, never resolved here.
+    assert "G5" in result.output and "pending" in result.output
+    # Discovery/validate-tier data without mined themes must not present a BUY.
+    assert "Verdict: BUY" not in result.output
+
+
+def test_validate_unknown_marketplace(initialized_db: Path) -> None:
+    result = runner.invoke(app, ["validate", "B0VALID001", "-m", "ZZ"])
+    assert result.exit_code == 1
+    assert "Unknown marketplace" in result.output
+
+
+def test_validate_missing_product_reports_no_verdict(initialized_db: Path) -> None:
+    result = runner.invoke(app, ["validate", "B0GHOST999", "-m", "US"])
+    assert result.exit_code == 1
+    assert "No verdict produced" in result.output
+
+
+def test_validate_hard_kill_shows_kill(initialized_db: Path) -> None:
+    import discovery_support as seed
+    from delium.database import get_connection
+
+    with get_connection() as conn:
+        rid = seed.new_run(conn)
+        # $8 median price is below the floor → K1 kills cheaply.
+        seed.seed_keyword_market(conn, rid, "US", asins=("B0KILL0001",), price_cents=800)
+    result = runner.invoke(app, ["validate", "B0KILL0001", "-m", "US"])
+    assert result.exit_code == 0
+    assert "Hard kill" in result.output
+
+
+def test_validate_bad_dims_option_is_rejected(initialized_db: Path) -> None:
+    result = runner.invoke(app, ["validate", "B0VALID001", "--dims", "10x20"])
+    assert result.exit_code == 1
+    assert "L×W×H" in result.output

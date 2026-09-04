@@ -20,7 +20,7 @@ from delium.config import ConfigError, load_config
 from delium.database import initialize_database, repository
 from delium.database.connection import get_connection
 from delium.ingestion import CrossMarketCandidate
-from delium.providers import ProviderError, build_review_provider
+from delium.providers import ProviderError, ReviewProviderChain, build_review_provider
 from delium.providers.dataforseo import DataForSeoClient
 from delium.providers.keepa import KeepaClient
 from delium.utils.logging import configure_logging, get_logger
@@ -482,6 +482,31 @@ def _render_discovery(report: object, limit: int) -> None:
         pass  # discovery never emits BUY; scoring caps at TEST without validate-tier data
 
 
+def _build_review_provider_probe() -> ReviewProviderChain | None:
+    """A review provider chain, or None if no review credentials are configured —
+    validation then uses only already-cached reviews."""
+    try:
+        return build_review_provider()
+    except ProviderError:
+        return None
+
+
+def _parse_dims(raw: str | None) -> tuple[int, int, int] | None:
+    """Parse a `--dims` override like '160x120x30' (millimetres, L×W×H)."""
+    if raw is None:
+        return None
+    parts = [p for p in raw.replace(",", "x").lower().split("x") if p.strip()]
+    if len(parts) != 3:
+        console.print("[bold red]--dims must be L×W×H in mm, e.g. 160x120x30.[/bold red]")
+        raise typer.Exit(code=1)
+    try:
+        length, width, height = (int(float(p)) for p in parts)
+    except ValueError as exc:
+        console.print("[bold red]--dims values must be numbers (mm).[/bold red]")
+        raise typer.Exit(code=1) from exc
+    return length, width, height
+
+
 @app.command()
 def validate(
     target: Annotated[str, typer.Argument(help="Amazon URL, ASIN, or keyword.")],
@@ -491,10 +516,168 @@ def validate(
     freight: Annotated[
         float | None, typer.Option("--freight", help="Override assumed freight/unit in USD.")
     ] = None,
+    marketplace: Annotated[
+        str, typer.Option("--marketplace", "-m", help="Marketplace: US, CA, UK, AU, IN.")
+    ] = "US",
+    dims: Annotated[
+        str | None,
+        typer.Option("--dims", help="Override dims (mm, L×W×H), e.g. 160x120x30 — unblocks fees."),
+    ] = None,
+    weight: Annotated[
+        int | None, typer.Option("--weight", help="Override unit weight in grams (unblocks fees).")
+    ] = None,
+    force: Annotated[
+        bool, typer.Option("--force", help="Bypass caches and refetch (per ingestion policy).")
+    ] = False,
 ) -> None:
-    """Run the full product validation mission on a target ASIN/URL/keyword."""
-    log.info("validate requested: target=%r cogs=%r freight=%r", target, cogs, freight)
-    _not_implemented("validate")
+    """Run the full deterministic validation on a target ASIN/URL/keyword.
+
+    Fetches cache-first (Keepa + DataForSEO + reviews), assembles the five pillar
+    reports with real review evidence, and lets scoring.py issue the final
+    Buy/Test/Avoid verdict. The LLM Strategist (G5) is a downstream stage and is
+    always reported as pending — a BUY here is deterministic and provisional.
+    """
+    from delium.analysis.models import Marketplace
+    from delium.validation import Clients, ValidationRequest, ValidationStatus, run_validation
+
+    initialize_database()
+    config = load_config()
+    mp_code = _validate_marketplace(marketplace)
+    dims_mm = _parse_dims(dims)
+
+    keepa_factory, dfs_factory = _build_provider_factories()
+    clients = Clients(keepa=keepa_factory, dfs=dfs_factory, reviews=_build_review_provider_probe())
+
+    with get_connection() as conn:
+        run_id = repository.insert_run(conn, command="validate", input_=f"{mp_code}:{target}")
+
+    request = ValidationRequest(
+        target=target,
+        marketplace=Marketplace(mp_code),
+        run_id=run_id,
+        force=force,
+        cogs_usd=cogs,
+        freight_usd=freight,
+        dims_mm=dims_mm,
+        weight_g=weight,
+    )
+
+    with get_connection() as conn:
+        report = run_validation(conn, request, config, clients)
+        terminal = report.status in (ValidationStatus.SCORED, ValidationStatus.HARD_KILLED)
+        if terminal:
+            run_status = "degraded" if report.hydration.degraded else "complete"
+        else:
+            run_status = "failed"
+        repository.finish_run(conn, run_id, status=run_status, data_cost_usd=report.data_cost_usd)
+
+    _render_validation(report)
+    if not terminal:
+        raise typer.Exit(code=1)
+
+
+def _render_validation(report: object) -> None:
+    from delium.validation import ValidationReport, ValidationStatus
+
+    assert isinstance(report, ValidationReport)
+    status = report.status
+    console.print(
+        "[bold]Validation[/bold] — the final Buy/Test/Avoid verdict is owned by "
+        "scoring.py; the LLM Strategist (G5) is a downstream, pending stage."
+    )
+    console.print(
+        f"Target: [cyan]{report.request.target}[/cyan]  →  "
+        f"ASIN [green]{report.asin or '—'}[/green] [{report.marketplace.value}]  ·  "
+        f"status [bold]{status.value}[/bold]"
+    )
+    if report.from_candidate:
+        srcs = ", ".join(sorted({e.source.value for e in report.discovery_evidence})) or "candidate"
+        console.print(f"  [dim]upgraded discovery candidate (via {srcs})[/dim]")
+
+    if report.asin is not None:
+        title = _product_title(report.asin, report.marketplace.value)
+        if title:
+            console.print(f"  Product: {title}")
+
+    if status not in (ValidationStatus.SCORED, ValidationStatus.HARD_KILLED):
+        console.print(f"\n[yellow]No verdict produced ({status.value}).[/yellow]")
+        for note in report.notes:
+            console.print(f"  - {note}")
+        return
+
+    scored = report.scored
+    assert scored is not None
+
+    if status is ValidationStatus.HARD_KILLED:
+        kill = next((k for k in scored.kills if k.kills), None)
+        if kill is not None:
+            console.print(
+                f"\n[red]Hard kill {kill.rule_id} ({kill.name})[/red]: {kill.reason}"
+                f"  [dim]{kill.actual} vs {kill.threshold}[/dim]"
+            )
+        console.print("[dim]Review spend skipped — killed before enrichment.[/dim]")
+
+    # Verdict line — echoes scoring.py exactly; never upgraded here.
+    suff = "insufficient data" if scored.insufficient_data else "sufficient"
+    console.print(
+        f"\n[bold]Verdict: {scored.verdict.value.upper()}[/bold]  ·  "
+        f"opportunity score {scored.score:.0f}/100  ·  "
+        f"{scored.confidence.level.value} confidence  ·  {suff}"
+    )
+
+    console.print("\n[bold]Pillars[/bold] (raw → capped × weight = contribution):")
+    for p in scored.pillars:
+        if not p.available:
+            console.print(f"  {p.pillar:<15} [yellow]absent[/yellow]  ({p.cap_reason})")
+            continue
+        raw = "—" if p.raw_score is None else f"{p.raw_score:.0f}"
+        capped = "—" if p.capped_score is None else f"{p.capped_score:.0f}"
+        flag = " [yellow](partial)[/yellow]" if p.partial else ""
+        console.print(
+            f"  {p.pillar:<15} {raw:>3} → {capped:>3}  × {p.weight:.0f} = "
+            f"{p.weighted_contribution:5.1f}  ·  {p.confidence.value} conf{flag}"
+        )
+
+    triggered = [k for k in scored.kills if k.kills]
+    demoted = [k for k in scored.kills if k.assessed and k.triggered and k.demoted]
+    unassessed = sum(1 for k in scored.kills if not k.assessed)
+    console.print(
+        f"\n[bold]Hard kills[/bold]: {len(triggered)} triggered, "
+        f"{len(demoted)} borderline (→Test), {unassessed} unassessed"
+    )
+    for k in triggered:
+        console.print(f"  [red]{k.rule_id}[/red] {k.name}: {k.actual} vs {k.threshold}")
+
+    console.print("[bold]Gates[/bold]:")
+    for g in scored.gates:
+        if g.passed is None:
+            console.print(f"  {g.gate_id} {g.name}: [yellow]pending[/yellow] ({g.actual})")
+        else:
+            mark = "[green]pass[/green]" if g.passed else "[red]fail[/red]"
+            kind = "hard" if g.hard else "soft"
+            console.print(f"  {g.gate_id} {g.name} ({kind}): {mark}  [dim]{g.actual}[/dim]")
+
+    if report.review_evidence is not None:
+        re_ = report.review_evidence
+        console.print(
+            f"\n[bold]Review evidence[/bold]: sample {re_.sample_size}, "
+            f"{re_.themes_available} persisted theme(s)  ·  "
+            "[yellow]Review Miner (LLM) pending[/yellow]"
+        )
+    console.print(
+        f"[dim]G5 Strategist: pending (not run). Data cost this run: "
+        f"${report.data_cost_usd:.4f}.[/dim]"
+    )
+    if scored.verdict.value == "buy":
+        console.print(
+            "[dim]BUY is deterministic and provisional — confirm with the Strategist (G5).[/dim]"
+        )
+
+
+def _product_title(asin: str, marketplace: str) -> str | None:
+    with get_connection() as conn:
+        row = repository.get_product(conn, asin, marketplace)
+    return row["title"] if row is not None else None
 
 
 @app.command()

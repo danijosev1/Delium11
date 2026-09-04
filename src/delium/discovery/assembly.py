@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 
@@ -24,12 +25,15 @@ from delium.analysis.competition import analyze_competition
 from delium.analysis.demand import analyze_demand, load_velocity_curves
 from delium.analysis.fees import load_fee_table
 from delium.analysis.models import (
+    ASSUMPTION_FIELDS,
     AsinHistory,
     BsrPoint,
     CompetitionInput,
     CompetitionReport,
     CompetitorSnapshot,
     DemandReport,
+    DifferentiationReport,
+    Dimensions,
     KeywordDatum,
     Marketplace,
     PricePoint,
@@ -61,6 +65,20 @@ class AssemblyProvenance:
         if not fetch_id:
             return self
         return AssemblyProvenance(self.entries + ((label, fetch_id),))
+
+
+@dataclass(frozen=True)
+class ProfitOverrides:
+    """User-supplied profit inputs (validate-tier CLI --cogs/--freight/--dims/
+    --weight). Each is optional; when present it replaces the config assumption
+    and, for cost/freight, is marked *known* (dropped from `estimated_fields`)
+    so the profit engine's confidence reflects a real quote instead of a guess.
+    Dims/weight overrides unblock the fee model when Keepa lacks them."""
+
+    cogs_cents: int | None = None
+    freight_cents: int | None = None
+    dims: Dimensions | None = None
+    weight_g: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -135,17 +153,23 @@ def _competitor_asins(
 
 
 def _competitor_snapshot(
-    conn: sqlite3.Connection, row: sqlite3.Row, marketplace: str
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    marketplace: str,
+    listing_quality: Mapping[str, float] | None = None,
 ) -> CompetitorSnapshot:
     asin = row["asin"]
     history = repository.get_price_bsr_history(conn, asin)
+    # Listing quality is computed at validate tier (from observable listing facts)
+    # and supplied here; at discovery tier it is absent (analyst-tier spend).
+    quality = listing_quality.get(asin) if listing_quality else None
     return CompetitorSnapshot(
         asin=asin,
         brand=row["brand"],
         review_count=_latest(history, "review_count"),
         rating=_latest_rating(history),
         price_cents=_latest(history, "price_cents"),
-        listing_quality=None,  # listing engine is analyst-tier; not run at discovery
+        listing_quality=quality,
         review_count_90d_ago=None,
         price_history=_price_history(conn, asin) or None,
     )
@@ -210,10 +234,13 @@ def build_competition(
     conn: sqlite3.Connection,
     marketplace: str,
     competitor_rows: list[sqlite3.Row],
+    listing_quality: Mapping[str, float] | None = None,
 ) -> CompetitionReport | None:
     if not competitor_rows:
         return None
-    snapshots = tuple(_competitor_snapshot(conn, r, marketplace) for r in competitor_rows)
+    snapshots = tuple(
+        _competitor_snapshot(conn, r, marketplace, listing_quality) for r in competitor_rows
+    )
     histories = [h for h in (_asin_history_dates(s) for s in snapshots) if h is not None]
     as_of = max(histories) if histories else _EPOCH
     return analyze_competition(CompetitionInput(competitors=snapshots, as_of=as_of))
@@ -230,38 +257,46 @@ def build_profit(
     price_cents: int | None,
     monthly_units: int | None,
     config: object,
+    overrides: ProfitOverrides | None = None,
 ) -> ScenarioSet | None:
     """Profit under conservative config assumptions (docs/scoring-model §7). Fee
-    inputs (dims/weight/category) are blocking — no fees, no profit pillar."""
-    from delium.analysis.models import Dimensions
+    inputs (dims/weight/category) are blocking — no fees, no profit pillar. A
+    validate-tier `overrides` may supply real COGS/freight (marked known, not
+    estimated) and dims/weight to unblock the fee model when Keepa lacks them."""
     from delium.config.models import DeliumConfig
 
     assert isinstance(config, DeliumConfig)
-    dims_json = row["dims_json"]
-    weight_g = row["weight_g"]
-    if not dims_json or weight_g is None or price_cents is None or price_cents <= 0:
+    ov = overrides or ProfitOverrides()
+    dims = ov.dims or _dims_from_row(row)
+    weight_g = ov.weight_g if ov.weight_g is not None else row["weight_g"]
+    if dims is None or weight_g is None or price_cents is None or price_cents <= 0:
         return None
-    parsed = json.loads(dims_json)
-    keys = ("length_mm", "width_mm", "height_mm")
-    if not all(k in parsed for k in keys):
-        return None
-    dims = Dimensions(*(int(parsed[k]) for k in keys))
 
     a = config.assumptions
-    cogs = round(a.default_cogs_pct * price_cents)
+    # Overridden fields are real quotes → drop them from the estimated set so the
+    # profit engine's confidence isn't held down by an assumption we replaced.
+    estimated = set(ASSUMPTION_FIELDS)
+    if ov.cogs_cents is not None:
+        cogs = ov.cogs_cents
+        estimated.discard("product_cost")
+    else:
+        cogs = round(a.default_cogs_pct * price_cents)
+    if ov.freight_cents is not None:
+        freight = ov.freight_cents
+        estimated.discard("freight")
+    else:
+        freight = round(a.freight_per_unit * 100)
+
     base = ProfitInputs(
         selling_price_cents=price_cents,
         product_cost_cents=cogs,
-        freight_cents=round(a.freight_per_unit * 100),
+        freight_cents=freight,
         customs_cents=round(a.duty_pct * cogs),
         prep_cost_cents=0,  # fee table supplies the default prep charge
         ppc_percent=a.tacos_pct,
         return_rate=a.return_rate_default,
         monthly_sales_units=monthly_units or 0,
-        # Everything is an assumption at discovery tier → confidence never HIGH.
-        estimated_fields=frozenset(
-            {"product_cost", "freight", "customs", "prep", "ppc", "return_rate"}
-        ),
+        estimated_fields=frozenset(estimated),
     )
     return compute_scenarios(
         load_fee_table(),
@@ -270,6 +305,17 @@ def build_profit(
         weight_g=int(weight_g),
         base_inputs=base,
     )
+
+
+def _dims_from_row(row: sqlite3.Row) -> Dimensions | None:
+    dims_json = row["dims_json"]
+    if not dims_json:
+        return None
+    parsed = json.loads(dims_json)
+    keys = ("length_mm", "width_mm", "height_mm")
+    if not all(k in parsed for k in keys):
+        return None
+    return Dimensions(*(int(parsed[k]) for k in keys))
 
 
 def build_risk(
@@ -333,6 +379,9 @@ def build_scoring_input(
     config: object,
     *,
     cheap_only: bool = False,
+    differentiation: DifferentiationReport | None = None,
+    listing_quality: Mapping[str, float] | None = None,
+    profit_overrides: ProfitOverrides | None = None,
 ) -> tuple[ScoringInput | None, AssemblyProvenance]:
     """Assemble a `ScoringInput` for one candidate from persisted data.
 
@@ -340,6 +389,13 @@ def build_scoring_input(
     (price, oversized, avoid list, fad) — so the kill-first funnel can eliminate
     candidates before any pillar analysis. Returns (None, provenance) if the
     product was never fetched in this marketplace.
+
+    Validate-tier callers additionally supply the real review-evidence
+    `differentiation` report, per-competitor `listing_quality` (0-100), and
+    profit `overrides`. Discovery passes none of these, so its behavior is
+    unchanged — differentiation stays absent, listing quality stays unknown.
+    This module never computes a pillar itself; it only assembles the inputs the
+    analysis engines consume.
     """
     from delium.config.models import DeliumConfig
 
@@ -396,11 +452,12 @@ def build_scoring_input(
             prov,
         )
 
-    # Full pillar assembly (differentiation stays None — validate-tier reviews).
+    # Full pillar assembly. `differentiation` is supplied by validate-tier
+    # callers (real review evidence) and stays None at discovery tier.
     demand = build_demand(conn, asin, marketplace.value, row["category_path"], competitor_asins)
-    competition = build_competition(conn, marketplace.value, competitor_rows)
+    competition = build_competition(conn, marketplace.value, competitor_rows, listing_quality)
     monthly_units = _candidate_units(demand, asin)
-    profit = build_profit(row, price_cents, monthly_units, config)
+    profit = build_profit(row, price_cents, monthly_units, config, profit_overrides)
     risk = build_risk(row, demand, competition, oversized)
 
     for r in competitor_rows:
@@ -410,7 +467,7 @@ def build_scoring_input(
         ScoringInput(
             demand=demand,
             competition=competition,
-            differentiation=None,
+            differentiation=differentiation,
             profit=profit,
             risk=risk,
             market_median_price_cents=market_median_price,
