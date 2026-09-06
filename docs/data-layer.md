@@ -124,6 +124,12 @@ review_themes      id PK, run_id FK, asin, kind ('complaint'|'praise'|
                    severity (1-3), quote_review_ids (json)   -- ≥3 or theme discarded
                    -- Review Miner OUTPUT stored as data: citations resolve to
                    -- real review rows; themes are queryable across markets over time
+competitor_features id PK, run_id FK, asin FK, feature, created_at  -- migration 0005
+                   -- Analyst OUTPUT: the CLAIMED (observable) features per COMPETITOR
+                   -- listing, each verified to appear in that listing's own text before
+                   -- persistence. Consumed by differentiation.py (F2/F4b) to decide
+                   -- competitor absence conservatively — no further LLM call. Target
+                   -- features are not persisted (report-only). INDEX (asin), (run_id)
 ```
 
 Cache freshness is determined by querying `raw_fetches` for the newest row per `request_key` — no separate TTL bookkeeping table. `runs` / `candidates` / `validations` tables are unchanged from ARCHITECTURE.md §9.

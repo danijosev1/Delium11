@@ -14,7 +14,7 @@ import json
 
 from delium.agents.llm import LlmClient, Tier
 from delium.agents.runner import AgentResult, run_structured
-from delium.agents.schemas import MinerReport, StrategistVerdict
+from delium.agents.schemas import AnalystReport, MinerReport, StrategistVerdict
 from delium.analysis.models import (
     ScoredOpportunity,
     ScoringInput,
@@ -136,6 +136,26 @@ def _differentiation_brief(inp: ScoringInput) -> dict[str, object] | None:
     }
 
 
+def _analyst_brief(analyst_report: AnalystReport | None) -> dict[str, object] | None:
+    """Compact, INTERPRETIVE Analyst context — market read + observed feature
+    matrix. The confirmed feature gaps that actually move the score are in
+    `differentiation_recomputed`; this is the competitive narrative only, never a
+    number the Strategist may restate."""
+    if analyst_report is None:
+        return None
+    return {
+        "market_structure": analyst_report.market_structure.type,
+        "attractiveness": analyst_report.attractiveness.rating,
+        "openings": [o.description for o in analyst_report.openings],
+        "concerns": [c.description for c in analyst_report.concerns],
+        "feature_matrix": [
+            {"asin": e.asin, "claimed_features": list(e.claimed_features)}
+            for e in analyst_report.feature_matrix
+        ],
+        "data_gaps_acknowledged": list(analyst_report.data_gaps_acknowledged),
+    }
+
+
 def build_strategist_context(
     scored: ScoredOpportunity,
     inp: ScoringInput,
@@ -143,16 +163,19 @@ def build_strategist_context(
     config: DeliumConfig,
     *,
     cross_market: list[dict[str, object]] | None = None,
+    analyst_report: AnalystReport | None = None,
 ) -> str:
     """Assemble the Strategist prompt from typed deterministic objects + the
-    validated Miner evidence. The Miner numbers are advisory; the differentiation
-    block carries the CORRECTED frequencies the engine recomputed."""
+    validated Miner/Analyst evidence. The agent numbers are advisory; the
+    differentiation block carries the CORRECTED frequencies (and Analyst-confirmed
+    feature gaps) the engine recomputed."""
     context: dict[str, object] = {
         "scored": _scored_brief(scored),
         "profit": _profit_brief(inp),
         "risk_ledger": _risk_brief(inp),
         "differentiation_recomputed": _differentiation_brief(inp),
         "miner_report": None if miner_report is None else miner_report.model_dump(),
+        "analyst_report": _analyst_brief(analyst_report),
         "preferences": {
             "min_price": config.preferences.min_price,
             "max_price": config.preferences.max_price,
@@ -182,9 +205,17 @@ def run_strategist(
     miner_report: MinerReport | None,
     config: DeliumConfig,
     cross_market: list[dict[str, object]] | None = None,
+    analyst_report: AnalystReport | None = None,
 ) -> AgentResult[StrategistVerdict]:
     """Run the frontier-tier Strategist and return its validated verdict."""
-    user = build_strategist_context(scored, inp, miner_report, config, cross_market=cross_market)
+    user = build_strategist_context(
+        scored,
+        inp,
+        miner_report,
+        config,
+        cross_market=cross_market,
+        analyst_report=analyst_report,
+    )
     return run_structured(
         client,
         tier=Tier.FRONTIER,

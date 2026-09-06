@@ -38,7 +38,7 @@ def _seed(conn, *, price=2200, reviews=180) -> str:  # type: ignore[no-untyped-d
     return rid
 
 
-def _routing_llm(*, miner=None, strategist=None):  # type: ignore[no-untyped-def]
+def _routing_llm(*, miner=None, strategist=None, analyst=None):  # type: ignore[no-untyped-def]
     ids = [f"{TGT}-R{i}" for i in range(8)]
     miner = (
         miner
@@ -50,7 +50,7 @@ def _routing_llm(*, miner=None, strategist=None):  # type: ignore[no-untyped-def
     strategist = (
         strategist if strategist is not None else json_body(fake.strategist_payload(verdict="buy"))
     )
-    transport = RoutingLlmTransport(miner=miner, strategist=strategist)
+    transport = RoutingLlmTransport(miner=miner, strategist=strategist, analyst=analyst)
     return build_llm(transport, CFG.agents), transport
 
 
@@ -74,10 +74,11 @@ def test_full_validation_runs_and_persists_agents(initialized_db: Path) -> None:
     assert report.review_evidence.miner_pending is False  # Miner ran
     assert report.miner_report is not None
     assert report.strategist_verdict is not None and report.strategist_verdict.verdict == "buy"
-    assert {r.agent for r in report.agent_runs} == {"review_miner", "strategist"}
+    assert report.analyst_report is not None
+    assert {r.agent for r in report.agent_runs} == {"review_miner", "analyst", "strategist"}
     assert report.llm_cost_usd > 0
     with get_connection() as conn:
-        assert len(repository.get_agent_runs(conn, TGT, "US")) == 2
+        assert len(repository.get_agent_runs(conn, TGT, "US")) == 3
         assert repository.get_review_themes(conn, TGT)  # evidence persisted
         assert repository.get_feature_requests(conn, TGT)
         assert repository.get_bundle_signals(conn, TGT)
@@ -121,6 +122,37 @@ def test_malformed_miner_output_creates_no_evidence(initialized_db: Path) -> Non
     assert report.scored.verdict is not Verdict.BUY
     with get_connection() as conn:
         assert repository.get_review_themes(conn, TGT) == []
+
+
+def test_analyst_failure_leaves_competitor_gaps_unknown(initialized_db: Path) -> None:
+    from agents_support import http
+
+    with get_connection() as conn:
+        _seed(conn)
+    llm, _ = _routing_llm(analyst=http(500))  # analyst provider error
+    report = _validate(Clients(llm=llm))
+    assert report.status is ValidationStatus.SCORED  # deterministic result stands
+    analyst_run = next(r for r in report.agent_runs if r.agent == "analyst")
+    assert analyst_run.status == "failed"
+    # No matrix → no confirmed absence; every requested feature stays UNKNOWN.
+    assert report.review_evidence.competitor_matrix_confirmed is False
+    assert all(g.status == "unknown" for g in report.review_evidence.feature_gaps)
+    with get_connection() as conn:
+        for a in (C1, C2, C3):
+            assert repository.get_competitor_features(conn, a) == []  # nothing fabricated
+
+
+def test_analyst_empty_matrix_never_manufactures_absence(initialized_db: Path) -> None:
+    with get_connection() as conn:
+        _seed(conn)
+    # The default Analyst response runs OK but claims NO competitor features.
+    # "Not mentioned" must never become "absent" — requested features stay UNKNOWN.
+    llm, _ = _routing_llm()
+    report = _validate(Clients(llm=llm))
+    assert report.status is ValidationStatus.SCORED
+    assert report.analyst_report is not None
+    assert report.review_evidence.competitor_matrix_confirmed is False
+    assert all(g.status == "unknown" for g in report.review_evidence.feature_gaps)
 
 
 def test_strategist_failure_is_unavailable_and_preserves_result(initialized_db: Path) -> None:

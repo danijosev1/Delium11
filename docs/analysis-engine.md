@@ -46,6 +46,8 @@ Conventions used by all modules:
 
 **Missing data:** absent price history → C6 = 50 neutral + note; missing listing rubric (Analyst step failed) → C5 = 50 neutral + note + pillar confidence low. Fewer than 10 resolvable competitors → compute over what exists, note "top-N only," confidence per sufficiency table.
 
+**Implementation note (C5 / Analyst rubric).** As built, `listing_quality` (C5) is computed **deterministically** from the observable listing facts we actually persist (title, `images_count`, review count, rating, price vs. competitors, keyword coverage) via `analysis/listing.py` — it is *not* wired to the Analyst's `listing_rubric`. Most rubric fields (video, A+, structured bullets, review-responding brand) are not persisted from the listing, so feeding LLM guesses into a scored pillar would violate the "observable, spot-checkable" rule. The Analyst `listing_rubric` is therefore produced for the **report only** (advisory competitive context); the only Analyst output that reaches a scored pillar is the `feature_matrix` (via F2/F4b below). This keeps the LLM out of competition scoring entirely.
+
 ---
 
 ## 3. `differentiation.py` — Differentiation Analysis
@@ -63,6 +65,12 @@ The module is deterministic math **over** LLM-extracted structure — the LLM fo
 | `sample_bias_note` | `sample_rating_avg − listing_rating_avg`; if > +0.4 stars, complaints are likely *under*-represented → note appended and F1 gets a `+5 latent-complaint adjustment` (bounded, documented) |
 
 **Confidence:** high ≥150 reviews & bias delta <0.4; medium 30–149; low <30 (pillar capped 50 by scoring). Zero reviews → all outputs null, pillar `missing`, verdict cap Test (data-layer §1.3).
+
+**Implementation note (F2 / F4b — Analyst feature matrix).** The "absent from all top-10 feature matrices" input to F2, and the "no top-10 bundles it" input to F4b, are derived in `validation/evidence.py` from the persisted `competitor_features` rows (the Analyst's claimed-feature matrix), **conservatively and coverage-gated**:
+- A requested feature is marked `absent_from_competitors = True` **only** when at least `agents.min_competitor_feature_coverage` competitors were analyzed (have persisted features) *and* none of them claim the feature (generous fuzzy present-matching against each competitor's claimed features + observable listing text). If the coverage gate is not met, or any competitor plausibly claims it, the flag stays `False`/`None` — **"not mentioned" is never treated as "absent."** F2 additionally requires the feature to carry ≥ `min_quotes` verified review citations before it counts.
+- `competitors_bundle_complement` is `False` (an opening → F4b awards) only when the coverage gate is met and no analyzed competitor offers the customer-requested complement; `True` when at least one does; `None` (no award) otherwise.
+
+The persisted matrix holds **competitor** claimed features only; each was verified (fuzzy ≥ `agents.feature_match_threshold`) to appear in that listing's own observable text by the agent runner before persistence, so the derivation is reproducible from the DB with no further LLM call.
 
 ---
 

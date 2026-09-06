@@ -38,8 +38,15 @@ from delium.analysis.models import (
     RawTheme,
     ThemeKind,
 )
+from delium.config.models import DeliumConfig
 from delium.database import repository
-from delium.validation.models import ReviewEvidence
+from delium.utils.text import feature_present
+from delium.validation.models import FeatureGap, ReviewEvidence
+
+# Present-matching a customer-requested feature against a competitor's listing is
+# deliberately generous (lower than the Analyst's 0.85 extraction guard): a
+# plausible match must read as PRESENT so we never manufacture a competitor gap.
+_PRESENT_MATCH_THRESHOLD = 0.6
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +152,73 @@ def _latest_rating(conn: sqlite3.Connection, asin: str) -> float | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Analyst feature matrix → confirmed competitor absence (differentiation F2/F4b)
+# ---------------------------------------------------------------------------
+def _competitor_haystacks(
+    conn: sqlite3.Connection, competitor_asins: list[str], marketplace: str | None
+) -> dict[str, str]:
+    """Per-competitor present-match text: the features the Analyst persisted for
+    that listing PLUS its observable listing text (title/brand/category). Only
+    competitors with ≥1 persisted feature are included — an ASIN with no persisted
+    features was not analyzed (or yielded nothing observable), so it can neither
+    confirm nor deny a gap and must not count toward coverage."""
+    haystacks: dict[str, str] = {}
+    for asin in competitor_asins:
+        features = [row["feature"] for row in repository.get_competitor_features(conn, asin)]
+        if not features:
+            continue
+        product = repository.get_product(conn, asin, marketplace)
+        listing_bits = (
+            [product["title"] or "", product["brand"] or "", product["category_path"] or ""]
+            if product is not None
+            else []
+        )
+        haystacks[asin] = " ".join([*features, *listing_bits])
+    return haystacks
+
+
+def _present_in_any(term: str, haystacks: dict[str, str]) -> bool:
+    return any(feature_present(term, text, _PRESENT_MATCH_THRESHOLD) for text in haystacks.values())
+
+
+def _derive_absence(
+    features: tuple[FeatureRequest, ...], haystacks: dict[str, str]
+) -> tuple[FeatureRequest, ...]:
+    """Set `absent_from_competitors` per requested feature from the analyzed
+    competitor set: True only when NO analyzed competitor claims it (a confirmed
+    gap), False when at least one does. Caller guarantees the coverage gate is met;
+    a feature never becomes 'absent' on thin evidence."""
+    return tuple(
+        FeatureRequest(
+            feature=f.feature,
+            supporting_review_ids=f.supporting_review_ids,
+            absent_from_competitors=not _present_in_any(f.feature, haystacks),
+        )
+        for f in features
+    )
+
+
+def _derive_bundle_complement(
+    bundle_signals: tuple[BundleSignal, ...], haystacks: dict[str, str]
+) -> bool | None:
+    """F4b input. True when at least one analyzed competitor already offers a
+    customer-requested complement (no opening); False when none do (a real
+    opening); None when there is nothing to judge. Caller guarantees the coverage
+    gate is met — the engine only rewards a confirmed False."""
+    if not bundle_signals:
+        return None
+    return any(_present_in_any(b.complement, haystacks) for b in bundle_signals)
+
+
 def build_differentiation(
-    conn: sqlite3.Connection, asin: str, config: object, *, miner_ran: bool = False
+    conn: sqlite3.Connection,
+    asin: str,
+    config: DeliumConfig,
+    *,
+    miner_ran: bool = False,
+    competitor_asins: list[str] | None = None,
+    marketplace: str | None = None,
 ) -> tuple[DifferentiationReport | None, ReviewEvidence | None]:
     """Assemble the differentiation input from persisted reviews + Review Miner
     evidence (themes, feature requests, bundle signals) and run the engine.
@@ -155,11 +227,15 @@ def build_differentiation(
 
     `miner_ran` records whether the LLM Review Miner produced this run's evidence,
     so the report can show its status; the deterministic engine is unaffected.
-    `config` is accepted for symmetry with the other assemblers (the engine uses
-    its own `DifferentiationConfig` defaults); it is intentionally unused here."""
+
+    When `competitor_asins` are given and the Analyst has persisted a feature
+    matrix for enough of them (`agents.min_competitor_feature_coverage`), each
+    requested feature's `absent_from_competitors` and the
+    `competitors_bundle_complement` flag are DERIVED from that matrix — otherwise
+    both stay UNKNOWN (None), never assumed. The engine owns every threshold; this
+    only supplies confirmed-or-unknown observations."""
     from delium.analysis.models import DifferentiationInput
 
-    del config  # differentiation engine owns its thresholds
     reviews = _diff_reviews(conn, asin)
     if not reviews:
         return None, None
@@ -168,15 +244,23 @@ def build_differentiation(
     feature_requests = _feature_requests(conn, asin)
     bundle_signals = _bundle_signals(conn, asin)
     listing_rating = _latest_rating(conn, asin)
+
+    # Confirmed competitor absence is derived from the Analyst matrix, coverage-
+    # gated so it is only asserted on a sufficient sample; otherwise left unknown.
+    competitors_bundle_complement: bool | None = None
+    haystacks = _competitor_haystacks(conn, competitor_asins or [], marketplace)
+    matrix_confirmed = len(haystacks) >= config.agents.min_competitor_feature_coverage
+    if matrix_confirmed:
+        feature_requests = _derive_absence(feature_requests, haystacks)
+        competitors_bundle_complement = _derive_bundle_complement(bundle_signals, haystacks)
+
     data = DifferentiationInput(
         target_asin=asin,
         reviews=reviews,
         themes=themes,
         feature_requests=feature_requests,
         bundle_signals=bundle_signals,
-        # Confirmed absence of a complement across the top-10 is an Analyst
-        # observation (not built here) — left unknown, never assumed.
-        competitors_bundle_complement=None,
+        competitors_bundle_complement=competitors_bundle_complement,
         listing_rating_avg=listing_rating,
     )
     report = analyze_differentiation(data)
@@ -188,8 +272,24 @@ def build_differentiation(
         bundle_signals=len(bundle_signals),
         listing_rating_avg=listing_rating,
         miner_pending=not miner_ran,
+        feature_gaps=_feature_gaps(feature_requests),
+        competitor_matrix_confirmed=matrix_confirmed,
     )
     return report, evidence
+
+
+def _feature_gaps(features: tuple[FeatureRequest, ...]) -> tuple[FeatureGap, ...]:
+    """Classify each requested feature by its competitor-absence status for the
+    report's feature-gap table — the same tri-state the engine consumed."""
+    status = {True: "absent", False: "present", None: "unknown"}
+    return tuple(
+        FeatureGap(
+            feature=f.feature,
+            status=status[f.absent_from_competitors],
+            request_count=len(f.supporting_review_ids),
+        )
+        for f in features
+    )
 
 
 # ---------------------------------------------------------------------------

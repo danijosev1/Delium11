@@ -273,7 +273,11 @@ class AgentsConfig(StrictModel):
 
     enabled: bool = True  # master switch; False → agents never run (deterministic-only)
     review_miner_enabled: bool = True
+    analyst_enabled: bool = True
     strategist_enabled: bool = True
+    # Analyst → differentiation integration (evidence-based competitor gaps).
+    feature_match_threshold: float = Field(0.85, ge=0, le=1)  # fuzzy claim resolution (§2 guard)
+    min_competitor_feature_coverage: int = Field(3, ge=1)  # competitors analyzed before ABSENT
     fast_model: str = "claude-haiku-4-5"  # Scout / Analyst / Review Miner
     frontier_model: str = "claude-sonnet-5"  # Strategist only
     max_output_tokens_fast: int = Field(4096, gt=0)

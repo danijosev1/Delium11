@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from delium.agents.schemas import MinerReport, StrategistVerdict
+from delium.agents.schemas import AnalystReport, MinerReport, StrategistVerdict
 from delium.analysis.models import DifferentiationReport, Marketplace, ScoredOpportunity
 from delium.discovery.assembly import AssemblyProvenance
 from delium.discovery.models import DiscoveryEvidence
@@ -51,6 +51,19 @@ class ValidationRequest:
 
 
 @dataclass(frozen=True)
+class FeatureGap:
+    """One customer-requested feature classified against the Analyst competitor
+    matrix (differentiation F2). `status` is exactly the competitor-absence
+    dimension the engine used: 'absent' = confirmed missing from the analyzed
+    top-10 (a real gap), 'present' = at least one competitor claims it, 'unknown'
+    = the Analyst matrix could not confirm either way (never assumed)."""
+
+    feature: str
+    status: str  # 'present' | 'absent' | 'unknown'
+    request_count: int  # supporting review requests (evidence weight)
+
+
+@dataclass(frozen=True)
 class ReviewEvidence:
     """What the review layer supplied to the differentiation engine. The real
     review *sample* (the differentiation denominator) is always assembled from
@@ -65,6 +78,12 @@ class ReviewEvidence:
     feature_requests: int = 0  # persisted feature_requests fed to F2
     bundle_signals: int = 0  # persisted bundle_signals fed to F4
     miner_pending: bool = True
+    # Per-feature competitor-absence status from the Analyst matrix (Present/
+    # Absent/Unknown) — the report's feature-gap table; empty when no requests.
+    feature_gaps: tuple[FeatureGap, ...] = ()
+    # Was the Analyst competitor feature matrix confirmed (coverage gate met)?
+    # False → every gap stays 'unknown', never assumed absent.
+    competitor_matrix_confirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -73,7 +92,7 @@ class AgentRunInfo:
     the persisted `agent_runs` row. Carries no evidence itself; the validated
     output lives in the typed report objects and the DB."""
 
-    agent: str  # 'review_miner' | 'strategist'
+    agent: str  # 'review_miner' | 'analyst' | 'strategist'
     status: str  # 'ok' | 'degraded' | 'failed'
     model: str | None = None
     provider: str | None = None
@@ -123,6 +142,7 @@ class ValidationReport:
     discovery_evidence: tuple[DiscoveryEvidence, ...] = ()  # provenance incl. cross-market signal
     # Agent layer (validated outputs only; never freeform model text):
     miner_report: MinerReport | None = None
+    analyst_report: AnalystReport | None = None  # competitive read incl. feature matrix
     strategist_verdict: StrategistVerdict | None = None
     differentiation: DifferentiationReport | None = None  # recomputed themes for the report
     agent_runs: tuple[AgentRunInfo, ...] = ()

@@ -95,7 +95,9 @@ data_gaps_acknowledged[]                                  # must echo data_quali
 
 **Failure handling:** retry once; on final failure, `validate` continues — C5/F2 fall back to neutral-50 per analysis-engine missing-data rules, Strategist is told "Analyst unavailable," verdict caps at Test (a Buy needs the full chain).
 
-**Guards:** rubric/matrix fields are counts/booleans (hard to hallucinate persuasively, easy to spot-check); feature claims must appear as substrings (fuzzy ≥0.85) in provided listing text or the item is dropped; openings/concerns pass evidence resolution.
+**Guards:** rubric/matrix fields are counts/booleans (hard to hallucinate persuasively, easy to spot-check); feature claims must appear as substrings (fuzzy ≥`agents.feature_match_threshold`, default 0.85) in the provided listing text or the item is dropped by the runner's evidence check; a `feature_matrix` entry for an ASIN not in the provided set is discarded entirely; unknown-ASIN `who_wins`/`listing_rubric` entries are pruned. If more than `evidence_drop_threshold` of the claimed features are unresolvable the run retries once, then fails.
+
+**Persistence & consumption (as built):** only the **competitor** claimed features are written, to `competitor_features` (migration 0005; target features stay in the in-memory report for the report table). `differentiation.py` consumes the matrix via `validation/evidence.py`, which derives `absent_from_competitors` (F2) and `competitors_bundle_complement` (F4b) **conservatively and coverage-gated** — a feature is "absent" only when ≥`agents.min_competitor_feature_coverage` competitors were analyzed and none claim it (generous present-matching), never from silence. C5 stays **deterministic** (`analysis/listing.py`); the Analyst `listing_rubric` is report-only, because most rubric fields are not persisted from the listing and must not seed a scored pillar with LLM guesses (see analysis-engine §2 implementation note). On Analyst failure the derivation simply leaves every gap UNKNOWN.
 
 ---
 

@@ -8,6 +8,11 @@ Buy/Test/Avoid verdict (scoring.py owns that; the Strategist only supplies the G
 concurrence, which can only block a would-be Buy).
 """
 
+from delium.agents.analyst import (
+    AnalystRun,
+    persist_analyst_output,
+    run_analyst,
+)
 from delium.agents.llm import (
     LlmAuthError,
     LlmClient,
@@ -24,7 +29,7 @@ from delium.agents.miner import (
     run_review_miner,
 )
 from delium.agents.runner import AgentResult, run_structured
-from delium.agents.schemas import MinerReport, StrategistVerdict
+from delium.agents.schemas import AnalystReport, MinerReport, StrategistVerdict
 from delium.agents.strategist import (
     derive_concurrence,
     run_strategist,
@@ -32,6 +37,8 @@ from delium.agents.strategist import (
 
 __all__ = [
     "AgentResult",
+    "AnalystReport",
+    "AnalystRun",
     "LlmAuthError",
     "LlmClient",
     "LlmError",
@@ -44,7 +51,9 @@ __all__ = [
     "Tier",
     "build_llm_client",
     "derive_concurrence",
+    "persist_analyst_output",
     "persist_miner_output",
+    "run_analyst",
     "run_review_miner",
     "run_strategist",
     "run_structured",

@@ -69,6 +69,78 @@ class MinerReport(_Model):
 
 
 # ---------------------------------------------------------------------------
+# Analyst (agent-layer §2)
+# ---------------------------------------------------------------------------
+class MarketStructure(_Model):
+    type: Literal["consolidated", "fragmented", "duopoly", "open"]
+    narrative: str = ""
+    evidence: list[str] = Field(default_factory=list)
+
+
+class WhoWins(_Model):
+    asin: str
+    advantage: str
+    vulnerable_because: str | None = None
+    evidence: list[str] = Field(default_factory=list)
+
+
+class PriceBand(_Model):
+    range_ref: str
+    positioning_note: str = ""
+
+
+class ListingRubric(_Model):
+    """Observable listing facts, counts/booleans only (agent-layer §2 → C5).
+    Fields not observable from the provided listing text stay null (never guessed)."""
+
+    asin: str
+    images_count: int | None = None
+    video: bool | None = None
+    aplus: bool | None = None
+    title_kw_coverage: int | None = Field(default=None, ge=0, le=3)
+    bullets_structured: bool | None = None
+    brand_responds: bool | None = None
+
+
+class FeatureMatrixEntry(_Model):
+    """Which features a listing *claims* (agent-layer §2 → differentiation F2). A
+    feature is only 'claimed' if it appears in the provided listing text — the
+    runner drops any that don't resolve. Absence of a claim is not proof of
+    product absence; the deterministic engine treats it conservatively."""
+
+    asin: str
+    claimed_features: list[str] = Field(default_factory=list)
+
+
+class Opening(_Model):
+    description: str
+    which_metric_supports: str | None = None
+    evidence: list[str] = Field(default_factory=list)
+
+
+class Concern(_Model):
+    description: str
+    evidence: list[str] = Field(default_factory=list)
+
+
+class Attractiveness(_Model):
+    rating: Literal["strong", "moderate", "weak"]
+    one_line: str = ""
+
+
+class AnalystReport(_Model):
+    market_structure: MarketStructure
+    who_wins_and_why: list[WhoWins] = Field(default_factory=list, max_length=3)
+    price_bands: list[PriceBand] = Field(default_factory=list, max_length=6)
+    listing_rubric: list[ListingRubric] = Field(default_factory=list, max_length=20)
+    feature_matrix: list[FeatureMatrixEntry] = Field(default_factory=list, max_length=20)
+    openings: list[Opening] = Field(default_factory=list, max_length=4)
+    concerns: list[Concern] = Field(default_factory=list, max_length=4)
+    attractiveness: Attractiveness
+    data_gaps_acknowledged: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # Strategist (agent-layer §4)
 # ---------------------------------------------------------------------------
 class RationalePoint(_Model):

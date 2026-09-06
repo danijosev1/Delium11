@@ -30,9 +30,10 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel
 
+from delium.agents.analyst import persist_analyst_output, run_analyst
 from delium.agents.miner import persist_miner_output, run_review_miner
 from delium.agents.runner import AgentResult
-from delium.agents.schemas import MinerReport, StrategistVerdict
+from delium.agents.schemas import AnalystReport, MinerReport, StrategistVerdict
 from delium.agents.strategist import derive_concurrence, run_strategist
 from delium.analysis.models import (
     DifferentiationReport,
@@ -67,6 +68,7 @@ from delium.validation.models import (
 log = get_logger(__name__)
 
 _REVIEW_COMPETITORS = 3  # target + top-3 competitors (~400 reviews; data-layer §3.1)
+_ANALYST_COMPETITORS = 10  # feature matrix over the top-10 organic (analysis-engine §F2)
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,7 @@ class _AgentsOutcome:
     scoring.py still owns the verdict; `concurrence` is only the G5 gate input."""
 
     miner_report: MinerReport | None = None
+    analyst_report: AnalystReport | None = None
     strategist_verdict: StrategistVerdict | None = None
     concurrence: StrategistConcurrence = StrategistConcurrence.PENDING
     runs: tuple[AgentRunInfo, ...] = ()
@@ -125,6 +128,7 @@ def run_validation(
             from_candidate=from_candidate,
             discovery_evidence=discovery_evidence,
             miner_report=agents.miner_report,
+            analyst_report=agents.analyst_report,
             strategist_verdict=agents.strategist_verdict,
             differentiation=differentiation,
             agent_runs=agents.runs,
@@ -235,9 +239,24 @@ def run_validation(
     # 6. Review Miner (LLM) — persists structured evidence the engine recomputes.
     agents = _run_miner(conn, request, config, clients, asin, competitor_review_asins, notes)
 
+    # 6b. Analyst (LLM) — persists the competitor feature matrix (top-10 listings)
+    #     the differentiation engine reads to confirm F2 gaps / F4 bundle openings.
+    analyst_competitor_asins = _top_competitors(
+        conn, asin, resolution.seed, mp, _ANALYST_COMPETITORS
+    )
+    agents = _run_analyst(
+        conn, request, config, clients, asin, analyst_competitor_asins, agents, notes
+    )
+
     # 7. Differentiation from the real review sample + (Miner-persisted) evidence.
+    #    Competitor absence is derived from the Analyst matrix, coverage-gated.
     differentiation, review_evidence = build_differentiation(
-        conn, asin, config, miner_ran=agents.miner_ran
+        conn,
+        asin,
+        config,
+        miner_ran=agents.miner_ran,
+        competitor_asins=analyst_competitor_asins,
+        marketplace=mp.value,
     )
 
     # 8. Full ScoringInput → scoring.py (provisional, G5 pending).
@@ -358,6 +377,68 @@ def _run_miner(
     )
 
 
+def _run_analyst(
+    conn: sqlite3.Connection,
+    request: ValidationRequest,
+    config: DeliumConfig,
+    clients: Clients,
+    asin: str,
+    competitor_asins: list[str],
+    agents: _AgentsOutcome,
+    notes: list[str],
+) -> _AgentsOutcome:
+    """Run the Analyst when enabled + affordable + there are competitors to read.
+    Persists the competitor feature matrix (replacing stale) and an audit row. On
+    any failure the pipeline continues: `absent_from_competitors` / bundle openings
+    simply stay UNKNOWN (never assumed present or absent), and a missing Analyst
+    never raises confidence or manufactures a competitor deficiency."""
+    ac = config.agents
+    if clients.llm is None or not ac.enabled or not ac.analyst_enabled:
+        return agents
+    if not competitor_asins:
+        return agents  # no competitor listings → matrix stays empty, gaps stay UNKNOWN
+    remaining = config.budgets.max_llm_usd_per_validate - agents.llm_cost_usd
+    if remaining <= 0:
+        notes.append("analyst skipped — LLM budget exhausted; competitor gaps stay unknown")
+        return agents
+
+    analyst_run = run_analyst(
+        conn,
+        clients.llm,
+        target_asin=asin,
+        competitor_asins=competitor_asins,
+        config=ac,
+    )
+    result = analyst_run.result
+    info = _agent_run_info("analyst", result)
+    _persist_agent_run(conn, request, asin, "analyst", result)
+
+    analyst_report: AnalystReport | None = None
+    if result.ok and result.output is not None:
+        persist_analyst_output(
+            conn,
+            run_id=request.run_id,
+            target_asin=asin,
+            competitor_asins=analyst_run.competitor_asins,
+            report=result.output,
+        )
+        analyst_report = result.output
+        if result.status == "degraded":
+            notes.append(f"analyst degraded — {result.dropped}/{result.total} features dropped")
+    else:
+        notes.append(f"analyst unavailable — {result.error}; competitor gaps stay unknown")
+
+    return _AgentsOutcome(
+        miner_report=agents.miner_report,
+        analyst_report=analyst_report,
+        strategist_verdict=agents.strategist_verdict,
+        concurrence=agents.concurrence,
+        runs=(*agents.runs, info),
+        llm_cost_usd=agents.llm_cost_usd + result.cost_usd,
+        miner_ran=agents.miner_ran,
+    )
+
+
 def _run_strategist(
     conn: sqlite3.Connection,
     request: ValidationRequest,
@@ -389,6 +470,7 @@ def _run_strategist(
         miner_report=agents.miner_report,
         config=config,
         cross_market=_cross_market_signals(discovery_evidence),
+        analyst_report=agents.analyst_report,
     )
     info = _agent_run_info("strategist", result)
     _persist_agent_run(conn, request, asin, "strategist", result)
@@ -398,6 +480,7 @@ def _run_strategist(
 
     return _AgentsOutcome(
         miner_report=agents.miner_report,
+        analyst_report=agents.analyst_report,
         strategist_verdict=result.output,
         concurrence=concurrence,
         runs=(*agents.runs, info),
@@ -411,6 +494,7 @@ def _replace_concurrence(
 ) -> _AgentsOutcome:
     return _AgentsOutcome(
         miner_report=agents.miner_report,
+        analyst_report=agents.analyst_report,
         strategist_verdict=agents.strategist_verdict,
         concurrence=concurrence,
         runs=agents.runs,

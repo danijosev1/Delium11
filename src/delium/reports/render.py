@@ -71,6 +71,7 @@ def render_validation(
     _kills_gates_section(_p, scored)
     _customer_pain_section(_p, report, quotes)
     _features_bundles_section(_p, report)
+    _market_analyst_section(_p, report)
     _risks_section(_p, report, scored)
     _strategist_section(_p, report)
     _methodology_section(_p, report)
@@ -195,10 +196,23 @@ def _customer_pain_section(_p, report: ValidationReport, quotes: Quotes) -> None
 
 def _features_bundles_section(_p, report: ValidationReport) -> None:  # type: ignore[no-untyped-def]
     mr = report.miner_report
+    re_ = report.review_evidence
+    gaps = re_.feature_gaps if re_ is not None else ()
     if mr is None or (not mr.missing_features and not mr.bundle_signals):
         return
     _p("## Product opportunities (Review Miner)")
-    if mr.missing_features:
+    if gaps:
+        # Present/Absent/Unknown against the Analyst competitor matrix — a gap is
+        # only 'absent' when confirmed, never inferred from silence.
+        confirmed = re_ is not None and re_.competitor_matrix_confirmed
+        note = "" if confirmed else " (competitor matrix unconfirmed → all Unknown)"
+        _p(f"**Requested features vs. competitors{note}:**")
+        _p("| Feature | Requests | Competitor status |")
+        _p("|---|---|---|")
+        label = {"absent": "Absent (confirmed gap)", "present": "Present", "unknown": "Unknown"}
+        for g in sorted(gaps, key=lambda x: (x.status != "absent", -x.request_count))[:8]:
+            _p(f"| {_flat(g.feature)} | {g.request_count} | {label.get(g.status, 'Unknown')} |")
+    elif mr.missing_features:
         _p("**Requested features (absence not competitor-confirmed):**")
         for f in mr.missing_features[:6]:
             _p(f"- {_flat(f.feature)} ({len(f.requested_in_review_ids)} requests)")
@@ -206,6 +220,40 @@ def _features_bundles_section(_p, report: ValidationReport) -> None:  # type: ig
         _p("**Bundle / packaging opportunities:**")
         for b in mr.bundle_signals[:4]:
             _p(f"- {_flat(b.complement)} ({len(b.mentioned_in_review_ids)} mentions)")
+    _p()
+
+
+def _market_analyst_section(_p, report: ValidationReport) -> None:  # type: ignore[no-untyped-def]
+    """Analyst competitive read — interpretive narrative + the observable
+    competitor feature matrix. Carries no score; the confirmed feature gaps that
+    move the differentiation pillar are shown above and recomputed by the engine."""
+    ar = report.analyst_report
+    if ar is None:
+        return
+    _p("## Market & competition (Analyst — advisory)")
+    _p(
+        f"Market structure: **{ar.market_structure.type}**  ·  attractiveness: "
+        f"**{ar.attractiveness.rating}**."
+    )
+    if ar.attractiveness.one_line:
+        _p(f"- {_flat(ar.attractiveness.one_line)}")
+    for o in ar.openings[:4]:
+        _p(f"- Opening: {_flat(o.description)}")
+    for c in ar.concerns[:4]:
+        _p(f"- Concern: {_flat(c.description)}")
+    matrix = [e for e in ar.feature_matrix if e.claimed_features]
+    if matrix:
+        _p(
+            "\n**Competitor feature matrix** (features CLAIMED in each listing; absence of a "
+            "claim is not proof of product absence):"
+        )
+        _p("| ASIN | Claimed features |")
+        _p("|---|---|")
+        for e in matrix[:10]:
+            feats = ", ".join(_flat(f) for f in e.claimed_features[:8]) or "—"
+            _p(f"| {_flat(e.asin)} | {feats} |")
+    for gap in ar.data_gaps_acknowledged[:3]:
+        _p(f"- Data gap: {_flat(gap)}")
     _p()
 
 

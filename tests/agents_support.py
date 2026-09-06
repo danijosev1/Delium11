@@ -62,19 +62,27 @@ class FakeLlmTransport:
 
 
 class RoutingLlmTransport:
-    """Routes by agent: the Miner prompt contains 'voice-of-customer', the
-    Strategist prompt contains 'private-label Amazon operator'. Each side is an
-    HttpResult or an Exception."""
+    """Routes by agent, keyed on a unique phrase in each system prompt: the Miner
+    says 'voice-of-customer', the Analyst 'competitive market analyst', and the
+    Strategist is the fallback. Each side is an HttpResult or an Exception; the
+    Analyst defaults to a valid (empty-matrix) response so pre-existing tests that
+    only wire miner+strategist keep passing."""
 
-    def __init__(self, *, miner: Any, strategist: Any) -> None:
+    def __init__(self, *, miner: Any, strategist: Any, analyst: Any = None) -> None:
         self._miner = miner
         self._strategist = strategist
+        self._analyst = analyst if analyst is not None else json_body(analyst_payload())
         self.calls: list[dict[str, Any]] = []
 
     def post_json(self, url: str, body: Any, headers: Any) -> HttpResult:
         self.calls.append({"url": url, "body": body, "headers": dict(headers)})
         system = body.get("system", "")
-        item = self._miner if "voice-of-customer" in system else self._strategist
+        if "voice-of-customer" in system:
+            item = self._miner
+        elif "competitive market analyst" in system:
+            item = self._analyst
+        else:
+            item = self._strategist
         if isinstance(item, Exception):
             raise item
         assert isinstance(item, HttpResult)
@@ -126,6 +134,37 @@ def miner_payload(
             {"complement": "storage bag", "mentioned_in_review_ids": bundle_ids}
         ]
     return payload
+
+
+def analyst_payload(
+    *,
+    market_type: str = "fragmented",
+    attractiveness: str = "moderate",
+    feature_matrix: list[dict[str, Any]] | None = None,
+    openings: list[str] | None = None,
+    concerns: list[str] | None = None,
+    data_gaps: list[str] | None = None,
+) -> dict[str, Any]:
+    """A valid AnalystReport. `feature_matrix` is a list of
+    {'asin': ..., 'claimed_features': [...]}; it defaults to empty so the runner's
+    evidence check drops nothing (status 'ok') without needing to match seeded
+    listing text. Tests that exercise the feature matrix pass explicit entries
+    whose features appear in the seeded competitor titles."""
+    return {
+        "market_structure": {
+            "type": market_type,
+            "narrative": "many small sellers, no dominant brand",
+            "evidence": [],
+        },
+        "who_wins_and_why": [],
+        "price_bands": [],
+        "listing_rubric": [],
+        "feature_matrix": feature_matrix or [],
+        "openings": [{"description": o, "evidence": []} for o in (openings or [])],
+        "concerns": [{"description": c, "evidence": []} for c in (concerns or [])],
+        "attractiveness": {"rating": attractiveness, "one_line": "beatable field"},
+        "data_gaps_acknowledged": data_gaps or [],
+    }
 
 
 def strategist_payload(*, verdict: str = "buy", agrees: bool = True) -> dict[str, Any]:

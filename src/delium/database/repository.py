@@ -682,6 +682,30 @@ def delete_bundle_signals(conn: sqlite3.Connection, asin: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# competitor_features (Analyst feature-matrix evidence → differentiation F2/F4)
+# ---------------------------------------------------------------------------
+def insert_competitor_feature(
+    conn: sqlite3.Connection, *, run_id: str, asin: str, feature: str
+) -> str:
+    feature_id = _new_id()
+    conn.execute(
+        "INSERT INTO competitor_features (id, run_id, asin, feature) VALUES (?, ?, ?, ?)",
+        (feature_id, run_id, asin, feature),
+    )
+    return feature_id
+
+
+def get_competitor_features(conn: sqlite3.Connection, asin: str) -> list[sqlite3.Row]:
+    return _all(
+        conn.execute("SELECT * FROM competitor_features WHERE asin = ? ORDER BY feature", (asin,))
+    )
+
+
+def delete_competitor_features(conn: sqlite3.Connection, asin: str) -> None:
+    conn.execute("DELETE FROM competitor_features WHERE asin = ?", (asin,))
+
+
+# ---------------------------------------------------------------------------
 # agent_runs (LLM agent audit + reproducibility)
 # ---------------------------------------------------------------------------
 def insert_agent_run(
