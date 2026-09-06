@@ -102,3 +102,60 @@ def test_risk_category_rules_fire_on_breadcrumb_paths() -> None:
     assert "high_returns" in _risk_types("Watches > Smart Watches")
     # A clean category triggers none of the category-keyed deductions.
     assert _risk_types("Home & Kitchen > Storage") == set()
+
+
+# ---------------------------------------------------------------------------
+# Calibration-audit contract tests (docs/category-data-audit.md)
+#
+# These lock in the CONSERVATIVE guarantees and document the known key/taxonomy
+# gaps as intended behavior — a table key that is not an exact Keepa segment
+# silently does NOT fire, which is safe (falls back to default) but is a
+# coverage gap that requires the operator to reconcile the key against a live
+# Keepa categoryTree. They must never start passing by accident.
+# ---------------------------------------------------------------------------
+def test_singular_key_does_not_match_pluralized_keepa_root() -> None:
+    # The shipped key is "Baby"; Keepa's US root is believed to be "Baby
+    # Products". Segment equality means "Baby" does NOT match — no false positive,
+    # but the CPSIA compliance deduction is MISSED until the key is reconciled.
+    # This asserts the safe (conservative) half; the report flags the gap.
+    assert category_matches("Baby", "Baby > Feeding")  # exact segment present → fires
+    assert not category_matches("Baby", "Baby Products > Feeding > Bowls")
+    assert "compliance" not in _risk_types("Baby Products > Feeding > Bowls")
+
+
+def test_media_closing_keys_reachability() -> None:
+    # "Books" is a real Keepa root → reachable. "Music"/"DVD"/"Video, DVD &
+    # Blu-ray" do not appear as segments of Keepa's "CDs & Vinyl" / "Movies & TV"
+    # roots, so those closing-fee keys are unreachable (fall back to default).
+    assert closing_fee(FEES, "Books > Nonfiction > Business") == 180
+    assert closing_fee(FEES, "CDs & Vinyl > Pop") == FEES.closing_default_cents
+    assert closing_fee(FEES, "Movies & TV > Action") == FEES.closing_default_cents
+
+
+def test_ambiguous_multi_department_resolution_is_deterministic() -> None:
+    # If a path somehow matches two keys, resolution is the FIRST key in the
+    # table's iteration order — deterministic and repeatable. (Real Amazon
+    # breadcrumbs have a single department root, so this is a defensive contract.)
+    path = "Electronics > Accessories > Home & Kitchen"
+    assert resolve_category_key(["Electronics", "Home & Kitchen"], path) == "Electronics"
+    assert resolve_category_key(["Home & Kitchen", "Electronics"], path) == "Home & Kitchen"
+    # Repeatable across calls.
+    assert resolve_category_key(FEES.referral_categories, path) == resolve_category_key(
+        FEES.referral_categories, path
+    )
+
+
+def test_unknown_category_falls_to_default_in_every_engine() -> None:
+    unknown = "Musical Instruments > Guitars > Electric"  # no key in any table
+    assert referral_fee(FEES, unknown, 10_000) == round(10_000 * FEES.referral_default_percent)
+    assert closing_fee(FEES, unknown) == FEES.closing_default_cents
+    _curve, known = CURVES.resolve(unknown)
+    assert known is False
+    assert _risk_types(unknown) == set()
+
+
+def test_no_unrelated_breadcrumb_silently_fires_a_risk_rule() -> None:
+    # Segment equality guarantees a rule keyed by "Toys & Games" cannot fire for
+    # an unrelated department whose path merely contains the word "toys".
+    assert "ip_signal" not in _risk_types("Pet Supplies > Dog Toys")
+    assert "compliance" not in _risk_types("Office Products > Baby Wipes Dispenser")
