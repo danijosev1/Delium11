@@ -4,6 +4,12 @@
 # Values are ILLUSTRATIVE and MUST be reviewed/expanded before real use.
 # Update this file and bump `version` when the watchlists change. The risk
 # engine reads it verbatim; it invents no categories or weights.
+#
+# Category KEYS below must equal a Keepa category *segment* name: the engine
+# matches them against segments of the product's breadcrumb path (e.g. "Baby"
+# matches "Baby > Feeding > Bowls"). A key that is not an exact Keepa segment
+# (e.g. "Baby" if Keepa returns "Baby Products") will never fire — verify each
+# against your Keepa taxonomy.
 
 version = "us-2026"
 

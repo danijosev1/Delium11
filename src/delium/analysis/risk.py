@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from delium.analysis.categories import resolve_category_key
 from delium.analysis.models import (
     Confidence,
     RiskConfidence,
@@ -108,7 +109,7 @@ _UNASSESSED = _RuleResult(None, False)
 def _rule_ip(data: RiskInput, rules: RiskRules, cfg: RiskConfig) -> _RuleResult:
     if data.category is None and data.patent_marked_listings is None and not data.titles:
         return _UNASSESSED
-    if data.category is not None and data.category in rules.ip_categories:
+    if resolve_category_key(rules.ip_categories, data.category) is not None:
         return _flag(
             "ip_signal",
             cfg.deduct_ip,
@@ -144,7 +145,8 @@ def _rule_ip(data: RiskInput, rules: RiskRules, cfg: RiskConfig) -> _RuleResult:
 def _rule_compliance(data: RiskInput, rules: RiskRules, cfg: RiskConfig) -> _RuleResult:
     if data.category is None:
         return _UNASSESSED
-    requirement = rules.compliance_map.get(data.category)
+    key = resolve_category_key(rules.compliance_map, data.category)
+    requirement = rules.compliance_map.get(key) if key is not None else None
     if requirement is not None:
         return _flag(
             "compliance",
@@ -239,7 +241,7 @@ def _rule_high_returns(data: RiskInput, rules: RiskRules, cfg: RiskConfig) -> _R
             "Sizing/fit issues drive returns.",
             cfg,
         )
-    if data.category is not None and data.category in rules.high_return_categories:
+    if resolve_category_key(rules.high_return_categories, data.category) is not None:
         return _flag(
             "high_returns",
             cfg.deduct_high_returns,

@@ -5,6 +5,11 @@
 # (see `delium calibrate` in the scoring model) before trusted. Update this file
 # and bump `version` when the curves are recalibrated.
 #
+# Category KEYS ([categories."<name>"]) must equal a Keepa category *segment*
+# name: the engine matches them against segments of the product's breadcrumb
+# path. A category with no matching key uses [default] (category_known = False,
+# which caps demand confidence). Add the departments you validate most.
+#
 # Each category provides:
 #   base_factor        multiplier on monthly rank-drops → expected units
 #   multi_unit_factor  extra headroom on the high bound (multi-unit orders)

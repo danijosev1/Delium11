@@ -291,9 +291,14 @@ class VelocityCurves:
     categories: dict[str, CategoryCurve]
 
     def resolve(self, category: str | None) -> tuple[CategoryCurve, bool]:
-        """Return (curve, category_known). Falls back to the default curve."""
-        if category is not None and category in self.categories:
-            return self.categories[category], True
+        """Return (curve, category_known). `category` is a Keepa breadcrumb path;
+        a department curve resolves against its segments (not exact-equality), so
+        real data selects its category curve instead of always the default."""
+        from delium.analysis.categories import resolve_category_key
+
+        key = resolve_category_key(self.categories, category)
+        if key is not None:
+            return self.categories[key], True
         return self.default, False
 
 

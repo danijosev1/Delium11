@@ -82,7 +82,7 @@ The persisted matrix holds **competitor** claimed features only; each was verifi
 
 - `size_tier(dims, weight)` → Amazon's published decision table (small-standard → large-bulky), computed on packaged-dims assumption (+10% dims allowance, config).
 - `fulfillment_fee(tier, weight)` → published FBA rate card lookup + interpolation rules.
-- `referral_fee(category, price)` → category % table with minimums.
+- `referral_fee(category, price)` → category % table with minimums. `category` is the Keepa **breadcrumb path**, so the table key is matched against its *segments* (`analysis/categories.py`, segment-equality, not substring) — a department key resolves whether it is a segment of the path or the whole string. The same segment matching is used for demand's BSR→velocity curve selection and the risk category rules (IP / compliance / high-return); a table/rule KEY must therefore be an exact Keepa segment name, or it never fires and the product uses the default.
 - `storage_fee_monthly(tier, volume_ft³, month)` → standard vs. Q4 rates; annualized average used in unit economics, Q4 rate reported separately.
 - Output includes the exact table rows used (`fee_table_version`, row keys) in `inputs_used`.
 

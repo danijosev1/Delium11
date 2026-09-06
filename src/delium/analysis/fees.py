@@ -13,6 +13,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from delium.analysis.categories import resolve_category_key
 from delium.analysis.models import (
     Dimensions,
     FeeBreakdown,
@@ -119,13 +120,17 @@ def fulfillment_fee(tier: SizeTier, weight_g: int) -> int:
 
 
 def referral_fee(table: FeeTable, category: str | None, price_cents: int) -> int:
-    percent = table.referral_categories.get(category or "", table.referral_default_percent)
+    # `category` is a Keepa breadcrumb path; match a department key against its
+    # segments (not exact-equality) so real data resolves its true referral rate.
+    key = resolve_category_key(table.referral_categories, category)
+    percent = table.referral_categories[key] if key is not None else table.referral_default_percent
     fee = round(price_cents * percent)
     return max(fee, table.referral_min_fee_cents)
 
 
 def closing_fee(table: FeeTable, category: str | None) -> int:
-    return table.closing_categories.get(category or "", table.closing_default_cents)
+    key = resolve_category_key(table.closing_categories, category)
+    return table.closing_categories[key] if key is not None else table.closing_default_cents
 
 
 def cubic_feet(dims: Dimensions) -> float:

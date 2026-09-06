@@ -15,7 +15,12 @@ currency = "USD"
 default_percent = 0.15
 min_fee_cents = 30
 
-# category -> referral percentage
+# category -> referral percentage.
+# KEYS must equal a Keepa category *segment* name (the engine matches these
+# against segments of the product's breadcrumb path, e.g. "Electronics" matches
+# "Electronics > Headphones"). Verify each key against your Keepa taxonomy — a
+# key that is not an exact segment (e.g. "Baby" vs Keepa's "Baby Products") will
+# never match and the product falls back to default_percent.
 [referral.categories]
 "Home & Kitchen" = 0.15
 "Kitchen" = 0.15
