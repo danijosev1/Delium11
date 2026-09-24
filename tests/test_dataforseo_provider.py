@@ -147,11 +147,13 @@ def test_search_volume_requires_keywords() -> None:
 def test_dataforseo_location_mapping() -> None:
     from delium.providers.dataforseo import dataforseo_location
 
-    assert dataforseo_location("US") == (2840, "en_US")
-    assert dataforseo_location("UK") == (2826, "en_GB")
-    assert dataforseo_location("CA") == (2124, "en_CA")
-    assert dataforseo_location("AU") == (2036, "en_AU")
-    assert dataforseo_location("IN") == (2356, "en_IN")
+    # (location_code, labs_language_code, serp_language_code). Labs Amazon
+    # endpoints require the short ISO "en"; the Merchant SERP wants the locale.
+    assert dataforseo_location("US") == (2840, "en", "en_US")
+    assert dataforseo_location("UK") == (2826, "en", "en_GB")
+    assert dataforseo_location("CA") == (2124, "en", "en_CA")
+    assert dataforseo_location("AU") == (2036, "en", "en_AU")
+    assert dataforseo_location("IN") == (2356, "en", "en_IN")
 
 
 def test_dataforseo_unknown_marketplace_rejected() -> None:
@@ -171,4 +173,54 @@ def test_client_marketplace_sets_location_in_request() -> None:
     client.search_volume(["baby food tray"])
     _url, body = transport.calls[0]
     assert body[0]["location_code"] == 2356
-    assert body[0]["language_code"] == "en_IN"
+    # Labs endpoint → short ISO code, NOT the "en_IN" locale (the bug that caused
+    # DataForSEO task error 40501 "Invalid Field: 'language_code'").
+    assert body[0]["language_code"] == "en"
+
+
+# Expected language_code per endpoint per marketplace (docs-verified 2026-09):
+# the three Labs Amazon endpoints take "en"; the Merchant SERP takes the locale.
+_EXPECTED_LANG = {
+    "US": ("en", "en_US"),
+    "UK": ("en", "en_GB"),
+    "CA": ("en", "en_CA"),
+    "AU": ("en", "en_AU"),
+    "IN": ("en", "en_IN"),
+}
+_LOCATION_CODE = {"US": 2840, "UK": 2826, "CA": 2124, "AU": 2036, "IN": 2356}
+
+
+@pytest.mark.parametrize("marketplace", ["US", "UK", "CA", "AU", "IN"])
+def test_labs_endpoints_send_iso_language_code(marketplace: str) -> None:
+    """bulk_search_volume / related_keywords / ranked_keywords must send the
+    short ISO language_code ("en"), never the "en_XX" locale."""
+    labs_lang, _serp_lang = _EXPECTED_LANG[marketplace]
+    loc = _LOCATION_CODE[marketplace]
+    for call, response in (
+        (lambda c: c.search_volume(["baby food tray"]), volume_body()),
+        (lambda c: c.related_keywords("baby food tray"), related_body()),
+        (lambda c: c.ranked_keywords("B0AAA00001"), related_body()),
+    ):
+        transport = FakePostTransport([ok(response)])
+        client = DataForSeoClient(
+            "login", "pass", transport=transport, sleep=lambda _: None, marketplace=marketplace
+        )
+        call(client)
+        _url, body = transport.calls[0]
+        assert body[0]["location_code"] == loc
+        assert body[0]["language_code"] == labs_lang
+
+
+@pytest.mark.parametrize("marketplace", ["US", "UK", "CA", "AU", "IN"])
+def test_serp_endpoint_sends_locale_language_code(marketplace: str) -> None:
+    """The Merchant Amazon SERP endpoint requires the "en_XX" locale form."""
+    _labs_lang, serp_lang = _EXPECTED_LANG[marketplace]
+    loc = _LOCATION_CODE[marketplace]
+    transport = FakePostTransport([ok(serp_body())])
+    client = DataForSeoClient(
+        "login", "pass", transport=transport, sleep=lambda _: None, marketplace=marketplace
+    )
+    client.serp("baby food tray")
+    _url, body = transport.calls[0]
+    assert body[0]["location_code"] == loc
+    assert body[0]["language_code"] == serp_lang

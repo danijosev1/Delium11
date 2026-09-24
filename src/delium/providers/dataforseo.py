@@ -45,17 +45,28 @@ _PATH_SERP = "merchant/amazon/products/live/advanced"
 # DataForSEO location/language per marketplace (provider-side half of the
 # centralized marketplace model). Keyed by the marketplace code strings used
 # across ingestion/DB (== analysis Marketplace enum values).
-_MARKETPLACE_LOCATIONS: dict[str, tuple[int, str]] = {
-    "US": (2840, "en_US"),
-    "UK": (2826, "en_GB"),
-    "CA": (2124, "en_CA"),
-    "AU": (2036, "en_AU"),
-    "IN": (2356, "en_IN"),
+#
+# The two Amazon API families expect DIFFERENT language_code formats (verified
+# against the official DataForSEO docs, 2026-09):
+#   - DataForSEO Labs Amazon endpoints (bulk_search_volume, related_keywords,
+#     ranked_keywords) require a short ISO code, e.g. "en" — sending "en_US"
+#     fails with task error 40501 "Invalid Field: 'language_code'".
+#   - The Merchant Amazon SERP endpoint (merchant/amazon/products/live/advanced)
+#     requires the locale form, e.g. "en_US" / "en_GB".
+# The value tuple is (location_code, labs_language_code, serp_language_code).
+_MARKETPLACE_LOCATIONS: dict[str, tuple[int, str, str]] = {
+    "US": (2840, "en", "en_US"),
+    "UK": (2826, "en", "en_GB"),
+    "CA": (2124, "en", "en_CA"),
+    "AU": (2036, "en", "en_AU"),
+    "IN": (2356, "en", "en_IN"),
 }
 
 
-def dataforseo_location(marketplace: str) -> tuple[int, str]:
-    """(location_code, language_code) for a marketplace, or raise if unsupported."""
+def dataforseo_location(marketplace: str) -> tuple[int, str, str]:
+    """(location_code, labs_language_code, serp_language_code) for a marketplace,
+    or raise if unsupported. The two language codes differ by API family — Labs
+    Amazon wants "en", the Merchant SERP wants "en_US"-style locales."""
     try:
         return _MARKETPLACE_LOCATIONS[marketplace]
     except KeyError as exc:
@@ -230,7 +241,11 @@ class DataForSeoClient:
         self._transport = transport or UrllibTransport()
         self._sleep = sleep
         self._marketplace = marketplace
-        self._location_code, self._language_code = dataforseo_location(marketplace)
+        (
+            self._location_code,
+            self._labs_language_code,
+            self._serp_language_code,
+        ) = dataforseo_location(marketplace)
 
     @property
     def marketplace(self) -> str:
@@ -260,7 +275,7 @@ class DataForSeoClient:
             {
                 "keywords": [normalize_phrase(k) for k in keywords],
                 "location_code": self._location_code,
-                "language_code": self._language_code,
+                "language_code": self._labs_language_code,  # Labs: "en", not "en_US"
             }
         ]
         result = self._post(_PATH_VOLUME, body)
@@ -276,7 +291,7 @@ class DataForSeoClient:
             {
                 "keyword": normalize_phrase(seed),
                 "location_code": self._location_code,
-                "language_code": self._language_code,
+                "language_code": self._labs_language_code,  # Labs: "en", not "en_US"
                 "depth": depth,
                 "limit": limit,
             }
@@ -295,7 +310,7 @@ class DataForSeoClient:
             {
                 "asin": asin,
                 "location_code": self._location_code,
-                "language_code": self._language_code,
+                "language_code": self._labs_language_code,  # Labs: "en", not "en_US"
                 "limit": limit,
             }
         ]
@@ -312,7 +327,7 @@ class DataForSeoClient:
             {
                 "keyword": normalize_phrase(keyword),
                 "location_code": self._location_code,
-                "language_code": self._language_code,
+                "language_code": self._serp_language_code,  # Merchant SERP: locale "en_US"
             }
         ]
         result = self._post(_PATH_SERP, body)
