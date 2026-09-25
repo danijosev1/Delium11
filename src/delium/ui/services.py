@@ -273,6 +273,51 @@ def cross_market(
 
 
 # ---------------------------------------------------------------------------
+# Emerging  (== `emerging`)
+# ---------------------------------------------------------------------------
+def emerging(
+    marketplace: str,
+    category_ids: list[int],
+    config: DeliumConfig,
+    *,
+    overrides: dict[str, int] | None = None,
+) -> Any:
+    from delium.discovery.emerging import run_emerging
+
+    initialize_database()
+    keepa_factory, dfs_factory = _provider_factories()
+    with get_connection() as conn:
+        run_id = repository.insert_run(
+            conn, command="emerging", input_=f"{marketplace}:{category_ids}"
+        )
+    with get_connection() as conn:
+        report = run_emerging(
+            conn,
+            marketplace=Marketplace(marketplace),
+            category_ids=category_ids,
+            config=config,
+            run_id=run_id,
+            keepa_factory=keepa_factory,
+            dfs_factory=dfs_factory,
+            overrides=overrides,
+        )
+        repository.finish_run(conn, run_id, status="complete")
+    return report
+
+
+def recent_emerging_runs(limit: int = 25) -> list[sqlite3.Row]:
+    initialize_database()
+    with get_connection() as conn:
+        return repository.list_emerging_runs(conn, limit=limit)
+
+
+def emerging_candidates(run_id: str) -> list[sqlite3.Row]:
+    initialize_database()
+    with get_connection() as conn:
+        return repository.get_emerging_candidates(conn, run_id)
+
+
+# ---------------------------------------------------------------------------
 # History (DB reads only — no providers)
 # ---------------------------------------------------------------------------
 def recent_runs(limit: int = 50) -> list[sqlite3.Row]:

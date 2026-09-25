@@ -144,6 +144,26 @@ def validate_estimate(
     )
 
 
+def emerging_estimate(config: DeliumConfig, *, dataforseo: bool) -> tuple[CostEstimate, int, int]:
+    """Emerging run estimate. Keepa is a flat subscription (spends tokens, ~$0
+    marginal); returns (CostEstimate, finder_tokens, product_tokens_worst_case)
+    so the UI can show the token budget explicitly."""
+    from delium.discovery.emerging import estimate_tokens
+
+    tokens = estimate_tokens(config)
+    providers = ["Keepa"]
+    notes = [
+        f"Keepa Product Finder ~{tokens.finder_tokens} tokens + up to "
+        f"{tokens.product_tokens_worst_case} product tokens (worst case; cache reused)",
+        "Keepa is a flat subscription — spends tokens, ~$0 marginal",
+    ]
+    if dataforseo and config.emerging.enrich_top_n > 0:
+        providers.append("DataForSEO")
+        notes.append(f"top {config.emerging.enrich_top_n} may make DataForSEO keyword calls")
+    est = CostEstimate(tuple(providers), 0.0, 0.0, fully_cached=False, notes=tuple(notes))
+    return est, tokens.finder_tokens, tokens.product_tokens_worst_case
+
+
 def discover_estimate(
     config: DeliumConfig, *, keyword_count: int, dataforseo: bool, keepa: bool
 ) -> CostEstimate:

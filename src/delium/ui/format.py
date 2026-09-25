@@ -170,6 +170,58 @@ def cross_market_rows(candidates: list[Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def emerging_rows(candidates: list[Any]) -> list[dict[str, Any]]:
+    """Scored emerging candidates → table rows (emergence + opportunity)."""
+    rows: list[dict[str, Any]] = []
+    for c in candidates:
+        s = c.evaluated.scored
+        rows.append(
+            {
+                "asin": c.asin,
+                "emergence": None
+                if c.emergence.emergence_score is None
+                else round(c.emergence.emergence_score, 0),
+                "age_days": c.emergence.age_days,
+                "opportunity": None if s is None else round(s.score, 0),
+                "verdict": None if s is None else s.verdict.value,
+                "confidence": None if s is None else s.confidence.level.value,
+                "why": "; ".join(c.emergence.reasons),
+            }
+        )
+    return rows
+
+
+def emerging_killed_rows(candidates: list[Any]) -> list[dict[str, Any]]:
+    """Emerging-but-killed candidates → table rows with the exact kill reason."""
+    return [
+        {
+            "asin": c.asin,
+            "emergence": None
+            if c.emergence.emergence_score is None
+            else round(c.emergence.emergence_score, 0),
+            "kill_rule": c.evaluated.kill_rule,
+            "reason": c.evaluated.notes[0] if c.evaluated.notes else "",
+        }
+        for c in candidates
+    ]
+
+
+def emerging_candidate_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    """Persisted emerging_candidates rows → table (History page)."""
+    return [
+        {
+            "asin": r["asin"],
+            "emergence": r["emergence_score"],
+            "age_days": r["age_days"],
+            "outcome": r["outcome"],
+            "opportunity": r["opportunity_score"],
+            "verdict": r["verdict"],
+            "kill_rule": r["kill_rule"],
+        }
+        for r in rows
+    ]
+
+
 def run_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return [
         {

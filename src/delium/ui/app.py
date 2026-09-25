@@ -289,6 +289,75 @@ def page_discover() -> None:
         st.info("No candidates survived to scoring (add Keepa to hydrate & score them).")
 
 
+def page_emerging() -> None:
+    st.header("Emerging products")
+    st.caption(
+        "Recently-launched products already gaining traction while competition is weak "
+        "(Keepa Product Finder), scored through the existing pipeline. Emergence explains "
+        "WHY; scoring.py still owns Buy/Test/Avoid."
+    )
+    if not credentials.is_configured("keepa"):
+        st.info(
+            "Emerging search needs Keepa (the Product Finder is Keepa-only). "
+            "Set DELIUM_KEEPA_API_KEY."
+        )
+        return
+
+    config = _config()
+    col1, col2 = st.columns(2)
+    marketplace = col1.selectbox("Marketplace", _MARKETPLACES, key="em_mp")
+    cats_raw = col2.text_input("Keepa category ids (comma-separated, optional)", key="em_cats")
+    col3, col4 = st.columns(2)
+    max_reviews = col3.number_input(
+        "Max reviews override", min_value=0, value=0, step=10, key="em_rev"
+    )
+    max_age = col4.number_input(
+        "Max age days override", min_value=0, value=0, step=30, key="em_age"
+    )
+    category_ids = [int(x) for x in cats_raw.replace(" ", "").split(",") if x.strip().isdigit()]
+    overrides: dict[str, int] = {}
+    if max_reviews:
+        overrides["reviews_max"] = int(max_reviews)
+    if max_age:
+        overrides["age_max_days"] = int(max_age)
+
+    est, finder_tok, product_tok = costs.emerging_estimate(
+        config, dataforseo=credentials.is_configured("dataforseo")
+    )
+    st.warning(
+        f"This calls **{', '.join(est.providers)}**. Estimated Keepa tokens: "
+        f"~**{finder_tok}** (Product Finder) + up to **{product_tok}** (product hydration, "
+        "worst case — cache is reused)."
+    )
+    for note in est.notes:
+        st.caption(f"• {note}")
+    if not st.button("Confirm & run emerging search", type="primary"):
+        return
+    try:
+        with st.spinner("Searching for emerging products…"):
+            report = services.emerging(marketplace, category_ids, config, overrides=overrides)
+    except (ProviderError, ConfigError) as exc:
+        st.error(f"Emerging search failed: {exc}")
+        return
+
+    for note in report.notes:
+        st.info(note)
+    st.caption(
+        f"Product Finder matched {report.finder_total_results or 0} total · "
+        f"tokens used: {report.finder_tokens} finder + {report.product_tokens} product."
+    )
+    ranked = format.emerging_rows(list(report.ranked))
+    if ranked:
+        st.subheader("Emerging candidates (emergence signal)")
+        st.dataframe(ranked, use_container_width=True, hide_index=True)
+    else:
+        st.info("No emerging candidates survived scoring.")
+    killed = format.emerging_killed_rows(list(report.killed))
+    if killed:
+        st.subheader("Emerging but hard-killed (excluded, reasons shown)")
+        st.dataframe(killed, use_container_width=True, hide_index=True)
+
+
 def page_cross_market() -> None:
     st.header("Cross-market")
     st.caption(
@@ -335,6 +404,20 @@ def page_history() -> None:
     else:
         st.caption("none yet")
 
+    st.subheader("Emerging runs")
+    em_runs = services.recent_emerging_runs()
+    if em_runs:
+        labels = [
+            f"{r['created_at']} · {r['marketplace']} · {r['page_size']} scanned" for r in em_runs
+        ]
+        idx = st.selectbox("Emerging run", range(len(em_runs)), format_func=lambda i: labels[i])
+        cands = format.emerging_candidate_rows(services.emerging_candidates(em_runs[idx]["run_id"]))
+        st.dataframe(cands, use_container_width=True, hide_index=True) if cands else st.caption(
+            "no candidates"
+        )
+    else:
+        st.caption("none yet")
+
     st.subheader("Recent runs")
     runs = format.run_rows(services.recent_runs())
     if runs:
@@ -357,6 +440,7 @@ _PAGES = {
     "Product lookup": page_product_lookup,
     "Validate": page_validate,
     "Discover": page_discover,
+    "Emerging": page_emerging,
     "Cross-market": page_cross_market,
     "History": page_history,
 }

@@ -822,6 +822,125 @@ def _render_cross_market(
 
 
 @app.command()
+def emerging(
+    category: Annotated[
+        list[int] | None,
+        typer.Option("--category", "-c", help="Keepa root category id (repeatable)."),
+    ] = None,
+    marketplace: Annotated[
+        str, typer.Option("--marketplace", "-m", help="Marketplace: US, CA, UK, AU, IN.")
+    ] = "US",
+    max_reviews: Annotated[
+        int | None, typer.Option("--max-reviews", help="Override the review-count ceiling.")
+    ] = None,
+    max_age_days: Annotated[
+        int | None, typer.Option("--max-age-days", help="Override the 'recently listed' window.")
+    ] = None,
+    yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Skip the cost confirmation prompt.")
+    ] = False,
+) -> None:
+    """Find recently-launched products already gaining traction (Keepa Product
+    Finder), score the top ones through the EXISTING pipeline, and show
+    emerging-but-killed products separately with their kill reasons."""
+    from delium.analysis.models import Marketplace
+    from delium.discovery.emerging import estimate_tokens, run_emerging
+
+    initialize_database()
+    config = load_config()
+    mp_code = _validate_marketplace(marketplace)
+    keepa_factory, dfs_factory = _build_provider_factories()
+    if keepa_factory is None:
+        console.print(
+            "[bold red]Emerging search needs Keepa.[/bold red] Set DELIUM_KEEPA_API_KEY "
+            "(the Product Finder is Keepa-only)."
+        )
+        raise typer.Exit(code=1)
+
+    overrides: dict[str, int] = {}
+    if max_reviews is not None:
+        overrides["reviews_max"] = max_reviews
+    if max_age_days is not None:
+        overrides["age_max_days"] = max_age_days
+
+    est = estimate_tokens(config)
+    console.print(
+        f"[bold]Emerging search[/bold] — {mp_code}, "
+        f"categories {category or 'all'}, page size {config.emerging.page_size}."
+    )
+    console.print(
+        f"[yellow]Estimated Keepa tokens:[/yellow] ~{est.finder_tokens} (Product Finder) + up to "
+        f"{est.product_tokens_worst_case} (product hydration, worst case; cache reused)."
+    )
+    if dfs_factory is not None and config.emerging.enrich_top_n > 0:
+        console.print(
+            f"[dim]Top {config.emerging.enrich_top_n} may also make DataForSEO keyword calls.[/dim]"
+        )
+    if not yes and not typer.confirm("Proceed and spend Keepa tokens?"):
+        console.print("Aborted — no API calls made.")
+        raise typer.Exit(code=0)
+
+    with get_connection() as conn:
+        run_id = repository.insert_run(
+            conn, command="emerging", input_=f"{mp_code}:{category or ''}"
+        )
+    with get_connection() as conn:
+        report = run_emerging(
+            conn,
+            marketplace=Marketplace(mp_code),
+            category_ids=category or [],
+            config=config,
+            run_id=run_id,
+            keepa_factory=keepa_factory,
+            dfs_factory=dfs_factory,
+            overrides=overrides,
+        )
+        repository.finish_run(conn, run_id, status="complete")
+    _render_emerging(report)
+
+
+def _render_emerging(report: object) -> None:
+    from delium.discovery.emerging import EmergingReport
+
+    assert isinstance(report, EmergingReport)
+    for note in report.notes:
+        console.print(f"[yellow]{note}[/yellow]")
+    console.print(
+        f"\nProduct Finder matched [cyan]{report.finder_total_results or 0}[/cyan] total  ·  "
+        f"tokens used: {report.finder_tokens} finder + {report.product_tokens} product."
+    )
+
+    if report.ranked:
+        console.print("\n[bold]Emerging candidates[/bold] (emergence signal DESC):")
+        for c in report.ranked:
+            s = c.evaluated.scored
+            assert s is not None
+            em = (
+                "—" if c.emergence.emergence_score is None else f"{c.emergence.emergence_score:.0f}"
+            )
+            age = "—" if c.emergence.age_days is None else f"{c.emergence.age_days}d"
+            console.print(
+                f"  [green]{c.asin}[/green]  emergence {em}/100 ({age})  ·  "
+                f"opportunity {s.score:.0f} · [bold]{s.verdict.value.upper()}[/bold] · "
+                f"{s.confidence.level.value} conf"
+            )
+            console.print(f"    [dim]{', '.join(c.emergence.reasons)}[/dim]")
+    else:
+        console.print("\n[yellow]No emerging candidates survived scoring.[/yellow]")
+
+    if report.killed:
+        console.print("\n[bold]Emerging but hard-killed[/bold] (excluded — reason shown):")
+        for c in report.killed:
+            em = (
+                "—" if c.emergence.emergence_score is None else f"{c.emergence.emergence_score:.0f}"
+            )
+            reason = c.evaluated.notes[0] if c.evaluated.notes else ""
+            console.print(
+                f"  [red]{c.asin}[/red]  emergence {em}/100  ·  {c.evaluated.kill_rule}: {reason}"
+            )
+
+
+@app.command()
 def portfolio() -> None:
     """Show all validated candidates ranked by score, capital, and payback."""
     log.info("portfolio requested")

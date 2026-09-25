@@ -293,6 +293,17 @@ class AgentsConfig(StrictModel):
     min_quote_ids: int = Field(3, ge=1)  # a theme needs ≥ this many supporting reviews
 
 
+class EmergingConfig(StrictModel):
+    """`emerging` discovery operational limits (docs/emerging.md). The emergence
+    *thresholds* live in the versioned external data file
+    (`analysis/emerging_data/<version>.toml`); these are only the run knobs."""
+
+    page_size: int = Field(50, gt=0, le=200)  # Keepa Product Finder results per run
+    top_n: int = Field(20, gt=0)  # candidates ranked by emergence → scoring
+    enrich_top_n: int = Field(5, ge=0)  # of those, how many get DataForSEO keyword enrichment
+    data_version: str = "us"  # emerging_data/<version>.toml
+
+
 class DeliumConfig(StrictModel):
     """Root configuration object loaded from config.toml."""
 
@@ -313,3 +324,4 @@ class DeliumConfig(StrictModel):
     cross_market: CrossMarketConfig = Field(default_factory=CrossMarketConfig)
     discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    emerging: EmergingConfig = Field(default_factory=EmergingConfig)

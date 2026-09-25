@@ -1,0 +1,54 @@
+# Emerging-products thresholds — EXTERNAL DATA, not hardcoded in Python
+# (docs/emerging.md; same pattern as fee_tables / bsr_velocity / risk_data).
+#
+# Values are ILLUSTRATIVE defaults for a US private-label seller ($15–60 band)
+# and MUST be reviewed against your own category norms before trusting them.
+# The engine reads this verbatim; it invents no thresholds or weights.
+#
+# Two sections:
+#   [finder]    — the Keepa Product Finder selection filter (what to search for)
+#   [emergence] — the deterministic emergence-signal bands + weights (why a
+#                 candidate reads as emerging). Both are versioned together.
+
+version = "us-2026"
+
+# ---------------------------------------------------------------------------
+# Keepa Product Finder selection (GET/POST https://api.keepa.com/query).
+# Money in integer cents; BSR is the current sales rank; age in DAYS is
+# converted to a Keepa-minute `trackingSince_gte` cutoff at query time.
+# ---------------------------------------------------------------------------
+[finder]
+age_max_days = 180            # first tracked within ~6 months  → trackingSince_gte
+bsr_min = 200                 # current_SALES_gte — exclude the mega-sellers
+bsr_max = 40000               # current_SALES_lte — but must show meaningful sales
+price_min_cents = 1500        # current_NEW_gte — $15 private-label floor
+price_max_cents = 6000        # current_NEW_lte — $60 ceiling
+reviews_max = 100             # current_COUNT_REVIEWS_lte — still beatable
+exclude_amazon = true         # buyBoxIsAmazon = false — not sold by Amazon
+
+# ---------------------------------------------------------------------------
+# Emergence signal (0–100 sub-signals, weighted → emergence_score 0–100).
+# This is SEPARATE from the opportunity score; it explains WHY a product looks
+# emerging and never feeds scoring.py.
+# ---------------------------------------------------------------------------
+[emergence]
+# recency: age in days → 100 at/below young_days, 0 at/above old_days
+young_days = 90
+old_days = 365
+# traction: current BSR (log scale) → 100 at/below bsr_strong, 0 at/above bsr_weak
+bsr_strong = 500
+bsr_weak = 40000
+# momentum: 90d Theil–Sen slope of log10(BSR)/day; negative = rank improving.
+# 100 at slope <= slope_improving, 0 at slope >= 0 (flat/worsening).
+slope_improving = -0.004
+# competition: review count (linear) → 100 at/below reviews_low, 0 at/above reviews_high
+reviews_low = 5
+reviews_high = 150
+
+# weights (sum 100). review_gap = geometric mean of traction and competition
+# ("selling well AND still few reviews").
+w_recency = 25
+w_traction = 25
+w_momentum = 25
+w_competition = 15
+w_review_gap = 10

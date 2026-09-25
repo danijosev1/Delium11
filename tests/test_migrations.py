@@ -32,6 +32,8 @@ EXPECTED_TABLES = {
     "bundle_signals",
     "agent_runs",
     "competitor_features",
+    "emerging_runs",
+    "emerging_candidates",
     "schema_migrations",
 }
 
@@ -55,7 +57,7 @@ def test_discover_migrations_are_ordered_and_named() -> None:
 
 def test_initialize_creates_all_tables(isolated_env: Path) -> None:
     applied = initialize_database()
-    assert applied == [1, 2, 3, 4, 5]
+    assert applied == [1, 2, 3, 4, 5, 6]
     assert EXPECTED_TABLES.issubset(_table_names(isolated_env / "data" / "delium.db"))
 
 
@@ -74,7 +76,7 @@ def test_initialize_enables_wal_and_foreign_keys(isolated_env: Path) -> None:
 def test_initialize_is_idempotent(isolated_env: Path) -> None:
     first = initialize_database()
     second = initialize_database()
-    assert first == [1, 2, 3, 4, 5]
+    assert first == [1, 2, 3, 4, 5, 6]
     assert second == []  # nothing new to apply the second time
 
 
@@ -86,13 +88,14 @@ def test_applied_versions_recorded(isolated_env: Path) -> None:
         rows = conn.execute("SELECT version, name FROM schema_migrations").fetchall()
     finally:
         conn.close()
-    assert applied == {1, 2, 3, 4, 5}
+    assert applied == {1, 2, 3, 4, 5, 6}
     names = {row["name"] for row in rows}
     assert "0001_initial_schema.sql" in names
     assert "0002_cross_market.sql" in names
     assert "0003_discovery.sql" in names
     assert "0004_agent_layer.sql" in names
     assert "0005_analyst.sql" in names
+    assert "0006_emerging.sql" in names
 
 
 def test_key_indexes_exist(isolated_env: Path) -> None:
@@ -164,8 +167,8 @@ def test_failed_migration_rolls_back(
 
     migration_dir = tmp_path / "m"
     migration_dir.mkdir()
-    # Version 6 (past the real 0001–0005 already applied to initialized_db).
-    (migration_dir / "0006_broken.sql").write_text(
+    # Version 7 (past the real 0001–0006 already applied to initialized_db).
+    (migration_dir / "0007_broken.sql").write_text(
         "CREATE TABLE ok_table (id INTEGER);\nTHIS IS NOT SQL;"
     )
     monkeypatch.setattr(migrations_module, "MIGRATIONS_DIR", migration_dir)
@@ -187,5 +190,5 @@ def test_failed_migration_rolls_back(
     finally:
         conn.close()
 
-    assert 6 not in applied  # broken migration not recorded
+    assert 7 not in applied  # broken migration not recorded
     assert "ok_table" not in tables  # its partial DDL was rolled back

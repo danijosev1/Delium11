@@ -13,6 +13,7 @@ against those reactively and paces before large batches.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -36,6 +37,18 @@ from delium.utils.logging import get_logger
 log = get_logger(__name__)
 
 KEEPA_PRODUCT_URL = "https://api.keepa.com/product"
+KEEPA_QUERY_URL = "https://api.keepa.com/query"  # Product Finder
+
+# Product Finder token cost (Keepa docs, keepa.com/api-docs/product-finder.html):
+# 10 tokens per request + 1 per 100 ASINs returned.
+_FINDER_BASE_TOKENS = 10
+
+
+def finder_token_estimate(per_page: int) -> int:
+    """Estimated Product Finder token cost for one `/query` call returning up to
+    `per_page` ASINs: base 10 + 1 per 100 results (Keepa docs)."""
+    return _FINDER_BASE_TOKENS + ceil(max(0, per_page) / 100)
+
 
 # Keepa timestamps are "Keepa minutes": minutes since the Keepa epoch.
 # unix_seconds = (keepa_minutes + KEEPA_EPOCH_MINUTES) * 60
@@ -125,6 +138,17 @@ class KeepaFetch:
         if asin_count <= 0:
             return 0
         return max(1, self.tokens_consumed // asin_count)
+
+
+@dataclass(frozen=True)
+class FinderResult:
+    """One Product Finder (`/query`) call: the matching ASINs plus token cost."""
+
+    http_status: int
+    asins: tuple[str, ...]
+    total_results: int | None
+    tokens_consumed: int
+    tokens_left: int | None
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +370,41 @@ class KeepaClient:
             )
         return cls(key.get_secret_value(), transport=transport, marketplace=marketplace)
 
+    def product_finder(self, selection: dict[str, Any]) -> FinderResult:
+        """Keepa Product Finder (`GET /query`): return the ASINs matching a
+        selection filter. The selection JSON is passed as a URL parameter; the
+        API key is a separate param and is never part of the selection. Response:
+        {asinList, totalResults, tokensLeft, tokensConsumed}."""
+        params = {
+            "key": self._api_key,
+            "domain": str(self._domain),
+            "selection": json.dumps(selection, separators=(",", ":")),
+        }
+        per_page = int(selection.get("perPage", 50))
+        self._await_tokens(finder_token_estimate(per_page))
+        result = self._request_with_retries(params, url=KEEPA_QUERY_URL)
+        return self._parse_finder(result)
+
+    def _parse_finder(self, result: HttpResult) -> FinderResult:
+        body = result.body
+        if not isinstance(body, dict):
+            raise ProviderResponseError(
+                f"Keepa Product Finder: unexpected body ({_keepa_error_detail(result)})."
+            )
+        self._absorb_token_state(body)
+        asin_list = body.get("asinList")
+        if not isinstance(asin_list, list):
+            raise ProviderResponseError(
+                f"Keepa Product Finder returned no asinList ({_keepa_error_detail(result)})."
+            )
+        return FinderResult(
+            http_status=result.status,
+            asins=tuple(str(a) for a in asin_list if a),
+            total_results=_positive_or_none(body.get("totalResults")),
+            tokens_consumed=_positive_or_none(body.get("tokensConsumed")) or 0,
+            tokens_left=self._tokens_left,
+        )
+
     def fetch_product(self, asin: str) -> KeepaFetch:
         return self.fetch_products([asin])
 
@@ -377,11 +436,13 @@ class KeepaClient:
         # Assume the wait refilled enough; the next response corrects the count.
         self._tokens_left = estimated
 
-    def _request_with_retries(self, params: dict[str, str]) -> HttpResult:
+    def _request_with_retries(
+        self, params: dict[str, str], *, url: str = KEEPA_PRODUCT_URL
+    ) -> HttpResult:
         last_status = 0
         for attempt in range(_MAX_RETRIES + 1):
             try:
-                result = self._transport.request_json(KEEPA_PRODUCT_URL, params)
+                result = self._transport.request_json(url, params)
             except ProviderNetworkError:
                 if attempt < _MAX_RETRIES:
                     self._sleep(_BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)])

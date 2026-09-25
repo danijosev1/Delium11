@@ -780,6 +780,105 @@ def get_agent_runs(conn: sqlite3.Connection, asin: str, marketplace: str) -> lis
     )
 
 
+# ---------------------------------------------------------------------------
+# emerging_runs / emerging_candidates (docs/emerging.md)
+# ---------------------------------------------------------------------------
+def insert_emerging_run(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    marketplace: str,
+    categories: list[int],
+    page_size: int,
+    top_n: int,
+    finder_total_results: int | None,
+    finder_tokens: int,
+) -> str:
+    row_id = _new_id()
+    conn.execute(
+        """
+        INSERT INTO emerging_runs
+            (id, run_id, marketplace, categories, page_size, top_n,
+             finder_total_results, finder_tokens)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row_id,
+            run_id,
+            marketplace,
+            _dumps(categories),
+            page_size,
+            top_n,
+            finder_total_results,
+            finder_tokens,
+        ),
+    )
+    return row_id
+
+
+def insert_emerging_candidate(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    asin: str,
+    marketplace: str,
+    emergence_score: float | None,
+    age_days: int | None,
+    outcome: str,
+    opportunity_score: float | None,
+    verdict: str | None,
+    confidence: str | None,
+    kill_rule: str | None,
+    signals: Any,
+) -> str:
+    row_id = _new_id()
+    conn.execute(
+        """
+        INSERT INTO emerging_candidates
+            (id, run_id, asin, marketplace, emergence_score, age_days, outcome,
+             opportunity_score, verdict, confidence, kill_rule, signals)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row_id,
+            run_id,
+            asin,
+            marketplace,
+            emergence_score,
+            age_days,
+            outcome,
+            opportunity_score,
+            verdict,
+            confidence,
+            kill_rule,
+            _dumps(signals),
+        ),
+    )
+    return row_id
+
+
+def list_emerging_runs(conn: sqlite3.Connection, *, limit: int = 50) -> list[sqlite3.Row]:
+    return _all(
+        conn.execute(
+            "SELECT * FROM emerging_runs ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)
+        )
+    )
+
+
+def get_emerging_candidates(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
+    """Candidates for one emerging run, best emergence first (nulls last)."""
+    return _all(
+        conn.execute(
+            """
+            SELECT * FROM emerging_candidates
+             WHERE run_id = ?
+             ORDER BY (emergence_score IS NULL), emergence_score DESC, asin
+            """,
+            (run_id,),
+        )
+    )
+
+
 def get_latest_agent_run(
     conn: sqlite3.Connection, *, asin: str, marketplace: str, agent: str
 ) -> sqlite3.Row | None:

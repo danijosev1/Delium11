@@ -135,6 +135,81 @@ def _store_normalized(conn: sqlite3.Connection, product: NormalizedProduct, fetc
         )
 
 
+def hydrate_products(
+    asins: list[str],
+    *,
+    run_id: str,
+    client: KeepaClient,
+    config: DeliumConfig,
+    force: bool = False,
+    batch_size: int = 20,
+) -> dict[str, ProductView]:
+    """Cache-first, BATCHED hydration for many ASINs (Keepa allows up to 100
+    ASINs per `/product` call). Cache hits are served from the DB; only the
+    stale/missing ASINs are grouped into batched Keepa calls, so the token spend
+    scales with cache misses, not with the candidate count. Returns the view per
+    ASIN that resolved to a stored product."""
+    marketplace = client.marketplace
+    ttl = timedelta(hours=config.cache.product_ttl_hours)
+    views: dict[str, ProductView] = {}
+    to_fetch: list[str] = []
+
+    if force:
+        to_fetch = list(dict.fromkeys(asins))
+    else:
+        with get_connection() as conn:
+            for asin in dict.fromkeys(asins):
+                latest = repository.latest_raw_fetch(
+                    conn, _PROVIDER, _request_key(marketplace, asin)
+                )
+                if latest is not None and is_fresh(latest["fetched_at"], ttl):
+                    view = _view_from_db(
+                        conn,
+                        asin,
+                        marketplace=marketplace,
+                        from_cache=True,
+                        tokens_used=0,
+                        cost_usd=0.0,
+                    )
+                    if view is not None:
+                        views[asin] = view
+                        continue
+                to_fetch.append(asin)
+
+    for start in range(0, len(to_fetch), batch_size):
+        chunk = to_fetch[start : start + batch_size]
+        fetch = client.fetch_products(chunk)
+        per_asin_tokens = fetch.per_asin_tokens(len(chunk))
+        with get_connection() as conn:
+            for asin in chunk:
+                fetch_id = repository.insert_raw_fetch(
+                    conn,
+                    run_id=run_id,
+                    provider=_PROVIDER,
+                    endpoint=_ENDPOINT,
+                    request_key=_request_key(marketplace, asin),
+                    payload=fetch.raw_products.get(asin, {"asin": asin, "found": False}),
+                    cost_usd=0.0,
+                    tokens_used=per_asin_tokens,
+                    http_status=fetch.http_status,
+                )
+                normalized = fetch.normalized.get(asin)
+                if normalized is None:
+                    continue
+                _store_normalized(conn, normalized, fetch_id)
+                view = _view_from_db(
+                    conn,
+                    asin,
+                    marketplace=marketplace,
+                    from_cache=False,
+                    tokens_used=per_asin_tokens,
+                    cost_usd=0.0,
+                )
+                if view is not None:
+                    views[asin] = view
+    return views
+
+
 def fetch_product(
     asin: str,
     *,

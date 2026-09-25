@@ -16,7 +16,7 @@ from delium.ingestion.cross_market import (
     generate_candidates,
 )
 from delium.ingestion.keywords import KeywordFetchResult, fetch_keywords
-from delium.ingestion.products import ProductView, fetch_product
+from delium.ingestion.products import ProductView, fetch_product, hydrate_products
 from delium.ingestion.reviews import ReviewFetchResult, fetch_reviews
 
 __all__ = [
@@ -30,6 +30,7 @@ __all__ = [
     "discover_cross_market",
     "fetch_keywords",
     "fetch_product",
+    "hydrate_products",
     "fetch_reviews",
     "generate_candidates",
 ]
