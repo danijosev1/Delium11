@@ -97,6 +97,58 @@ def list_validations(conn: sqlite3.Connection, *, limit: int = 50) -> list[sqlit
     )
 
 
+def run_token_total(conn: sqlite3.Connection, run_id: str) -> int:
+    """Total Keepa/provider tokens consumed by one run (from the fetch ledger)."""
+    row = _one(
+        conn.execute(
+            "SELECT COALESCE(SUM(tokens_used), 0) AS t FROM raw_fetches WHERE run_id = ?", (run_id,)
+        )
+    )
+    return int(row["t"]) if row is not None else 0
+
+
+def spend_by_provider_day(conn: sqlite3.Connection, *, days: int = 30) -> list[sqlite3.Row]:
+    """Per-day, per-provider spend + tokens from the fetch ledger (Usage page)."""
+    return _all(
+        conn.execute(
+            """
+            SELECT date(fetched_at) AS day, provider,
+                   COUNT(*) AS calls,
+                   COALESCE(SUM(cost_usd), 0) AS cost_usd,
+                   COALESCE(SUM(tokens_used), 0) AS tokens
+              FROM raw_fetches
+             WHERE fetched_at >= datetime('now', ?)
+             GROUP BY day, provider
+             ORDER BY day DESC, provider
+            """,
+            (f"-{max(1, days)} days",),
+        )
+    )
+
+
+def run_type_summary(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Per-command run count and average cost/tokens (Usage page). Tokens come
+    from the fetch ledger joined by run id."""
+    return _all(
+        conn.execute(
+            """
+            SELECT r.command AS command,
+                   COUNT(*) AS runs,
+                   AVG(r.data_cost_usd) AS avg_data_usd,
+                   AVG(r.llm_cost_usd) AS avg_llm_usd,
+                   AVG(COALESCE(t.tokens, 0)) AS avg_tokens
+              FROM runs r
+              LEFT JOIN (
+                   SELECT run_id, SUM(tokens_used) AS tokens
+                     FROM raw_fetches GROUP BY run_id
+              ) t ON t.run_id = r.id
+             GROUP BY r.command
+             ORDER BY runs DESC
+            """
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # raw_fetches (cache / fetch log / spend ledger)
 # ---------------------------------------------------------------------------

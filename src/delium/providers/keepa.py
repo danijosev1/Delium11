@@ -38,6 +38,7 @@ log = get_logger(__name__)
 
 KEEPA_PRODUCT_URL = "https://api.keepa.com/product"
 KEEPA_QUERY_URL = "https://api.keepa.com/query"  # Product Finder
+KEEPA_TOKEN_URL = "https://api.keepa.com/token"  # token status; costs 0 tokens
 
 # Product Finder token cost (Keepa docs, keepa.com/api-docs/product-finder.html):
 # 10 tokens per request + 1 per 100 ASINs returned.
@@ -88,10 +89,13 @@ _CSV_RATING = 16  # rating, 0-50 (i.e. 45 == 4.5 stars)
 _CSV_COUNT_REVIEWS = 17  # review count
 
 # Reactive throttling / retries.
-_TOKENS_PER_PRODUCT_ESTIMATE = 4  # pre-flight estimate; corrected from responses
+# Keepa /product costs 1 token base + up to 1 for `rating`; `history`/`stats` are
+# free (keepa.com/api-docs/product.html). ~2 tokens/product is the real cost.
+_TOKENS_PER_PRODUCT_ESTIMATE = 2  # pre-flight estimate; corrected from responses
 _MAX_TOKEN_WAIT_S = 300.0
 _MAX_RETRIES = 2  # → 3 attempts total (docs/data-layer.md §1.1: "5xx → 2 retries")
 _BACKOFF_SECONDS = (5.0, 25.0)
+_DEFAULT_TIMEOUT_S = 60.0  # Keepa /product is fast; batching (≤100 ASINs) avoids waits
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +153,15 @@ class FinderResult:
     total_results: int | None
     tokens_consumed: int
     tokens_left: int | None
+
+
+@dataclass(frozen=True)
+class TokenStatus:
+    """Keepa token balance from the `/token` endpoint (costs 0 tokens)."""
+
+    tokens_left: int | None
+    refill_rate: int | None  # tokens per minute
+    refill_in_ms: int | None
 
 
 # ---------------------------------------------------------------------------
@@ -343,11 +356,12 @@ class KeepaClient:
         sleep: Callable[[float], None] = time.sleep,
         marketplace: str = "US",
         domain: int | None = None,
+        timeout: float = _DEFAULT_TIMEOUT_S,
     ) -> None:
         if not api_key:
             raise ProviderConfigError("Keepa API key is required.")
         self._api_key = api_key
-        self._transport = transport or UrllibTransport()
+        self._transport = transport or UrllibTransport(timeout=timeout)
         self._sleep = sleep
         self._marketplace = marketplace
         # `domain` overrides the marketplace mapping when given (back-compat).
@@ -361,14 +375,32 @@ class KeepaClient:
 
     @classmethod
     def from_env(
-        cls, *, transport: Transport | None = None, marketplace: str = "US"
+        cls,
+        *,
+        transport: Transport | None = None,
+        marketplace: str = "US",
+        timeout: float = _DEFAULT_TIMEOUT_S,
     ) -> KeepaClient:
         key = get_secrets().keepa_api_key
         if key is None:
             raise ProviderConfigError(
                 "DELIUM_KEEPA_API_KEY is not set — add it to your environment or .env."
             )
-        return cls(key.get_secret_value(), transport=transport, marketplace=marketplace)
+        return cls(
+            key.get_secret_value(), transport=transport, marketplace=marketplace, timeout=timeout
+        )
+
+    def token_status(self) -> TokenStatus:
+        """Live Keepa token balance via `/token` (costs 0 tokens). Used by the UI
+        Usage page; never exposes the API key."""
+        result = self._request_with_retries({"key": self._api_key}, url=KEEPA_TOKEN_URL)
+        body = result.body if isinstance(result.body, dict) else {}
+        self._absorb_token_state(body)
+        return TokenStatus(
+            tokens_left=_positive_or_none(body.get("tokensLeft")),
+            refill_rate=_positive_or_none(body.get("refillRate")),
+            refill_in_ms=_positive_or_none(body.get("refillIn")),
+        )
 
     def product_finder(self, selection: dict[str, Any]) -> FinderResult:
         """Keepa Product Finder (`GET /query`): return the ASINs matching a
@@ -431,7 +463,13 @@ class KeepaClient:
         rate = self._refill_rate or 1
         deficit = estimated - self._tokens_left
         wait_s = min(ceil(deficit / rate * 60), _MAX_TOKEN_WAIT_S)
-        log.info("Keepa token pacing: waiting %ss for refill.", wait_s)
+        log.info(
+            "waiting %ss for Keepa tokens, tokensLeft=%s, refillRate=%s/min, need=%s",
+            wait_s,
+            self._tokens_left,
+            rate,
+            estimated,
+        )
         self._sleep(wait_s)
         # Assume the wait refilled enough; the next response corrects the count.
         self._tokens_left = estimated

@@ -31,6 +31,24 @@ def verdict_style(verdict_value: str) -> tuple[str, str]:
     return _VERDICT_COLORS.get(verdict_value, (verdict_value.upper(), "#57606a"))
 
 
+# ---------------------------------------------------------------------------
+# Money formatting for Streamlit markdown
+# ---------------------------------------------------------------------------
+def usd_md(amount: float, *, places: int = 2) -> str:
+    """A USD amount for Streamlit markdown with the '$' escaped.
+
+    Streamlit renders `$...$` as LaTeX math, so an unescaped '$' (or a pair around
+    an en-dash, e.g. `$0.00–$2.20`) garbles cost text into an equation. Escaping
+    the sign keeps it literal."""
+    return f"\\${amount:,.{places}f}"
+
+
+def escape_money(text: str) -> str:
+    """Escape every literal '$' in a free-text string so Streamlit markdown does
+    not render it (or a pair of them) as LaTeX math."""
+    return text.replace("$", "\\$")
+
+
 def _usd(cents: int | None) -> float | None:
     return None if cents is None else round(cents / 100, 2)
 
@@ -145,6 +163,64 @@ def discovery_rows(report: Any) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def discovery_killed_rows(report: Any, facts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every cheap-killed candidate with the exact rule(s) + observed/threshold
+    values. Title/price/BSR come from `facts` (the hydrated product), since the
+    kill happens on that product row, not the SERP row."""
+    rows: list[dict[str, Any]] = []
+    for ec in report.killed:
+        f = facts.get(ec.asin, {})
+        scored = ec.scored
+        triggered = [k for k in (scored.kills if scored is not None else ()) if k.kills]
+        rule = "; ".join(f"{k.rule_id} {k.name}" for k in triggered) or (ec.kill_rule or "")
+        actual = "; ".join(k.actual for k in triggered if k.actual)
+        threshold = "; ".join(k.threshold for k in triggered if k.threshold)
+        rows.append(
+            {
+                "asin": ec.asin,
+                "title": f.get("title") or "—",
+                "price_usd": _usd(f.get("price_cents")),
+                "bsr": f.get("bsr"),
+                "kill_rule": rule,
+                "actual": actual,
+                "threshold": threshold,
+                "reason": ec.notes[0] if ec.notes else "",
+            }
+        )
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Usage page (token / spend reporting)
+# ---------------------------------------------------------------------------
+def spend_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    """Per-day, per-provider spend + tokens (from repository.spend_by_provider_day)."""
+    return [
+        {
+            "day": r["day"],
+            "provider": r["provider"],
+            "calls": int(r["calls"]),
+            "cost_usd": round(float(r["cost_usd"]), 4),
+            "tokens": int(r["tokens"]),
+        }
+        for r in rows
+    ]
+
+
+def run_type_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    """Per-command averages (from repository.run_type_summary)."""
+    return [
+        {
+            "command": r["command"],
+            "runs": int(r["runs"]),
+            "avg_data_usd": round(float(r["avg_data_usd"] or 0.0), 4),
+            "avg_llm_usd": round(float(r["avg_llm_usd"] or 0.0), 4),
+            "avg_tokens": round(float(r["avg_tokens"] or 0.0), 1),
+        }
+        for r in rows
+    ]
 
 
 def cross_market_rows(candidates: list[Any]) -> list[dict[str, Any]]:

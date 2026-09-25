@@ -61,8 +61,11 @@ def candidates_from_keyword(
 
     phrase = normalize_phrase(seed)
     rows = repository.get_serp_rankings(conn, phrase, marketplace.value)
+    # Cheap SERP prefilter: sponsored placements are ads, not the organic
+    # competitive set — dropping them before Keepa hydration cuts token spend.
+    organic = [r for r in rows if not r["sponsored"]]
     out: list[Candidate] = []
-    for row in rows[:cap]:
+    for row in organic[:cap]:
         evidence = DiscoveryEvidence(
             source=DiscoverySource.KEYWORD,
             reference=phrase,
@@ -175,16 +178,27 @@ def _candidate_seed(candidate: Candidate) -> str | None:
     return None
 
 
-def _hydrate_cheap(
-    candidate: Candidate, config: DeliumConfig, run_id: str, keepa_factory: KeepaFactory | None
+def _batch_hydrate_cheap(
+    candidates: list[Candidate],
+    config: DeliumConfig,
+    run_id: str,
+    keepa_factory: KeepaFactory | None,
 ) -> None:
-    """Fetch only the candidate's own Keepa quick stats (cheap kill tier)."""
-    if keepa_factory is None:
+    """Batch-hydrate every candidate's Keepa product (cache-first, ≤100 ASINs per
+    call), grouped by marketplace. One or two Keepa calls for a whole run instead
+    of one per ASIN — this is what removes the per-ASIN token-bucket waits."""
+    if keepa_factory is None or not candidates:
         return
-    from delium.ingestion import fetch_product
+    from delium.ingestion import hydrate_products
 
-    client = keepa_factory(candidate.marketplace.value)
-    fetch_product(candidate.asin, run_id=run_id, client=client, config=config)  # type: ignore[arg-type]
+    by_mp: dict[str, list[str]] = {}
+    for cand in candidates:
+        by_mp.setdefault(cand.marketplace.value, []).append(cand.asin)
+    for mp, asins in by_mp.items():
+        try:
+            hydrate_products(asins, run_id=run_id, client=keepa_factory(mp), config=config)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001 — a hydration failure degrades to unresolved candidates
+            log.warning("batched Keepa hydration failed for %s (%d asins)", mp, len(asins))
 
 
 # ---------------------------------------------------------------------------
@@ -317,10 +331,11 @@ def run_discovery(
     # Evaluate with reads on `conn` + hydration via ingestion's own connections.
     # No writes on `conn` happen in this loop, so the inner hydration writes
     # never contend with an open outer transaction (SQLite single-writer).
+    # One batched, cache-first cheap hydration for the whole candidate set, then
+    # cheap kills → (survivors only) full hydration.
+    _batch_hydrate_cheap(discovered, config, run_id, keepa_factory)
     evaluated: list[EvaluatedCandidate] = []
     for cand in discovered:
-        # Cheap hydration → cheap kills → (survivors only) full hydration.
-        _hydrate_cheap(cand, config, run_id, keepa_factory)
         cheap_input, _ = build_scoring_input(
             conn, cand.asin, cand.marketplace, config, cheap_only=True
         )
@@ -363,17 +378,16 @@ def _hydrate_full_serp(
     """Full enrichment with a real connection (keyword cluster + competitors)."""
     if keepa_factory is None and dfs_factory is None:
         return
-    from delium.ingestion import fetch_keywords, fetch_product
+    from delium.ingestion import fetch_keywords, hydrate_products
 
     seed = _candidate_seed(candidate)
     mp = candidate.marketplace.value
     if seed is not None and dfs_factory is not None:
         fetch_keywords(seed, run_id=run_id, client=dfs_factory(mp), config=config)  # type: ignore[arg-type]
-    if keepa_factory is not None:
-        client = keepa_factory(mp)
-        if seed is not None:
-            for row in repository.get_serp_rankings(conn, seed, mp):
-                fetch_product(row["asin"], run_id=run_id, client=client, config=config)  # type: ignore[arg-type]
+    if keepa_factory is not None and seed is not None:
+        comp_asins = [r["asin"] for r in repository.get_serp_rankings(conn, seed, mp)]
+        if comp_asins:  # one batched Keepa call for the competitor pool
+            hydrate_products(comp_asins, run_id=run_id, client=keepa_factory(mp), config=config)  # type: ignore[arg-type]
 
 
 def _evidence_json(e: DiscoveryEvidence) -> dict[str, object]:

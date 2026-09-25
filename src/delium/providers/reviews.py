@@ -45,6 +45,7 @@ _APIFY_DEFAULT_ACTOR = "junglee~amazon-reviews-scraper"
 # Real billing is credit/subscription-based; this is a spend estimate for the ledger.
 _COST_PER_REVIEW = 0.003
 _MAX_REVIEWS = 100  # anonymous ceiling
+_DEFAULT_TIMEOUT_S = 60.0  # review scrapers can be slow
 
 _MAX_RETRIES = 2
 _BACKOFF_SECONDS = (5.0, 25.0)
@@ -247,11 +248,12 @@ class UnwrangleClient:
         *,
         transport: Transport | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        timeout: float = _DEFAULT_TIMEOUT_S,
     ) -> None:
         if not api_key:
             raise ProviderConfigError("Unwrangle API key is required.")
         self._api_key = api_key
-        self._transport = transport or UrllibTransport()
+        self._transport = transport or UrllibTransport(timeout=timeout)
         self._sleep = sleep
 
     def fetch_reviews(self, asin: str) -> ReviewFetch:
@@ -292,12 +294,13 @@ class ApifyClient:
         actor: str = _APIFY_DEFAULT_ACTOR,
         transport: PostTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        timeout: float = _DEFAULT_TIMEOUT_S,
     ) -> None:
         if not api_token:
             raise ProviderConfigError("Apify API token is required.")
         self._api_token = api_token
         self._actor = actor
-        self._transport = transport or UrllibTransport()
+        self._transport = transport or UrllibTransport(timeout=timeout)
         self._sleep = sleep
 
     def fetch_reviews(self, asin: str) -> ReviewFetch:
@@ -343,17 +346,22 @@ class ReviewProviderChain:
 def build_review_provider(
     *,
     transport: Any = None,
+    timeout: float = _DEFAULT_TIMEOUT_S,
 ) -> ReviewProviderChain:
     """Build the review chain from environment secrets (Unwrangle → Apify)."""
     secrets = get_secrets()
     providers: list[UnwrangleClient | ApifyClient] = []
     if secrets.unwrangle_api_key is not None:
         providers.append(
-            UnwrangleClient(secrets.unwrangle_api_key.get_secret_value(), transport=transport)
+            UnwrangleClient(
+                secrets.unwrangle_api_key.get_secret_value(), transport=transport, timeout=timeout
+            )
         )
     if secrets.apify_api_token is not None:
         providers.append(
-            ApifyClient(secrets.apify_api_token.get_secret_value(), transport=transport)
+            ApifyClient(
+                secrets.apify_api_token.get_secret_value(), transport=transport, timeout=timeout
+            )
         )
     if not providers:
         raise ProviderConfigError(

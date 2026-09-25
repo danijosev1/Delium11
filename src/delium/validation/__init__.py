@@ -6,7 +6,7 @@ scoring.py remains the sole owner of the Buy/Test/Avoid verdict; the LLM Review
 Miner and Strategist (G5) are downstream and unimplemented — never faked here.
 """
 
-from delium.validation.hydration import Clients
+from delium.validation.hydration import Clients, looks_like_asin
 from delium.validation.models import (
     HydrationOutcome,
     ReviewEvidence,
@@ -23,6 +23,7 @@ __all__ = [
     "ValidationReport",
     "ValidationRequest",
     "ValidationStatus",
+    "looks_like_asin",
     "run_validation",
     "validation_snapshot",
 ]

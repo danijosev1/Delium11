@@ -36,6 +36,10 @@ log = get_logger(__name__)
 
 _BASE_URL = "https://api.dataforseo.com/v3/"
 
+# The live Amazon SERP endpoint scrapes on demand and can take 20–60s, so the
+# default read timeout is generous; timeouts/5xx are retried with backoff.
+_DEFAULT_TIMEOUT_S = 120.0
+
 # Endpoint paths (all POST, "live" mode).
 _PATH_VOLUME = "dataforseo_labs/amazon/bulk_search_volume/live"
 _PATH_RELATED = "dataforseo_labs/amazon/related_keywords/live"
@@ -233,12 +237,13 @@ class DataForSeoClient:
         transport: PostTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         marketplace: str = "US",
+        timeout: float = _DEFAULT_TIMEOUT_S,
     ) -> None:
         if not login or not password:
             raise ProviderConfigError("DataForSEO login and password are required.")
         token = base64.b64encode(f"{login}:{password}".encode()).decode()
         self._auth_header = f"Basic {token}"
-        self._transport = transport or UrllibTransport()
+        self._transport = transport or UrllibTransport(timeout=timeout)
         self._sleep = sleep
         self._marketplace = marketplace
         (
@@ -253,7 +258,11 @@ class DataForSeoClient:
 
     @classmethod
     def from_env(
-        cls, *, transport: PostTransport | None = None, marketplace: str = "US"
+        cls,
+        *,
+        transport: PostTransport | None = None,
+        marketplace: str = "US",
+        timeout: float = _DEFAULT_TIMEOUT_S,
     ) -> DataForSeoClient:
         secrets = get_secrets()
         if secrets.dataforseo_login is None or secrets.dataforseo_password is None:
@@ -265,6 +274,7 @@ class DataForSeoClient:
             secrets.dataforseo_password.get_secret_value(),
             transport=transport,
             marketplace=marketplace,
+            timeout=timeout,
         )
 
     # -- public endpoint methods --------------------------------------------

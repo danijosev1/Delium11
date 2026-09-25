@@ -25,6 +25,10 @@ def _config() -> Any:
     return load_config()
 
 
+_usd = format.usd_md
+_escape_money = format.escape_money
+
+
 # ---------------------------------------------------------------------------
 # Shared widgets
 # ---------------------------------------------------------------------------
@@ -41,24 +45,27 @@ def _cost_gate(estimate: costs.CostEstimate, action_label: str) -> bool:
     """Render the pre-flight cost panel and return True only when the user has
     confirmed. Cached actions are free and need a single click."""
     if estimate.fully_cached:
-        st.success("Fully cached — this will cost **$0.00** (no provider call).")
+        st.success(f"Fully cached — this will cost **{_usd(0)}** (no provider call).")
         return bool(st.button(f"Run {action_label} (cached)"))
     providers = ", ".join(estimate.providers) or "no providers"
     st.warning(
         f"This will call: **{providers}**.  Estimated cost: "
-        f"**${estimate.est_low_usd:.2f}–${estimate.est_high_usd:.2f}**."
+        f"**{_usd(estimate.est_low_usd)}–{_usd(estimate.est_high_usd)}**."
     )
     for note in estimate.notes:
-        st.caption(f"• {note}")
+        st.caption("• " + _escape_money(note))
     return bool(st.button(f"Confirm & run {action_label}", type="primary"))
 
 
 def _actual_cost(data_usd: float, llm_usd: float = 0.0, *, from_cache: bool | None = None) -> None:
     if from_cache:
-        st.caption("Served from cache — actual cost $0.00.")
+        st.caption(f"Served from cache — actual cost {_usd(0)}.")
         return
     total = data_usd + llm_usd
-    st.caption(f"Actual cost: **${total:.4f}** (data ${data_usd:.4f} + LLM ${llm_usd:.4f}).")
+    st.caption(
+        f"Actual cost: **{_usd(total, places=4)}** "
+        f"(data {_usd(data_usd, places=4)} + LLM {_usd(llm_usd, places=4)})."
+    )
 
 
 def _verdict_banner(verdict_value: str, subtitle: str) -> None:
@@ -107,9 +114,9 @@ def page_keyword_research() -> None:
     vol = f"{result.seed_volume:,}" if result.seed_volume is not None else "—"
     st.metric(f"Search volume · {result.seed}", vol)
     st.subheader("Related keywords")
-    st.dataframe(format.related_rows(result), use_container_width=True, hide_index=True)
+    st.dataframe(format.related_rows(result), width="stretch", hide_index=True)
     st.subheader("Top SERP ASINs")
-    st.dataframe(format.serp_rows(result), use_container_width=True, hide_index=True)
+    st.dataframe(format.serp_rows(result), width="stretch", hide_index=True)
 
 
 def page_product_lookup() -> None:
@@ -214,6 +221,7 @@ def page_validate() -> None:
 
     report = res.report
     _actual_cost(report.data_cost_usd, report.llm_cost_usd)
+    st.caption(f"Keepa tokens used this run: {res.tokens_used}")
     scored = report.scored
     if scored is None:
         st.warning(f"No verdict produced — status: `{report.status.value}`.")
@@ -230,13 +238,13 @@ def page_validate() -> None:
         st.caption("A Buy here would be provisional pending Strategist (G5) concurrence.")
 
     st.subheader("Pillars")
-    st.dataframe(format.pillar_rows(scored), use_container_width=True, hide_index=True)
+    st.dataframe(format.pillar_rows(scored), width="stretch", hide_index=True)
     kills = format.kill_rows(scored)
     if kills:
         st.subheader("Hard kills / borderline")
-        st.dataframe(kills, use_container_width=True, hide_index=True)
+        st.dataframe(kills, width="stretch", hide_index=True)
     st.subheader("Gates")
-    st.dataframe(format.gate_rows(scored), use_container_width=True, hide_index=True)
+    st.dataframe(format.gate_rows(scored), width="stretch", hide_index=True)
 
     with st.expander("Full report (Markdown)", expanded=False):
         st.markdown(res.markdown)
@@ -273,20 +281,50 @@ def page_discover() -> None:
         return
     try:
         with st.spinner("Discovering candidates…"):
-            report = services.discover(keywords, marketplace, config, force=force)
+            res = services.discover(keywords, marketplace, config, force=force)
     except (ProviderError, ConfigError) as exc:
         st.error(f"Discovery failed: {exc}")
         return
 
+    report = res.report
     st.caption(
         f"discovered {report.discovered_count} · ranked {len(report.ranked)} · "
-        f"killed {len(report.killed)} · unresolved {len(report.unresolved)}"
+        f"killed {len(report.killed)} · unresolved {len(report.unresolved)} · "
+        f"Keepa tokens used: {res.tokens_used}"
     )
     rows = format.discovery_rows(report)
     if rows:
-        st.dataframe(rows, use_container_width=True, hide_index=True)
-    else:
-        st.info("No candidates survived to scoring (add Keepa to hydrate & score them).")
+        st.subheader("Ranked candidates")
+        st.dataframe(rows, width="stretch", hide_index=True)
+
+    if report.killed:
+        st.subheader(f"Eliminated by hard kills ({len(report.killed)})")
+        st.caption(
+            "Every killed candidate with the exact rule(s) and observed vs. threshold value."
+        )
+        facts = services.discovery_product_facts(report)
+        st.dataframe(format.discovery_killed_rows(report, facts), width="stretch", hide_index=True)
+
+    if not rows:
+        # Explain WHY nothing was ranked, precisely — the old message wrongly
+        # blamed missing Keepa even when candidates were hydrated and then killed.
+        if not credentials.is_configured("keepa"):
+            st.info(
+                "No candidates were scored because Keepa is not configured — they were "
+                "surfaced but could not be hydrated. Add DELIUM_KEEPA_API_KEY to score them."
+            )
+        elif report.killed:
+            st.info(
+                "Every candidate was eliminated by a hard kill — see the table above for the "
+                "exact rule and value that killed each one."
+            )
+        elif report.unresolved:
+            st.info(
+                "Candidates were surfaced but could not be hydrated (no product data yet). "
+                "Try again, or check Keepa token availability on the Usage page."
+            )
+        else:
+            st.info("No candidates were surfaced for these seed keyword(s).")
 
 
 def page_emerging() -> None:
@@ -330,7 +368,7 @@ def page_emerging() -> None:
         "worst case — cache is reused)."
     )
     for note in est.notes:
-        st.caption(f"• {note}")
+        st.caption("• " + _escape_money(note))
     if not st.button("Confirm & run emerging search", type="primary"):
         return
     try:
@@ -349,13 +387,13 @@ def page_emerging() -> None:
     ranked = format.emerging_rows(list(report.ranked))
     if ranked:
         st.subheader("Emerging candidates (emergence signal)")
-        st.dataframe(ranked, use_container_width=True, hide_index=True)
+        st.dataframe(ranked, width="stretch", hide_index=True)
     else:
         st.info("No emerging candidates survived scoring.")
     killed = format.emerging_killed_rows(list(report.killed))
     if killed:
         st.subheader("Emerging but hard-killed (excluded, reasons shown)")
-        st.dataframe(killed, use_container_width=True, hide_index=True)
+        st.dataframe(killed, width="stretch", hide_index=True)
 
 
 def page_cross_market() -> None:
@@ -385,7 +423,7 @@ def page_cross_market() -> None:
         return
     rows = format.cross_market_rows(candidates)
     if rows:
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
     else:
         st.info(
             "No qualifying candidates. Fetch source products/keywords first "
@@ -400,7 +438,7 @@ def page_history() -> None:
     st.subheader("Recent validations")
     vals = format.validation_rows(services.recent_validations())
     if vals:
-        st.dataframe(vals, use_container_width=True, hide_index=True)
+        st.dataframe(vals, width="stretch", hide_index=True)
     else:
         st.caption("none yet")
 
@@ -412,7 +450,7 @@ def page_history() -> None:
         ]
         idx = st.selectbox("Emerging run", range(len(em_runs)), format_func=lambda i: labels[i])
         cands = format.emerging_candidate_rows(services.emerging_candidates(em_runs[idx]["run_id"]))
-        st.dataframe(cands, use_container_width=True, hide_index=True) if cands else st.caption(
+        st.dataframe(cands, width="stretch", hide_index=True) if cands else st.caption(
             "no candidates"
         )
     else:
@@ -421,7 +459,7 @@ def page_history() -> None:
     st.subheader("Recent runs")
     runs = format.run_rows(services.recent_runs())
     if runs:
-        st.dataframe(runs, use_container_width=True, hide_index=True)
+        st.dataframe(runs, width="stretch", hide_index=True)
     else:
         st.caption("none yet")
 
@@ -435,6 +473,48 @@ def page_history() -> None:
     st.markdown(services.read_report(files[choice]["path"]))
 
 
+def page_usage() -> None:
+    st.header("Usage")
+    st.caption(
+        "Keepa token balance, and spend / tokens per provider and per run type — "
+        "all from the local database and a free Keepa token check. API keys are never shown."
+    )
+
+    st.subheader("Keepa tokens")
+    if not credentials.is_configured("keepa"):
+        st.info("Keepa is not configured — set DELIUM_KEEPA_API_KEY to see the live token balance.")
+    else:
+        status = services.keepa_token_status()
+        if status is None:
+            st.warning("Could not read the Keepa token balance right now.")
+        else:
+            c1, c2 = st.columns(2)
+            left = "—" if status.tokens_left is None else f"{status.tokens_left:,}"
+            c1.metric("Tokens left", left)
+            c2.metric(
+                "Refill rate",
+                "—" if status.refill_rate is None else f"{status.refill_rate:,}/min",
+            )
+            st.caption("Live from Keepa's `/token` endpoint (costs 0 tokens).")
+
+    st.subheader("Spend & tokens per provider (last 30 days)")
+    spend = format.spend_rows(services.spend_by_provider_day(days=30))
+    if spend:
+        st.dataframe(spend, width="stretch", hide_index=True)
+    else:
+        st.caption("no fetches recorded yet")
+
+    st.subheader("Cost & tokens per run type")
+    st.caption(
+        "Average data spend, LLM spend, and Keepa tokens per validate / discover / emerging run."
+    )
+    summary = format.run_type_rows(services.run_type_summary())
+    if summary:
+        st.dataframe(summary, width="stretch", hide_index=True)
+    else:
+        st.caption("no runs recorded yet")
+
+
 _PAGES = {
     "Keyword research": page_keyword_research,
     "Product lookup": page_product_lookup,
@@ -443,6 +523,7 @@ _PAGES = {
     "Emerging": page_emerging,
     "Cross-market": page_cross_market,
     "History": page_history,
+    "Usage": page_usage,
 }
 
 

@@ -420,8 +420,10 @@ def discover(
             dfs_factory=dfs_factory,
         )
         repository.finish_run(conn, run_id, status="complete")
+        tokens = repository.run_token_total(conn, run_id)
 
     _render_discovery(report, limit or config.discovery.max_ranked)
+    console.print(f"\n[dim]Keepa tokens used this run: {tokens}[/dim]")
 
 
 def _render_discovery(report: object, limit: int) -> None:
@@ -583,8 +585,10 @@ def validate(
             data_cost_usd=report.data_cost_usd,
             llm_cost_usd=report.llm_cost_usd,
         )
+        tokens = repository.run_token_total(conn, run_id)
 
     _render_validation(report)
+    console.print(f"\n[dim]Keepa tokens used this run: {tokens}[/dim]")
     if not terminal:
         raise typer.Exit(code=1)
 
@@ -659,7 +663,7 @@ def _refresh_discovery_data(
     product and re-pull its linked seed keyword cluster in the source and every
     target marketplace. Requires provider credentials; degrades to a warning if
     they are absent. This is where the marketplace flows CLI → provider → cache."""
-    from delium.ingestion import fetch_keywords, fetch_product
+    from delium.ingestion import fetch_keywords, hydrate_products
 
     try:
         keepa = KeepaClient.from_env(marketplace=source_mp)
@@ -669,9 +673,13 @@ def _refresh_discovery_data(
         console.print(f"[yellow]--force refresh skipped:[/yellow] {exc}")
         return
 
+    # One batched Keepa call for all source candidates (≤100 ASINs/call).
+    try:
+        hydrate_products(asins, run_id=run_id, client=keepa, config=config, force=True)  # type: ignore[arg-type]
+    except ProviderError as exc:
+        console.print(f"[yellow]source product refresh failed:[/yellow] {exc}")
     for asin in asins:
         try:
-            fetch_product(asin, run_id=run_id, client=keepa, config=config, force=True)  # type: ignore[arg-type]
             with get_connection() as conn:
                 seeds = repository.get_serp_keyword_phrases(conn, asin, source_mp)
             for seed in seeds[:1]:  # primary cluster only

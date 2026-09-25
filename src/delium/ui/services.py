@@ -124,6 +124,13 @@ def product_lookup(
 class ValidateResult:
     report: Any  # ValidationReport
     markdown: str
+    tokens_used: int = 0
+
+
+@dataclass(frozen=True)
+class DiscoverResult:
+    report: Any  # DiscoveryReport
+    tokens_used: int = 0
 
 
 def validate(
@@ -171,7 +178,8 @@ def validate(
             data_cost_usd=report.data_cost_usd,
             llm_cost_usd=report.llm_cost_usd,
         )
-    return ValidateResult(report=report, markdown=render_report(report))
+        tokens = repository.run_token_total(conn, run_id)
+    return ValidateResult(report=report, markdown=render_report(report), tokens_used=tokens)
 
 
 def render_report(report: Any) -> str:
@@ -206,7 +214,9 @@ def _review_quotes(asin: str | None, ids: list[str]) -> dict[str, tuple[int, str
 # ---------------------------------------------------------------------------
 # Discover  (== `discover`)
 # ---------------------------------------------------------------------------
-def discover(keywords: list[str], marketplace: str, config: DeliumConfig, *, force: bool) -> Any:
+def discover(
+    keywords: list[str], marketplace: str, config: DeliumConfig, *, force: bool
+) -> DiscoverResult:
     from delium.discovery import run_discovery
 
     initialize_database()
@@ -236,7 +246,8 @@ def discover(keywords: list[str], marketplace: str, config: DeliumConfig, *, for
             dfs_factory=dfs_factory,
         )
         repository.finish_run(conn, run_id, status="complete")
-    return report
+        tokens = repository.run_token_total(conn, run_id)
+    return DiscoverResult(report=report, tokens_used=tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +316,53 @@ def emerging(
     return report
 
 
+def discovery_product_facts(report: Any) -> dict[str, dict[str, Any]]:
+    """Title + latest price/BSR for a discovery report's killed candidates (DB
+    reads only). Lets the UI show a full kill table — the price/BSR come from the
+    hydrated product row + its newest history point, since the SERP table stores
+    neither."""
+    facts: dict[str, dict[str, Any]] = {}
+    with get_connection() as conn:
+        for ec in report.killed:
+            row = repository.get_product(conn, ec.asin, ec.marketplace.value)
+            history = repository.get_price_bsr_history(conn, ec.asin)
+            latest = history[-1] if history else None
+            facts[ec.asin] = {
+                "title": row["title"] if row is not None else None,
+                "price_cents": latest["price_cents"] if latest is not None else None,
+                "bsr": latest["bsr"] if latest is not None else None,
+            }
+    return facts
+
+
+# ---------------------------------------------------------------------------
+# Usage page (token/spend reporting — DB reads + a free Keepa /token call)
+# ---------------------------------------------------------------------------
+def keepa_token_status() -> Any | None:
+    """Live Keepa token balance + refill rate (a free `/token` call, 0 tokens).
+    Returns None when Keepa is not configured or the call fails — never the key."""
+    try:
+        client = KeepaClient.from_env()
+    except ProviderError:
+        return None
+    try:
+        return client.token_status()
+    except ProviderError:
+        return None
+
+
+def spend_by_provider_day(days: int = 30) -> list[sqlite3.Row]:
+    initialize_database()
+    with get_connection() as conn:
+        return repository.spend_by_provider_day(conn, days=days)
+
+
+def run_type_summary() -> list[sqlite3.Row]:
+    initialize_database()
+    with get_connection() as conn:
+        return repository.run_type_summary(conn)
+
+
 def recent_emerging_runs(limit: int = 25) -> list[sqlite3.Row]:
     initialize_database()
     with get_connection() as conn:
@@ -357,10 +415,13 @@ def _mtime(path: Any) -> str:
 
 # Re-export for the history page date helper / typing convenience.
 __all__ = [
+    "DiscoverResult",
     "ProductLookup",
     "ValidateResult",
     "cross_market",
     "discover",
+    "discovery_product_facts",
+    "keepa_token_status",
     "keyword_research",
     "product_lookup",
     "read_report",
@@ -368,5 +429,7 @@ __all__ = [
     "recent_validations",
     "render_report",
     "report_files",
+    "run_type_summary",
+    "spend_by_provider_day",
     "validate",
 ]

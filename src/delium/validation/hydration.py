@@ -24,7 +24,7 @@ from delium.agents.llm import LlmClient
 from delium.analysis.models import Marketplace
 from delium.config.models import DeliumConfig
 from delium.database import repository
-from delium.ingestion import fetch_keywords, fetch_product, fetch_reviews
+from delium.ingestion import fetch_keywords, fetch_product, fetch_reviews, hydrate_products
 from delium.ingestion.reviews import ReviewSource
 from delium.providers import ProviderError
 from delium.utils.logging import get_logger
@@ -36,6 +36,19 @@ DfsFactory = Callable[[str], object]
 
 _ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
 _URL_ASIN_RE = re.compile(r"/(?:dp|gp/product|product|gp/aw/d)/([A-Z0-9]{10})", re.IGNORECASE)
+
+
+def looks_like_asin(raw: str) -> str | None:
+    """Return the normalized (upper-cased) ASIN if `raw` is a bare ASIN, else None.
+
+    An ASIN is 10 alphanumerics with at least one digit (a plain 10-letter word is
+    treated as a keyword, not an ASIN). Surrounding whitespace and case are
+    tolerated so `' b0f543r23m '` resolves the same as `B0F543R23M`. Pure regex —
+    never a model (ARCHITECTURE §5)."""
+    candidate = raw.strip().upper()
+    if _ASIN_RE.match(candidate) and any(ch.isdigit() for ch in candidate):
+        return candidate
+    return None
 
 
 @dataclass(frozen=True)
@@ -101,8 +114,8 @@ def resolve_target(
         asin = url_match.group(1).upper()
         return TargetResolution(asin=asin, seed=_primary_seed(conn, asin, marketplace))
 
-    if _ASIN_RE.match(raw.upper()) and any(ch.isdigit() for ch in raw):
-        asin = raw.upper()
+    asin = looks_like_asin(raw)
+    if asin is not None:
         return TargetResolution(asin=asin, seed=_primary_seed(conn, asin, marketplace))
 
     # Otherwise treat as a keyword seed → SERP → top organic ASIN.
@@ -218,19 +231,20 @@ def hydrate_cluster(
             : config.discovery.max_candidates_per_seed
         ]
     ]
-    if clients.keepa is not None:
-        for comp_asin in competitor_asins:
-            try:
-                fetch_product(
-                    comp_asin,
-                    run_id=run_id,
-                    client=clients.keepa(marketplace.value),  # type: ignore[arg-type]
-                    config=config,
-                    force=force,
-                )
-                hydrated += 1
-            except ProviderError as exc:
-                notes.append(f"competitor {comp_asin} fetch failed: {exc}")
+    if clients.keepa is not None and competitor_asins:
+        # One batched, cache-first Keepa call (≤100 ASINs) instead of one call per
+        # competitor — avoids per-ASIN token-bucket waits (was ~20–30s each).
+        try:
+            views = hydrate_products(
+                competitor_asins,
+                run_id=run_id,
+                client=clients.keepa(marketplace.value),  # type: ignore[arg-type]
+                config=config,
+                force=force,
+            )
+            hydrated = len(views)
+        except ProviderError as exc:
+            notes.append(f"competitor hydration failed: {exc}")
     return FetchTally(cost_usd=cost, count=hydrated, notes=tuple(notes))
 
 
