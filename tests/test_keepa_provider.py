@@ -161,6 +161,58 @@ def test_missing_products_array_raises() -> None:
         client.fetch_product(DEFAULT_ASIN)
 
 
+def test_missing_products_error_reports_status_tokens_and_keepa_error_no_key_leak() -> None:
+    # A products-less Keepa reply must surface HTTP status, tokensLeft, and
+    # Keepa's own error message — but never the API key.
+    error_body = {"tokensLeft": 1200, "error": {"message": "Not enough tokens"}}
+    client = KeepaClient(
+        "SUPER_SECRET_KEY_123", transport=FakeTransport([ok(error_body)]), sleep=lambda _: None
+    )
+    with pytest.raises(ProviderResponseError) as excinfo:
+        client.fetch_product(DEFAULT_ASIN)
+    message = str(excinfo.value)
+    assert "HTTP 200" in message
+    assert "tokensLeft=1200" in message
+    assert "Not enough tokens" in message
+    assert "SUPER_SECRET_KEY_123" not in message  # key must never appear in errors
+
+
+def test_fetch_product_decodes_a_real_gzip_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    # End-to-end reproduction of the reported bug: Keepa gzips every response.
+    # Drive the REAL UrllibTransport with a gzip body and confirm the product
+    # parses (before the fix this raised "missing 'products' array").
+    import email.message
+    import gzip
+    import json
+    import urllib.request
+
+    from delium.providers.base import UrllibTransport
+
+    body = gzip.compress(json.dumps(keepa_product_body()).encode("utf-8"))
+
+    class _Resp:
+        status = 200
+
+        def __init__(self) -> None:
+            self.headers = email.message.Message()
+            self.headers["Content-Encoding"] = "gzip"
+
+        def read(self) -> bytes:
+            return body
+
+        def __enter__(self) -> _Resp:
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _Resp())
+    client = KeepaClient("test-key", transport=UrllibTransport(), sleep=lambda _: None)
+    result = client.fetch_product(DEFAULT_ASIN)
+    assert DEFAULT_ASIN in result.normalized
+    assert result.tokens_left == 300
+
+
 def test_empty_api_key_rejected() -> None:
     from delium.providers.base import ProviderConfigError
 

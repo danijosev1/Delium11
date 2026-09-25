@@ -233,6 +233,27 @@ def _is_found(raw: dict[str, Any]) -> bool:
     return bool(isinstance(csv, list) and any(csv))
 
 
+def _keepa_error_detail(result: HttpResult) -> str:
+    """Diagnostics for a Keepa response that carried no products — HTTP status,
+    tokensLeft, and Keepa's own error message. Built only from the response body
+    and status; the request URL/params (which hold the API key) are never
+    referenced, so the key can never leak into an error."""
+    parts = [f"HTTP {result.status}"]
+    body = result.body
+    if isinstance(body, dict):
+        tokens = body.get("tokensLeft")
+        if tokens is not None:
+            parts.append(f"tokensLeft={tokens}")
+        error = body.get("error")
+        if error:
+            if isinstance(error, dict):
+                error = error.get("message") or error.get("type") or error
+            parts.append(f"keepa_error={str(error)[:200]}")
+    else:
+        parts.append(f"body_type={type(body).__name__}")
+    return ", ".join(parts)
+
+
 def normalize_product(raw: dict[str, Any], marketplace: str = "US") -> NormalizedProduct:
     """Map one raw Keepa product dict into our `NormalizedProduct`."""
     csv = raw.get("csv") or []
@@ -408,7 +429,9 @@ class KeepaClient:
 
         products = body.get("products")
         if not isinstance(products, list):
-            raise ProviderResponseError("Keepa response missing 'products' array.")
+            raise ProviderResponseError(
+                f"Keepa response missing 'products' array ({_keepa_error_detail(result)})."
+            )
 
         by_asin: dict[str, dict[str, Any]] = {}
         for entry in products:
