@@ -62,7 +62,10 @@ def test_build_finder_selection_overrides() -> None:
 def test_finder_token_estimate() -> None:
     assert finder_token_estimate(50) == 11  # 10 + ceil(50/100)
     assert finder_token_estimate(250) == 13  # 10 + 3
-    assert estimate_tokens(CFG).finder_tokens == finder_token_estimate(CFG.emerging.page_size)
+    # Sub-band sampling issues one finder call per sub-band, each over ~page/bands.
+    bands = DATA.finder.sub_bands
+    per_band = max(1, -(-CFG.emerging.page_size // bands))
+    assert estimate_tokens(CFG).finder_tokens == bands * finder_token_estimate(per_band)
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +178,8 @@ def test_run_emerging_routes_killed_and_scored(initialized_db: Path) -> None:
             _product_entry("B0CHEAP002", price_cents=800, bsr=1500, reviews=15, age_days=50),
         ],
     }
-    transport = FakeTransport([ok(finder), ok(products)])
+    # One finder call per BSR sub-band, then the batched product hydration call.
+    transport = FakeTransport([ok(finder)] * DATA.finder.sub_bands + [ok(products)])
     client = KeepaClient("k", transport=transport, marketplace="US", sleep=lambda _: None)
 
     with get_connection() as conn:
@@ -205,7 +209,8 @@ def test_run_emerging_routes_killed_and_scored(initialized_db: Path) -> None:
         rows = repository.get_emerging_candidates(conn, run_id)
         runs = repository.list_emerging_runs(conn, limit=5)
     assert {r["asin"] for r in rows} == {"B0GOOD0001", "B0CHEAP002"}
-    assert runs and runs[0]["finder_total_results"] == 2
+    # finder_total_results sums each sub-band's reported total (same fake per band).
+    assert runs and runs[0]["finder_total_results"] == 2 * DATA.finder.sub_bands
 
 
 def test_title_seed_from_product(initialized_db: Path) -> None:

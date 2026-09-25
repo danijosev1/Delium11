@@ -224,14 +224,15 @@ def upsert_product(
     amazon_on_listing: bool = False,
     gtin: str | None = None,
     manufacturer: str | None = None,
+    parent_asin: str | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO products
             (asin, marketplace, title, brand, category_path, listing_date,
              dims_json, weight_g, size_tier, images_count, amazon_on_listing,
-             gtin, manufacturer, fetch_id, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+             gtin, manufacturer, parent_asin, fetch_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(asin) DO UPDATE SET
             marketplace = excluded.marketplace,
             title = excluded.title,
@@ -245,6 +246,7 @@ def upsert_product(
             amazon_on_listing = excluded.amazon_on_listing,
             gtin = excluded.gtin,
             manufacturer = excluded.manufacturer,
+            parent_asin = excluded.parent_asin,
             fetch_id = excluded.fetch_id,
             updated_at = datetime('now')
         """,
@@ -262,6 +264,7 @@ def upsert_product(
             int(amazon_on_listing),
             gtin,
             manufacturer,
+            parent_asin,
             fetch_id,
         ),
     )
@@ -281,6 +284,18 @@ def get_product(
             (asin, marketplace),
         )
     )
+
+
+def get_parent_map(
+    conn: sqlite3.Connection, asins: list[str], marketplace: str
+) -> dict[str, str | None]:
+    """Map each ASIN to its stored Keepa parent ASIN (None when standalone or not
+    stored). Used to collapse variations to one row per parent listing."""
+    out: dict[str, str | None] = {}
+    for asin in dict.fromkeys(asins):
+        row = get_product(conn, asin, marketplace)
+        out[asin] = row["parent_asin"] if row is not None else None
+    return out
 
 
 def get_products_by_marketplace(

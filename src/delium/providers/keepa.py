@@ -124,6 +124,7 @@ class NormalizedProduct:
     amazon_on_listing: bool
     gtin: str | None = None  # best barcode (EAN preferred, else UPC) — for identity
     manufacturer: str | None = None
+    parent_asin: str | None = None  # Keepa `parentAsin` — variation grouping
     history: list[PriceBsrPoint] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -337,6 +338,7 @@ def normalize_product(raw: dict[str, Any], marketplace: str = "US") -> Normalize
         amazon_on_listing=bool(amazon),
         gtin=_extract_gtin(raw),
         manufacturer=_clean_str(raw.get("manufacturer")),
+        parent_asin=_clean_str(raw.get("parentAsin")),
         history=history,
         raw=raw,
     )

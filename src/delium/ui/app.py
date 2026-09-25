@@ -292,9 +292,11 @@ def page_discover() -> None:
         f"killed {len(report.killed)} · unresolved {len(report.unresolved)} · "
         f"Keepa tokens used: {res.tokens_used}"
     )
-    rows = format.discovery_rows(report)
+    ranked_asins = [ec.asin for ec in report.ranked if ec.scored is not None]
+    parents = services.parent_map(ranked_asins, marketplace)
+    rows = format.discovery_rows(report, parents)
     if rows:
-        st.subheader("Ranked candidates")
+        st.subheader("Ranked candidates (variations collapsed by parent)")
         st.dataframe(rows, width="stretch", hide_index=True)
 
     if report.killed:
@@ -384,16 +386,68 @@ def page_emerging() -> None:
         f"Product Finder matched {report.finder_total_results or 0} total · "
         f"tokens used: {report.finder_tokens} finder + {report.product_tokens} product."
     )
-    ranked = format.emerging_rows(list(report.ranked))
-    if ranked:
-        st.subheader("Emerging candidates (emergence signal)")
-        st.dataframe(ranked, width="stretch", hide_index=True)
+    if report.ranked:
+        facts, parents = services.emerging_facts(report)
+        st.subheader("Emerging candidates (one row per parent listing)")
+        st.caption(
+            "Variations are collapsed to one row per parent (variation count shown). "
+            "A blank pillar column means that pillar is *unknown* (no data yet) — it "
+            "lowers confidence, it is not scored as 0."
+        )
+        st.dataframe(
+            format.emerging_rich_rows(list(report.ranked), facts, parents),
+            width="stretch",
+            hide_index=True,
+        )
+        _emerging_cards(report, facts)
     else:
         st.info("No emerging candidates survived scoring.")
     killed = format.emerging_killed_rows(list(report.killed))
     if killed:
         st.subheader("Emerging but hard-killed (excluded, reasons shown)")
         st.dataframe(killed, width="stretch", hide_index=True)
+
+
+def _emerging_cards(report: Any, facts: dict[str, Any]) -> None:
+    """Deterministic plain-English card per ranked candidate (no LLM)."""
+    from delium.discovery.diagnostics import diagnose_scored
+    from delium.reports.cards import CardFacts, build_card
+
+    st.subheader("What each result means")
+    for c in report.ranked:
+        s = c.evaluated.scored
+        if s is None:
+            continue
+        diag = diagnose_scored(c.asin, report.marketplace.value, s)
+        f = facts.get(c.asin, {})
+        card = build_card(
+            diag,
+            CardFacts(
+                title=f.get("title"),
+                brand=f.get("brand"),
+                category=f.get("category"),
+                price_cents=f.get("price_cents"),
+                bsr=f.get("bsr"),
+                reviews=f.get("reviews"),
+                age_days=c.emergence.age_days,
+                monthly_units=f.get("monthly_units"),
+                emergence=c.emergence.emergence_score,
+                established_brand=getattr(c, "established_brand", False),
+            ),
+        )
+        with st.expander(_escape_money(card.headline)):
+            for label, items in (
+                ("Why it looks promising", card.promising),
+                ("Why confidence is low", card.low_confidence),
+                ("What would raise it", card.to_raise),
+            ):
+                if items:
+                    st.markdown(f"**{label}:**")
+                    for it in items:
+                        st.markdown("- " + _escape_money(it))
+            for flag in card.flags:
+                st.warning(_escape_money(flag))
+            st.markdown("**Next:** " + _escape_money(card.next_action))
 
 
 def page_cross_market() -> None:
@@ -421,7 +475,8 @@ def page_cross_market() -> None:
     except (ProviderError, ConfigError) as exc:
         st.error(f"Cross-market failed: {exc}")
         return
-    rows = format.cross_market_rows(candidates)
+    parents = services.parent_map([c.source_asin for c in candidates], source)
+    rows = format.cross_market_rows(candidates, parents)
     if rows:
         st.dataframe(rows, width="stretch", hide_index=True)
     else:

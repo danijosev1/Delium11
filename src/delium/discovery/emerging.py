@@ -26,8 +26,9 @@ from delium.analysis.curves import theil_sen
 from delium.analysis.emerging import (
     EmergenceInput,
     EmergenceSignal,
-    build_finder_selection,
+    build_finder_selections,
     compute_emergence,
+    is_established_brand,
     load_emerging_data,
 )
 from delium.analysis.models import Marketplace
@@ -61,6 +62,7 @@ class EmergingCandidate:
     evaluated: EvaluatedCandidate
     emergence: EmergenceSignal
     keyword_volume: int | None = None
+    established_brand: bool = False  # flagged large brand (likely ad-driven launch)
 
     @property
     def asin(self) -> str:
@@ -97,8 +99,15 @@ class TokenEstimate:
 def estimate_tokens(config: DeliumConfig) -> TokenEstimate:
     """Pre-flight Keepa token estimate for one emerging run (worst case: every
     Product Finder result is a cache miss needing a product fetch)."""
+    from delium.analysis.emerging import load_emerging_data
+
     page = config.emerging.page_size
-    return TokenEstimate(finder_token_estimate(page), page * _PRODUCT_TOKENS_EST)
+    bands = max(1, load_emerging_data(config.emerging.data_version).finder.sub_bands)
+    # One finder call per sub-band; each returns up to ~page/bands ASINs, so the
+    # per-band finder cost is smaller but there are `bands` of them.
+    per_band = max(1, -(-page // bands))
+    finder_tokens = bands * finder_token_estimate(per_band)
+    return TokenEstimate(finder_tokens, page * _PRODUCT_TOKENS_EST)
 
 
 # ---------------------------------------------------------------------------
@@ -229,15 +238,29 @@ def run_emerging(
         )
 
     client = cast(KeepaClient, keepa_factory(marketplace.value))
-    selection = build_finder_selection(
+    selections = build_finder_selections(
         data,
         as_of=as_of,
         category_ids=category_ids,
         per_page=config.emerging.page_size,
         overrides=overrides,
     )
-    finder = client.product_finder(selection)
-    asins = list(finder.asins[: config.emerging.page_size])
+    # One finder call per BSR sub-band; merge the ASIN lists (dedup, order-stable)
+    # so the candidate pool spans the whole band instead of only its top edge.
+    asins: list[str] = []
+    seen: set[str] = set()
+    finder_tokens = 0
+    finder_total: int | None = None
+    for selection in selections:
+        finder = client.product_finder(selection)
+        finder_tokens += finder.tokens_consumed
+        if finder.total_results is not None:
+            finder_total = (finder_total or 0) + finder.total_results
+        for a in finder.asins:
+            if a not in seen:
+                seen.add(a)
+                asins.append(a)
+    asins = asins[: config.emerging.page_size]
 
     from delium.ingestion import hydrate_products
 
@@ -275,8 +298,17 @@ def run_emerging(
             ),
         )
         evaluated, _prov = _evaluate(conn, candidate, config)
+        view = views.get(asin)
+        flagged = is_established_brand(
+            view.brand if view is not None else None, data.established_brands
+        )
         candidates.append(
-            EmergingCandidate(evaluated, signals[asin], keyword_volume=kw_volume.get(asin))
+            EmergingCandidate(
+                evaluated,
+                signals[asin],
+                keyword_volume=kw_volume.get(asin),
+                established_brand=flagged,
+            )
         )
 
     ranked = tuple(c for c in candidates if c.outcome is CandidateOutcome.SCORED)
@@ -289,8 +321,8 @@ def run_emerging(
         ranked=ranked,
         killed=killed,
         unresolved=unresolved,
-        finder_total_results=finder.total_results,
-        finder_tokens=finder.tokens_consumed,
+        finder_total_results=finder_total,
+        finder_tokens=finder_tokens,
         product_tokens=product_tokens,
     )
     if persist:

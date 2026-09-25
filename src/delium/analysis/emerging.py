@@ -50,6 +50,8 @@ class FinderThresholds:
     price_max_cents: int
     reviews_max: int
     exclude_amazon: bool
+    sub_bands: int = 1  # split the BSR band into N log-spaced sub-ranges
+    sort_field: str = "current_SALES"  # Keepa finder sort key within each sub-band
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,7 @@ class EmergingData:
     version: str
     finder: FinderThresholds
     emergence: EmergenceThresholds
+    established_brands: tuple[str, ...] = ()  # large brands to FLAG (never score)
 
 
 def load_emerging_data(version: str = DEFAULT_VERSION) -> EmergingData:
@@ -81,6 +84,7 @@ def load_emerging_data(version: str = DEFAULT_VERSION) -> EmergingData:
         raise EmergingError(f"Emerging thresholds {version!r} not found at {path}.")
     raw = tomllib.loads(path.read_text(encoding="utf-8"))
     f, e = raw["finder"], raw["emergence"]
+    brands = raw.get("brands", {}).get("established", [])
     return EmergingData(
         version=str(raw["version"]),
         finder=FinderThresholds(
@@ -91,7 +95,10 @@ def load_emerging_data(version: str = DEFAULT_VERSION) -> EmergingData:
             price_max_cents=int(f["price_max_cents"]),
             reviews_max=int(f["reviews_max"]),
             exclude_amazon=bool(f["exclude_amazon"]),
+            sub_bands=max(1, int(f.get("sub_bands", 1))),
+            sort_field=str(f.get("sort_field", "current_SALES")),
         ),
+        established_brands=tuple(str(b).strip().lower() for b in brands if str(b).strip()),
         emergence=EmergenceThresholds(
             young_days=float(e["young_days"]),
             old_days=float(e["old_days"]),
@@ -144,13 +151,88 @@ def build_finder_selection(
         "productType": [0, 1],  # physical products only
         "page": page,
         "perPage": per_page,
-        "sort": [["current_SALES", "asc"]],  # best-selling (lowest BSR) first
+        "sort": [[f.sort_field, "asc"]],  # best-selling (lowest BSR) first within the band
     }
     if f.exclude_amazon:
         selection["buyBoxIsAmazon"] = False
     if category_ids:
         selection["rootCategory"] = list(category_ids)
     return selection
+
+
+def _log_band_edges(lo: int, hi: int, bands: int) -> list[int]:
+    """`bands + 1` log-spaced integer edges spanning [lo, hi] (inclusive). Log
+    spacing matches BSR's scale — sales fall off geometrically with rank, so equal
+    log steps give sub-bands with comparable product density."""
+    from math import log10
+
+    if bands <= 1 or lo <= 0 or hi <= lo:
+        return [lo, hi]
+    ratio = log10(hi / lo)
+    edges = [int(round(lo * 10 ** (ratio * i / bands))) for i in range(bands + 1)]
+    edges[0], edges[-1] = lo, hi  # pin the ends against rounding drift
+    return edges
+
+
+def build_finder_selections(
+    data: EmergingData,
+    *,
+    as_of: date,
+    category_ids: list[int],
+    per_page: int = 50,
+    overrides: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """One Keepa `/query` selection per BSR sub-band (docs/emerging.md sampling).
+
+    Splitting [bsr_min, bsr_max] into `sub_bands` log-spaced ranges and sampling
+    each fixes the top-edge bias of a single ascending sort (which only ever
+    returns the lowest-BSR products). Each sub-band gets an even share of
+    `per_page`; the caller merges the returned ASINs and ranks locally by
+    emergence. `sub_bands = 1` returns a single full-band selection (old behavior).
+    """
+    f = data.finder
+    ov = overrides or {}
+    bsr_min = int(ov.get("bsr_min", f.bsr_min))
+    bsr_max = int(ov.get("bsr_max", f.bsr_max))
+    bands = max(1, f.sub_bands)
+    if bands <= 1:
+        return [
+            build_finder_selection(
+                data,
+                as_of=as_of,
+                category_ids=category_ids,
+                per_page=per_page,
+                overrides=overrides,
+            )
+        ]
+    per_band = max(1, -(-per_page // bands))  # ceil division, ≥ 1 per band
+    edges = _log_band_edges(bsr_min, bsr_max, bands)
+    selections: list[dict[str, Any]] = []
+    for i in range(bands):
+        band_ov = {**ov, "bsr_min": edges[i], "bsr_max": edges[i + 1]}
+        selections.append(
+            build_finder_selection(
+                data,
+                as_of=as_of,
+                category_ids=category_ids,
+                per_page=per_band,
+                overrides=band_ov,
+            )
+        )
+    return selections
+
+
+def is_established_brand(brand: str | None, established: tuple[str, ...]) -> bool:
+    """True when `brand` matches a configured large-brand name (case-insensitive,
+    whole-string or word match) — a launch to FLAG as likely ad-driven, never to
+    score differently or drop."""
+    if not brand:
+        return False
+    b = brand.strip().lower()
+    if not b:
+        return False
+    tokens = set(b.replace("-", " ").split())
+    return any(name == b or name in tokens or (" " in name and name in b) for name in established)
 
 
 # ---------------------------------------------------------------------------

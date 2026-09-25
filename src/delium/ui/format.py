@@ -145,24 +145,46 @@ def gate_rows(scored: Any) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Discover / cross-market / history
 # ---------------------------------------------------------------------------
-def discovery_rows(report: Any) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for ec in report.ranked:
-        s = ec.scored
-        if s is None:
-            continue
-        rows.append(
-            {
-                "asin": ec.asin,
-                "marketplace": ec.marketplace.value,
-                "score": round(s.score, 0),
-                "verdict": s.verdict.value,
-                "confidence": s.confidence.level.value,
-                "needs_data": bool(s.insufficient_data),
-                "via": ",".join(src.value for src in ec.candidate.sources),
-            }
+def discovery_rows(
+    report: Any, parents: dict[str, str | None] | None = None
+) -> list[dict[str, Any]]:
+    """Ranked discovery candidates. With a `parents` map, variations are collapsed
+    to one row per parent listing (best opportunity score as representative) and a
+    variation count is shown; without it, one row per candidate (back-compat)."""
+    scored_ecs = [ec for ec in report.ranked if ec.scored is not None]
+    if parents is None:
+        return [_discovery_row(ec, parent="", variations=1) for ec in scored_ecs]
+    from delium.discovery.dedupe import group_by_parent
+
+    groups = group_by_parent(
+        scored_ecs,
+        asin_of=lambda ec: ec.asin,
+        parents=parents,
+        rank=lambda ec: ec.scored.score,
+    )
+    return [
+        _discovery_row(
+            g.representative,
+            parent=g.parent_asin if g.parent_asin != g.representative.asin else "",
+            variations=g.variation_count,
         )
-    return rows
+        for g in groups
+    ]
+
+
+def _discovery_row(ec: Any, *, parent: str, variations: int) -> dict[str, Any]:
+    s = ec.scored
+    return {
+        "asin": ec.asin,
+        "parent_asin": parent,
+        "variations": variations,
+        "marketplace": ec.marketplace.value,
+        "score": round(s.score, 0),
+        "verdict": s.verdict.value,
+        "confidence": s.confidence.level.value,
+        "needs_data": bool(s.insufficient_data),
+        "via": ",".join(src.value for src in ec.candidate.sources),
+    }
 
 
 def discovery_killed_rows(report: Any, facts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -223,27 +245,50 @@ def run_type_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     ]
 
 
-def cross_market_rows(candidates: list[Any]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for c in candidates:
-        r = c.report
-        te = r.target_evidence
-        rows.append(
-            {
-                "source_asin": c.source_asin,
-                "title": (r.match.source.title or c.source_asin),
-                "route": f"{c.source_marketplace.value}→{c.target_marketplace.value}",
-                "verdict": r.verdict.value,
-                "score": round(r.score, 0),
-                "confidence": r.confidence.level.value,
-                "match": r.match.confidence.value,
-                "target_presence": te.presence.value,
-                "target_demand": round(te.target_demand_score, 0),
-                "demand_credible": bool(te.demand_credible),
-                "competition_gap": round(r.market_gap.competition_gap, 0),
-            }
+def cross_market_rows(
+    candidates: list[Any], parents: dict[str, str | None] | None = None
+) -> list[dict[str, Any]]:
+    """Cross-market candidates. With a `parents` map (keyed by source ASIN),
+    variations of the same source product collapse to one row per parent (best
+    score as representative); without it, one row per candidate (back-compat)."""
+    if parents is None:
+        return [_cross_market_row(c, parent="", variations=1) for c in candidates]
+    from delium.discovery.dedupe import group_by_parent
+
+    groups = group_by_parent(
+        candidates,
+        asin_of=lambda c: c.source_asin,
+        parents=parents,
+        rank=lambda c: c.report.score,
+    )
+    return [
+        _cross_market_row(
+            g.representative,
+            parent=g.parent_asin if g.parent_asin != g.representative.source_asin else "",
+            variations=g.variation_count,
         )
-    return rows
+        for g in groups
+    ]
+
+
+def _cross_market_row(c: Any, *, parent: str, variations: int) -> dict[str, Any]:
+    r = c.report
+    te = r.target_evidence
+    return {
+        "source_asin": c.source_asin,
+        "parent_asin": parent,
+        "variations": variations,
+        "title": (r.match.source.title or c.source_asin),
+        "route": f"{c.source_marketplace.value}→{c.target_marketplace.value}",
+        "verdict": r.verdict.value,
+        "score": round(r.score, 0),
+        "confidence": r.confidence.level.value,
+        "match": r.match.confidence.value,
+        "target_presence": te.presence.value,
+        "target_demand": round(te.target_demand_score, 0),
+        "demand_credible": bool(te.demand_credible),
+        "competition_gap": round(r.market_gap.competition_gap, 0),
+    }
 
 
 def emerging_rows(candidates: list[Any]) -> list[dict[str, Any]]:
@@ -264,6 +309,79 @@ def emerging_rows(candidates: list[Any]) -> list[dict[str, Any]]:
                 "why": "; ".join(c.emergence.reasons),
             }
         )
+    return rows
+
+
+def _pillar_cell(scored: Any, pillar: str) -> tuple[float | None, str]:
+    """(capped score, confidence label) for one pillar; ('absent') when missing."""
+    if scored is None:
+        return None, "absent"
+    for p in scored.pillars:
+        if p.pillar == pillar:
+            if not p.available:
+                return None, "absent"
+            return (None if p.capped_score is None else round(p.capped_score, 0)), (
+                p.confidence.value
+            )
+    return None, "absent"
+
+
+def _kill_gate_reasons(scored: Any) -> str:
+    if scored is None:
+        return ""
+    reasons = [f"{k.rule_id} {k.name}" for k in scored.kills if k.kills]
+    reasons += [f"{g.gate_id} fail" for g in scored.gates if g.passed is False]
+    return "; ".join(reasons)
+
+
+def emerging_rich_rows(
+    candidates: list[Any],
+    facts: dict[str, dict[str, Any]],
+    parents: dict[str, str | None],
+) -> list[dict[str, Any]]:
+    """Readable emerging table: one row per PARENT listing (variations collapsed),
+    with facts + every pillar score/confidence + verdict. `facts` and `parents`
+    are DB-derived and passed in (this module stays pure). The representative of
+    each parent group is its highest-emergence child."""
+    from delium.discovery.dedupe import group_by_parent
+
+    groups = group_by_parent(
+        candidates,
+        asin_of=lambda c: c.asin,
+        parents=parents,
+        rank=lambda c: c.emergence.emergence_score or 0.0,
+    )
+    rows: list[dict[str, Any]] = []
+    for g in groups:
+        c = g.representative
+        s = c.evaluated.scored
+        f = facts.get(c.asin, {})
+        row: dict[str, Any] = {
+            "asin": c.asin,
+            "parent_asin": g.parent_asin if g.parent_asin != c.asin else "",
+            "variations": g.variation_count,
+            "title": f.get("title") or "—",
+            "brand": f.get("brand") or "—",
+            "category": f.get("category") or "—",
+            "price_usd": _usd(f.get("price_cents")),
+            "bsr": f.get("bsr"),
+            "monthly_units": f.get("monthly_units"),
+            "age_days": c.emergence.age_days,
+            "reviews": f.get("reviews"),
+            "emergence": None
+            if c.emergence.emergence_score is None
+            else round(c.emergence.emergence_score, 0),
+        }
+        for pillar in ("demand", "competition", "differentiation", "profitability", "risk"):
+            score, conf = _pillar_cell(s, pillar)
+            row[pillar] = score
+            row[f"{pillar}_conf"] = conf
+        row["opportunity"] = None if s is None else round(s.score, 0)
+        row["verdict"] = None if s is None else s.verdict.value
+        row["confidence"] = None if s is None else s.confidence.level.value
+        row["flag"] = "established brand" if getattr(c, "established_brand", False) else ""
+        row["kill_gate"] = _kill_gate_reasons(s)
+        rows.append(row)
     return rows
 
 

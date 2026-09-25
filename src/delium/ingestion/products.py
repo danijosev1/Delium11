@@ -44,6 +44,7 @@ class ProductView:
     images_count: int | None = None
     gtin: str | None = None
     manufacturer: str | None = None
+    parent_asin: str | None = None
     latest_price_cents: int | None = None
     latest_bsr: int | None = None
     history_points: int = 0
@@ -97,6 +98,7 @@ def _view_from_db(
         images_count=product["images_count"],
         gtin=product["gtin"],
         manufacturer=product["manufacturer"],
+        parent_asin=product["parent_asin"],
         latest_price_cents=_latest(history, "price_cents"),
         latest_bsr=_latest(history, "bsr"),
         history_points=len(history),
@@ -121,6 +123,7 @@ def _store_normalized(conn: sqlite3.Connection, product: NormalizedProduct, fetc
         amazon_on_listing=product.amazon_on_listing,
         gtin=product.gtin,
         manufacturer=product.manufacturer,
+        parent_asin=product.parent_asin,
     )
     for point in product.history:
         repository.upsert_price_bsr_history(

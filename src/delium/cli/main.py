@@ -10,7 +10,7 @@ deliberately left as stubs here.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 from rich.console import Console
@@ -25,6 +25,9 @@ from delium.providers.dataforseo import DataForSeoClient
 from delium.providers.keepa import KeepaClient
 from delium.utils.logging import configure_logging, get_logger
 from delium.utils.paths import ensure_directories, get_database_path
+
+if TYPE_CHECKING:
+    from delium.reports.cards import CardFacts
 
 app = typer.Typer(
     name="delium",
@@ -927,12 +930,20 @@ def _render_emerging(report: object) -> None:
                 "—" if c.emergence.emergence_score is None else f"{c.emergence.emergence_score:.0f}"
             )
             age = "—" if c.emergence.age_days is None else f"{c.emergence.age_days}d"
+            flag = (
+                "  [magenta](established brand — likely ad-driven)[/magenta]"
+                if (c.established_brand)
+                else ""
+            )
             console.print(
                 f"  [green]{c.asin}[/green]  emergence {em}/100 ({age})  ·  "
                 f"opportunity {s.score:.0f} · [bold]{s.verdict.value.upper()}[/bold] · "
-                f"{s.confidence.level.value} conf"
+                f"{s.confidence.level.value} conf{flag}"
             )
             console.print(f"    [dim]{', '.join(c.emergence.reasons)}[/dim]")
+            console.print(
+                "    [dim]run `delium diagnose` for the per-pillar breakdown and next action.[/dim]"
+            )
     else:
         console.print("\n[yellow]No emerging candidates survived scoring.[/yellow]")
 
@@ -945,6 +956,124 @@ def _render_emerging(report: object) -> None:
             reason = c.evaluated.notes[0] if c.evaluated.notes else ""
             console.print(
                 f"  [red]{c.asin}[/red]  emergence {em}/100  ·  {c.evaluated.kill_rule}: {reason}"
+            )
+
+
+def _diag_facts(conn: object, asin: str, marketplace: str, emerging_row: object) -> CardFacts:
+    """Assemble CardFacts for one product from persisted data (read-only)."""
+    import sqlite3
+
+    from delium.reports.cards import CardFacts
+
+    assert isinstance(conn, sqlite3.Connection)
+    row = repository.get_product(conn, asin, marketplace)
+    history = repository.get_price_bsr_history(conn, asin)
+
+    def _latest(col: str) -> int | None:
+        for r in reversed(history):
+            if r[col] is not None:
+                return int(r[col])
+        return None
+
+    emergence = age = None
+    if isinstance(emerging_row, sqlite3.Row):
+        emergence = emerging_row["emergence_score"]
+        age = emerging_row["age_days"]
+    return CardFacts(
+        title=row["title"] if row is not None else None,
+        brand=row["brand"] if row is not None else None,
+        category=row["category_path"] if row is not None else None,
+        price_cents=_latest("price_cents"),
+        bsr=_latest("bsr"),
+        reviews=_latest("review_count"),
+        age_days=age,
+        emergence=emergence,
+    )
+
+
+@app.command()
+def diagnose(
+    run_id: Annotated[
+        str | None,
+        typer.Option("--run-id", help="Emerging run id to diagnose (default: the latest)."),
+    ] = None,
+    asin: Annotated[
+        str | None,
+        typer.Option("--asin", help="Diagnose a single stored ASIN instead of a run."),
+    ] = None,
+    marketplace: Annotated[
+        str, typer.Option("--marketplace", "-m", help="Marketplace for --asin.")
+    ] = "US",
+) -> None:
+    """Explain WHY stored candidates score as they do — per-pillar scores,
+    confidence, the input that drove each pillar, and which evidence fix would
+    raise confidence. Read-only: rebuilds scoring from the local DB, no API calls.
+    """
+    from delium.analysis.models import Marketplace
+    from delium.discovery import diagnostics
+    from delium.reports.cards import build_card
+
+    initialize_database()
+    config = load_config()
+
+    with get_connection() as conn:
+        if asin is not None:
+            mp = Marketplace(_validate_marketplace(marketplace))
+            diag = diagnostics.diagnose_candidate(conn, asin.strip().upper(), mp, config)
+            diags = [diag] if diag is not None else []
+            facts_by_asin = {}
+            if diag is not None:
+                facts_by_asin[diag.asin] = _diag_facts(conn, diag.asin, mp.value, None)
+        else:
+            rid = run_id
+            if rid is None:
+                runs = repository.list_emerging_runs(conn, limit=1)
+                if not runs:
+                    console.print("[yellow]No emerging runs found in the database.[/yellow]")
+                    raise typer.Exit(code=0)
+                rid = runs[0]["run_id"]
+            diags = diagnostics.diagnose_run(conn, rid, config)
+            em_rows = {r["asin"]: r for r in repository.get_emerging_candidates(conn, rid)}
+            facts_by_asin = {
+                d.asin: _diag_facts(conn, d.asin, d.marketplace, em_rows.get(d.asin)) for d in diags
+            }
+
+    if not diags:
+        console.print("[yellow]Nothing to diagnose (no stored candidates matched).[/yellow]")
+        raise typer.Exit(code=0)
+
+    for d in diags:
+        console.print(
+            f"\n[bold green]{d.asin}[/bold green] [{d.marketplace}]  "
+            f"opportunity {d.score:.0f} · [bold]{d.verdict.upper()}[/bold] · "
+            f"{d.confidence} confidence"
+        )
+        console.print("  [bold]Pillars[/bold] (missing = unknown, excluded from the score):")
+        for p in d.pillars:
+            if not p.available:
+                state = "[magenta]ABSENT (unknown — not scored as 0)[/magenta]"
+            elif p.partial:
+                state = f"[yellow]partial: {p.cap_reason}[/yellow]"
+            else:
+                state = "ok"
+            capped = "—" if p.capped is None else f"{p.capped:.0f}"
+            console.print(
+                f"    {p.pillar:<15} score {capped:>4}/100  w{p.weight:.2f}  "
+                f"contrib {p.contribution:5.1f}  {p.confidence:<6} {state}"
+            )
+            console.print(f"      [dim]{p.driver}[/dim]")
+        card = build_card(d, facts_by_asin.get(d.asin))
+        console.print("  [bold]Plain English[/bold]:")
+        for line in card.lines():
+            console.print(f"    {line}", markup=False)
+
+    if len(diags) > 1:
+        console.print("\n[bold]Confidence-cause summary[/bold] (which fix would lift how many):")
+        for impact in diagnostics.summarize_fixes(diags):
+            console.print(
+                f"  {impact.label}: blocks {impact.blocks_count}, "
+                f"sole blocker for {impact.sole_blocker_count} "
+                f"(would reach ≥MEDIUM on this fix alone)"
             )
 
 

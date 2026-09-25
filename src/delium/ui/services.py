@@ -363,6 +363,47 @@ def run_type_summary() -> list[sqlite3.Row]:
         return repository.run_type_summary(conn)
 
 
+def parent_map(asins: list[str], marketplace: str) -> dict[str, str | None]:
+    """ASIN → Keepa parent ASIN for a marketplace (variation dedupe). Read-only."""
+    if not asins:
+        return {}
+    initialize_database()
+    with get_connection() as conn:
+        return repository.get_parent_map(conn, asins, marketplace)
+
+
+def emerging_facts(report: Any) -> tuple[dict[str, dict[str, Any]], dict[str, str | None]]:
+    """(facts_by_asin, parents_by_asin) for a report's ranked candidates — the
+    readable-table columns that live in the DB, not on the report (title, brand,
+    category, latest price/BSR/reviews, Keepa monthly-units estimate, parent ASIN).
+    Read-only."""
+    asins = [c.asin for c in report.ranked]
+    facts: dict[str, dict[str, Any]] = {}
+    with get_connection() as conn:
+        parents = repository.get_parent_map(conn, asins, report.marketplace.value)
+        for asin in asins:
+            row = repository.get_product(conn, asin, report.marketplace.value)
+            history = repository.get_price_bsr_history(conn, asin)
+            derived = repository.get_product_derived(conn, asin)
+
+            def _latest(col: str, hist: list[sqlite3.Row] = history) -> int | None:
+                for r in reversed(hist):
+                    if r[col] is not None:
+                        return int(r[col])
+                return None
+
+            facts[asin] = {
+                "title": row["title"] if row is not None else None,
+                "brand": row["brand"] if row is not None else None,
+                "category": row["category_path"] if row is not None else None,
+                "price_cents": _latest("price_cents"),
+                "bsr": _latest("bsr"),
+                "reviews": _latest("review_count"),
+                "monthly_units": (derived["est_units_high"] if derived is not None else None),
+            }
+    return facts, parents
+
+
 def recent_emerging_runs(limit: int = 25) -> list[sqlite3.Row]:
     initialize_database()
     with get_connection() as conn:
@@ -421,8 +462,10 @@ __all__ = [
     "cross_market",
     "discover",
     "discovery_product_facts",
+    "emerging_facts",
     "keepa_token_status",
     "keyword_research",
+    "parent_map",
     "product_lookup",
     "read_report",
     "recent_runs",

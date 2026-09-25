@@ -65,6 +65,8 @@ A score is only as honest as its inputs. Minimum evidence before a full score is
 
 **Rule: missing data never defaults to optimistic.** Unknown = neutral-to-pessimistic, visibly flagged. A product cannot reach `Buy` with any pillar in `partial` state (§10).
 
+**Absent vs. thin — how the composite treats each.** A *thin-but-present* pillar keeps the sufficiency cap above (e.g. Demand capped at 60) — pessimistic, but scored. A *genuinely absent* pillar (no competitor set, no reviews, no fee inputs) is **excluded from the composite (numerator and denominator both), not scored as 0** — it is *unknown*, so it lowers **confidence** (LOW, via `data_quality`/G2 and the missing-pillar list), never the **score**. Scoring an absent pillar as 0 would read "bad market" when the truth is "not yet assessed"; the protection against a false Buy is the gate + confidence machinery (a missing pillar is `partial` → G2 fails → no Buy; fees absent → G1 fails → Avoid), so the number stays an honest reflection of what *is* known. This matches the emergence signal, which already renormalizes over its available sub-signals.
+
 ---
 
 ## 4. Pillar 1 — Demand (weight 25)

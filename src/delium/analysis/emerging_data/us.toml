@@ -25,6 +25,25 @@ price_min_cents = 1500        # current_NEW_gte — $15 private-label floor
 price_max_cents = 6000        # current_NEW_lte — $60 ceiling
 reviews_max = 100             # current_COUNT_REVIEWS_lte — still beatable
 exclude_amazon = true         # buyBoxIsAmazon = false — not sold by Amazon
+# Sampling: sort [bsr_min, bsr_max] ascending returns only the TOP EDGE of the
+# band (the lowest-BSR mega-sellers). Splitting the band into log-spaced
+# sub-bands and sampling each returns a spread across the whole band; the top N
+# are then chosen locally by emergence. sub_bands = 1 restores the old single
+# call. sort_field is the Keepa finder sort key applied within each sub-band.
+sub_bands = 4
+sort_field = "current_SALES"
+
+# Large, established brands whose "new" listings are usually ad-driven line
+# extensions rather than the emerging-underdog signal we want. Matched
+# case-insensitively against the product brand; FLAGGED in the output, never
+# silently scored or dropped (a real emerging brand should never be on this
+# list). Review against your categories before trusting it.
+[brands]
+established = [
+    "anker", "amazonbasics", "amazon basics", "logitech", "sony", "samsung",
+    "philips", "bosch", "3m", "duracell", "energizer", "hp", "dell", "lego",
+    "nike", "adidas", "oral-b", "gillette", "nestle", "procter & gamble",
+]
 
 # ---------------------------------------------------------------------------
 # Emergence signal (0–100 sub-signals, weighted → emergence_score 0–100).

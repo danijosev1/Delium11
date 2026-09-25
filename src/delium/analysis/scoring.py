@@ -993,10 +993,19 @@ def score_opportunity(
     risk_p = _risk_pillar(inp, config)
     pillars_raw = (demand_p, competition_p, differentiation_p, profit_p, risk_p)
 
-    # Stage 3 — composite. Normalize by the configured weight total so the score
-    # stays on a 0-100 scale; a missing pillar contributes 0 but stays in the
-    # denominator (missing data is pessimistic, never optimistic — §3).
-    total_w = sum(p.weight for p in pillars_raw)
+    # Stage 3 — composite. Normalize over the AVAILABLE pillars only: an absent
+    # pillar (no data at all) is excluded from BOTH numerator and denominator —
+    # "unknown", not "zero". Missing data therefore lowers *confidence* (via
+    # _score_confidence and the G2 data-quality gate) instead of dragging the
+    # score toward 0. This is scoring-model §3's "unknown = neutral-to-pessimistic,
+    # visibly flagged": the protection against a false Buy lives in the gates and
+    # confidence (a missing pillar is `partial` → G2 fails → cannot reach Buy →
+    # LOW confidence), never in a punitive zero that reads as "bad market".
+    # A present-but-thin pillar KEEPS its sufficiency-capped score (§3 caps), so
+    # thin data stays pessimistic — only genuinely absent pillars are renormalized
+    # away. This mirrors the emergence signal, which already renormalizes over its
+    # available sub-signals rather than scoring an absent one as 0.
+    total_w = sum(p.weight for p in pillars_raw if p.capped_score is not None)
     pillars: list[PillarScore] = []
     composite = 0.0
     for p in pillars_raw:

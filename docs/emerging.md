@@ -111,3 +111,30 @@ continue to live in the shared scoring path.
 - **Competition/differentiation run thin** for a finder candidate (no SERP
   competitor set is fetched), so those pillars are low-confidence — as they
   should be for a product with little market history.
+
+## Sampling, variation dedupe, brand flags, and diagnosis (2026 update)
+
+- **BSR sub-band sampling.** A single `sort: current_SALES asc` over the whole
+  `[bsr_min, bsr_max]` band only ever returns its *top edge* (the lowest-BSR
+  mega-sellers). The finder now splits the band into `sub_bands` log-spaced
+  sub-ranges (external `[finder].sub_bands`, default 4) and issues one call per
+  sub-band, merging the ASIN lists; the top N are then chosen locally by
+  emergence. `sub_bands = 1` restores the single-call behavior. `sort_field` is
+  configurable in the data file so a verified momentum/rank-drop sort can be
+  swapped in without code changes. Token cost scales with the number of
+  sub-bands (reported per run).
+- **Variation dedupe.** Keepa `parentAsin` is captured and stored
+  (migration 0007). `discover`, `emerging`, and `cross-market` collapse
+  variations to one row per parent listing (the best-performing child is the
+  representative) with a variation count, so eight colours of one product no
+  longer fill the table.
+- **Established-brand flag.** Brands in `[brands].established` are FLAGGED
+  ("likely ad-driven line extension"), never silently scored or dropped — a real
+  emerging underdog should never be on that list.
+- **`delium diagnose`.** A read-only command (no API calls) that rebuilds the
+  deterministic score for stored candidates and shows, per pillar, the score,
+  confidence, the input that drove it, and which evidence fix would raise
+  confidence — plus a per-product plain-English card. An **absent** pillar is
+  reported as *unknown* (excluded from the composite; lowers confidence), never
+  as a 0 that would drag the opportunity score down (see
+  `docs/scoring-model.md` §3).
