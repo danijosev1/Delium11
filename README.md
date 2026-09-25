@@ -46,8 +46,24 @@ uv run delium watch
 uv run delium portfolio
 ```
 
-All five commands are wired up and argument-complete; each currently exits
-with "not implemented yet" until its pipeline is built.
+### Web UI (local browser front end)
+
+A local Streamlit app wraps the same internal functions as the CLI (no shelling
+out, no duplicated logic). It runs only on your machine (localhost, single user,
+no login).
+
+```bash
+uv sync --group ui        # one-time: install the optional UI dependencies
+uv run delium ui          # launches http://localhost:8501 (use --port to change)
+```
+
+Pages: **Keyword research**, **Product lookup** (with price/BSR history chart),
+**Validate** (verdict + pillar scores + kills/gates + full report), **Discover**,
+**Cross-market**, and **History** (past runs/validations/reports from the local
+DB, no API calls). A sidebar panel shows which credentials are configured
+(never their values). Before any paid provider call the app shows the providers
+and an estimated cost and requires a confirm click, then reports the actual
+cost; cached data is reused and shown as $0.00.
 
 ## Configuration
 

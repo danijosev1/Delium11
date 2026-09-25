@@ -13,6 +13,20 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_secrets_from_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the test suite hermetic against a developer's real `.env`.
+
+    `DeliumSecrets` (pydantic-settings) auto-loads a `.env` from the working
+    directory, so a real credential file on the dev's machine would otherwise
+    make the "no credentials configured" tests fail. Neutralize the `.env`
+    source for every test; tests that need a credential set it via monkeypatch.
+    """
+    from delium.config.secrets import DeliumSecrets
+
+    monkeypatch.setitem(DeliumSecrets.model_config, "env_file", None)
+
+
 @pytest.fixture
 def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """Point all Delium filesystem paths at a fresh tmp_path for one test."""

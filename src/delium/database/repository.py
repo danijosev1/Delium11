@@ -81,6 +81,22 @@ def get_run(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
     return _one(conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)))
 
 
+def list_runs(conn: sqlite3.Connection, *, limit: int = 50) -> list[sqlite3.Row]:
+    """Recent runs, newest first (read-only; for the history view)."""
+    return _all(
+        conn.execute("SELECT * FROM runs ORDER BY started_at DESC, id DESC LIMIT ?", (limit,))
+    )
+
+
+def list_validations(conn: sqlite3.Connection, *, limit: int = 50) -> list[sqlite3.Row]:
+    """Recent persisted validations, newest first (read-only; for the history view)."""
+    return _all(
+        conn.execute(
+            "SELECT * FROM validations ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # raw_fetches (cache / fetch log / spend ledger)
 # ---------------------------------------------------------------------------

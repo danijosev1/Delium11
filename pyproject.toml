@@ -26,6 +26,12 @@ dev = [
     "ruff>=0.5",
 ]
 
+# Optional local web UI (Streamlit). Install with: uv sync --group ui
+# pandas is pulled in transitively by streamlit and used for the history chart.
+ui = [
+    "streamlit>=1.37",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -72,6 +78,11 @@ warn_required_dynamic_aliases = true
 module = "delium.analysis.*"
 disallow_any_expr = false
 
+# Optional UI dependencies are not installed in the dev/CI env (the `ui` group).
+[[tool.mypy.overrides]]
+module = ["streamlit", "streamlit.*", "pandas", "pandas.*"]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------------------
 # pytest
 # ---------------------------------------------------------------------------
@@ -84,6 +95,9 @@ pythonpath = ["src", "tests"]
 [tool.coverage.run]
 source = ["src/delium"]
 branch = true
+# The Streamlit script is an interactive presentation layer (needs the optional
+# `ui` deps + a running server); its logic lives in unit-tested helper modules.
+omit = ["src/delium/ui/app.py"]
 
 [tool.coverage.report]
 exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]

@@ -828,5 +828,38 @@ def portfolio() -> None:
     _not_implemented("portfolio")
 
 
+@app.command()
+def ui(
+    port: Annotated[int, typer.Option("--port", help="Local port to serve on.")] = 8501,
+) -> None:
+    """Launch the local Streamlit web UI (browser front end, localhost only)."""
+    import importlib.util
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    if importlib.util.find_spec("streamlit") is None:
+        console.print(
+            "[bold red]Streamlit is not installed.[/bold red] Install the UI extras:\n"
+            "  uv sync --group ui        [dim](or: pip install 'streamlit>=1.37')[/dim]"
+        )
+        raise typer.Exit(code=1)
+
+    app_path = Path(__file__).resolve().parent.parent / "ui" / "app.py"
+    console.print(f"[green]Starting Delium UI[/green] at http://localhost:{port}  (Ctrl-C to stop)")
+    cmd = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(app_path),
+        "--server.port",
+        str(port),
+        "--server.address",
+        "localhost",
+    ]
+    raise typer.Exit(code=subprocess.call(cmd))
+
+
 if __name__ == "__main__":
     app()
