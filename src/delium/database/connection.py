@@ -25,6 +25,10 @@ def _configure_connection(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA synchronous = NORMAL")
+    # Wait briefly for a competing writer instead of erroring immediately — the
+    # daily-scan orchestrator commits before every ingestion boundary, but this
+    # covers any short overlap between its connection and ingestion's own.
+    conn.execute("PRAGMA busy_timeout = 5000")
 
 
 def connect(path: Path | None = None) -> sqlite3.Connection:

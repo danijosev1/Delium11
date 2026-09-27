@@ -13,11 +13,18 @@
 #   * incumbent_freshness — how young/movable the page-one incumbents are
 #                        (launchability's listing-age component). Not used by any
 #                        opportunity pillar.
+#   * product_momentum — the CANDIDATE'S OWN review-accrual velocity (new
+#                        reviews/month). No pillar uses it: competition C3 measures
+#                        the *leaders'* review velocity (a threat), demand D2/D3 are
+#                        cluster medians, and the candidate's own BSR slope is left
+#                        out on purpose (D3 prices cluster trend and the emergence
+#                        signal already surfaces own-rank momentum separately). See
+#                        docs/sellability.md.
 #
 # The overlapping launchability parts (review moat, heavy-review count, brand
 # presence, listing-quality gap) are DELIBERATELY EXCLUDED here — the competition
 # pillar inside `opportunity` already prices them. Profitability is inside
-# `opportunity` and is never re-added. See docs/sellability.md.
+# `opportunity` and is never re-added.
 #
 # Score = weighted mean over the AVAILABLE components (missing → renormalize, same
 # rule as the composite). Confidence is a SEPARATE badge, never folded in.
@@ -25,6 +32,13 @@
 version = "us-2026"
 
 [weights]
-opportunity = 60           # the vetted 5-pillar score carries most of the weight
-price_headroom = 25        # non-overlapping: headroom at my target price
-incumbent_freshness = 15   # non-overlapping: how movable the incumbents are
+opportunity = 55           # the vetted 5-pillar score carries most of the weight
+price_headroom = 22        # non-overlapping: headroom at my target price
+incumbent_freshness = 13   # non-overlapping: how movable the incumbents are
+product_momentum = 10      # non-overlapping: the candidate's own review velocity
+
+# product_momentum maps the candidate's OWN new-reviews/month to 0-100 (absolute).
+# <= lo reviews/mo → 0 (no traction), >= hi → 100 (selling hard). Log-scaled.
+[product_momentum]
+reviews_per_month_lo = 1
+reviews_per_month_hi = 120

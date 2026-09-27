@@ -27,6 +27,7 @@ from delium.utils.logging import configure_logging, get_logger
 from delium.utils.paths import ensure_directories, get_database_path
 
 if TYPE_CHECKING:
+    from delium.discovery.daily_scan import ScanClients
     from delium.reports.cards import CardFacts
 
 app = typer.Typer(
@@ -1203,6 +1204,214 @@ def _pct(value: float | None) -> str:
 
 def _rate(value: float | None) -> str:
     return "—" if value is None else f"{value * 100:.0f}%"
+
+
+# ---------------------------------------------------------------------------
+# Daily Scan
+# ---------------------------------------------------------------------------
+scan_app = typer.Typer(help="Daily Scan pipeline — resumable, budget-gated funnel.")
+app.add_typer(scan_app, name="scan")
+
+_CONF_CHOICES = {"low", "medium", "high"}
+
+
+@scan_app.callback(invoke_without_command=True)
+def scan_main(
+    ctx: typer.Context,
+    marketplaces: Annotated[
+        str, typer.Option("--marketplaces", help="Comma-separated, e.g. US,CA,UK.")
+    ] = "US",
+    top: Annotated[int, typer.Option("--top", help="How many finalists to keep.")] = 10,
+    budget_cap: Annotated[
+        int | None,
+        typer.Option("--budget-cap", help="Abort if projected Keepa tokens exceed this."),
+    ] = None,
+    max_spend: Annotated[
+        float | None, typer.Option("--max-spend", help="Abort if projected USD exceed this.")
+    ] = None,
+    min_confidence: Annotated[
+        str, typer.Option("--min-confidence", help="low | medium | high.")
+    ] = "low",
+    scheduled: Annotated[
+        bool,
+        typer.Option("--scheduled", help="Non-interactive; abort (never prompt) if over caps."),
+    ] = False,
+    resume: Annotated[
+        str | None, typer.Option("--resume", help="Resume a scan by id (from the last stage).")
+    ] = None,
+) -> None:
+    """Run a daily scan (interactive: shows the projected cost and confirms)."""
+    if ctx.invoked_subcommand is not None:
+        return  # `delium scan report …` handled by the subcommand
+    from delium.analysis.models import Confidence
+    from delium.discovery import daily_scan
+    from delium.discovery.daily_scan import ScanParams
+
+    initialize_database()
+    config = load_config()
+    if min_confidence.lower() not in _CONF_CHOICES:
+        console.print(
+            f"[bold red]--min-confidence must be one of {sorted(_CONF_CHOICES)}.[/bold red]"
+        )
+        raise typer.Exit(code=1)
+    mps = tuple(_validate_marketplace(m) for m in marketplaces.split(",") if m.strip())
+
+    from delium.profile import store as profile_store
+
+    with get_connection() as conn:
+        profile = profile_store.load_active(conn)
+    params = ScanParams(
+        marketplaces=mps,
+        top_n=top,
+        budget_cap_tokens=budget_cap,
+        max_spend_usd=max_spend,
+        min_confidence=Confidence(min_confidence.lower()),
+        scheduled=scheduled,
+    )
+    clients = _build_scan_clients(config)
+
+    def _confirm(projection: daily_scan.CostProjection) -> bool:
+        console.print(
+            f"[bold]Projected cost[/bold]: ~{projection.total_tokens} Keepa tokens + "
+            f"${projection.total_usd:.2f}."
+        )
+        for s in projection.stages:
+            console.print(f"  {s.name}: ~{s.keepa_tokens} tokens, ${s.data_usd + s.llm_usd:.2f}")
+        for note in projection.notes:
+            console.print(f"  [yellow]{note}[/yellow]")
+        return bool(typer.confirm("Proceed and spend?"))
+
+    try:
+        with get_connection() as conn:
+            report = daily_scan.run_scan(
+                conn,
+                params=params,
+                profile=profile,
+                config=config,
+                clients=clients,
+                confirm=None if scheduled else _confirm,
+                resume_scan_id=resume,
+            )
+    except daily_scan.ScanAbortedError as exc:
+        console.print(f"[bold red]Scan aborted:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+    _render_scan(report)
+
+
+@scan_app.command("report")
+def scan_report(
+    scan_id: Annotated[
+        str | None, typer.Argument(help="Scan id to print. Omit for the latest.")
+    ] = None,
+) -> None:
+    """Print a past scan report (funnel, per-stage cost, finalists, categories)."""
+    from delium.discovery.daily_scan import build_report
+
+    initialize_database()
+    with get_connection() as conn:
+        if scan_id is None:
+            latest = repository.latest_scan(conn)
+            if latest is None:
+                console.print("[yellow]No scans yet.[/yellow]")
+                raise typer.Exit(code=0)
+            scan_id = latest["id"]
+        report = build_report(conn, scan_id)
+    _render_scan(report)
+
+
+def _build_scan_clients(config: object) -> ScanClients:
+    """Provider factories + an optional finalist enricher (reviews + Claude
+    differentiation + re-score, via the validation pipeline)."""
+    from delium.analysis.models import Marketplace
+    from delium.config.models import DeliumConfig
+    from delium.discovery.daily_scan import EnrichResult, ScanClients
+
+    assert isinstance(config, DeliumConfig)
+    keepa_factory, dfs_factory = _build_provider_factories()
+    reviews = _build_review_provider_probe()
+    from delium.agents import build_llm_client
+
+    llm = build_llm_client(config.agents)
+    enrich = None
+    if keepa_factory is not None and (reviews is not None or llm is not None):
+
+        def _enrich(asin: str, marketplace: str, run_id: str) -> EnrichResult:
+            from delium.validation import (
+                Clients,
+                ValidationRequest,
+                ValidationStatus,
+                run_validation,
+            )
+
+            val_clients = Clients(keepa=keepa_factory, dfs=dfs_factory, reviews=reviews, llm=llm)
+            request = ValidationRequest(
+                target=asin, marketplace=Marketplace(marketplace), run_id=run_id, force=False
+            )
+            with get_connection() as vconn:
+                report = run_validation(vconn, request, config, val_clients)
+            scored = report.scored
+            diff_available = bool(
+                scored
+                and any(p.pillar == "differentiation" and p.available for p in scored.pillars)
+            )
+            terminal = report.status in (ValidationStatus.SCORED, ValidationStatus.HARD_KILLED)
+            eligible = terminal and (scored is None or scored.verdict.value != "avoid")
+            return EnrichResult(
+                opportunity_score=scored.score if scored is not None else None,
+                differentiation_available=diff_available,
+                data_usd=report.data_cost_usd,
+                llm_usd=report.llm_cost_usd,
+                eligible=eligible,
+            )
+
+        enrich = _enrich
+    return ScanClients(keepa_factory=keepa_factory, dfs_factory=dfs_factory, enrich_finalist=enrich)
+
+
+def _render_scan(report: object) -> None:
+    from delium.discovery.daily_scan import ScanReport
+
+    assert isinstance(report, ScanReport)
+    console.print(
+        f"[bold]Scan[/bold] {report.scan_id}  ·  {report.status}  ·  "
+        f"markets {', '.join(report.marketplaces)}"
+    )
+    for note in report.notes:
+        console.print(f"  [yellow]{note}[/yellow]")
+    funnel = report.funnel
+    console.print(
+        "[bold]Funnel[/bold]: "
+        + " → ".join(
+            f"{k} {funnel.get(k, 0)}"
+            for k in ("swept", "hydrated", "killed", "scored", "competitor_set", "finalists")
+        )
+    )
+    console.print(
+        f"[bold]Cost[/bold]: {report.keepa_tokens} Keepa tokens · "
+        f"${report.data_usd:.2f} data · ${report.llm_usd:.2f} LLM"
+    )
+    console.print("\n[bold]Per stage[/bold]:")
+    for s in report.stages:
+        console.print(
+            f"  {s['stage']} {s['name']:<16} {s['status']:<9} "
+            f"in {s['in']:>4} out {s['out']:>4} killed {s['killed']:>4}  "
+            f"{s['tokens']} tok  ${s['data_usd']:.2f}+${s['llm_usd']:.2f}"
+        )
+    console.print("\n[bold]Scan inbox — finalists[/bold] (promote to shortlist manually):")
+    if not report.finalists:
+        console.print("  [dim]none[/dim]")
+    for f in report.finalists:
+        sell = "—" if f["sellability"] is None else f"{f['sellability']:.0f}"
+        console.print(
+            f"  {f['rank']:>2}. [green]{f['asin']}[/green] [{f['marketplace']}]  "
+            f"sellability {sell} · {f['confidence']} conf · diff {f['differentiation']}"
+        )
+        if f["reason"]:
+            console.print(f"      [dim]{f['reason']}[/dim]", markup=False)
+    console.print("\n[bold]Emerging categories[/bold]:")
+    for c in report.categories:
+        score = "—" if c["score"] is None else f"{c['score']:.0f}"
+        console.print(f"  [cyan]{c['category']}[/cyan] {score}/100 — {c['reason']}", markup=False)
 
 
 @app.command()

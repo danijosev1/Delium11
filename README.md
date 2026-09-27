@@ -107,6 +107,61 @@ FBA fulfilment fee, cents), and `referralFeePercentage`. The real FBA fee is fed
 into the profit engine when present (falling back to the fee table, clearly
 labelled), so profit confidence rises through the existing rules.
 
+### Daily Scan (`delium scan`)
+
+A resumable, budget-gated funnel that turns a broad Keepa sweep into a short
+ranked "scan inbox". It never loosens a kill or gate and preserves
+"missing = unknown"; scoring.py stays the sole verdict owner.
+
+```bash
+delium scan                              # interactive: shows projected cost, confirms
+delium scan --marketplaces US,CA,UK
+delium scan --top 10 --budget-cap 1500 --max-spend 5
+delium scan --min-confidence medium
+delium scan --scheduled                  # non-interactive; aborts if over caps
+delium scan --resume <scan_id>           # continue a crashed scan from its last stage
+delium scan report [<scan_id>]           # print a past scan (latest if omitted)
+```
+
+**Stages** (each persists progress to SQLite, logs Keepa tokens + $, and records
+its funnel counts, so a crash resumes from the last completed stage):
+
+0. **Preflight** — load the active Research Profile, a free Keepa `/token`
+   check, project the cost of every later stage, and **abort before spending**
+   if it would exceed `--budget-cap` (tokens) or `--max-spend` (USD).
+1. **Sweep** — Keepa Product Finder across BSR sub-bands per profile category,
+   with as many hard-kill rules as the finder supports pushed **into** the query
+   (price band → `current_NEW_gte/lte` for K1/K2; not sold by Amazon →
+   `buyBoxIsAmazon=false` for K4; review cap → `current_COUNT_REVIEWS_lte` for
+   K6; weight limit → `packageWeight_lte` for K3) so less junk comes back. Also
+   runs the existing cross-market pass.
+2. **Hydrate** — batched, cache-first Keepa `/product` (≤100/call) for the sweep.
+3. **Normalize + hard kill** — merge variations by parent ASIN, flag established
+   brands, apply the existing kill rules (every kill logged with its reason).
+4. **Cheap scoring** — demand, profitability (with the real Keepa fee), risk,
+   emergence — everything needing no further paid call. Missing = unknown.
+5. **Competitor sets** — for the top ~40 by cheap score: main keyword →
+   DataForSEO SERP → batched Keepa hydration → competition + launchability.
+6. **Rank** — sellability on all survivors; keep the top N (respecting
+   `--min-confidence`).
+7. **Finalists** — reviews + Claude differentiation (the validation pipeline,
+   per-product budget caps) for the top N only, then re-score and re-rank.
+   Products without differentiation show **"differentiation pending"**, never a
+   heuristic score mixed in as if it were real.
+8. **Report** — persist the funnel, per-stage cost, top N with one-line reasons,
+   and emerging categories. Finalists go to the **scan inbox** — *separate* from
+   the shortlist; you promote them manually.
+
+Australia has no Keepa coverage: a requested `AU` marketplace is reported as
+"AU pending — Keepa has no Australia data" and skipped; the scan continues.
+
+**Cost model (projected worst case, default scan — US, ~300 swept, 40
+competitor sets, top 10):** sweep ≈ 44 Keepa tokens; hydrate ≈ 600 tokens;
+competitor sets ≈ 800 tokens + ~$1.20 DataForSEO; finalists ≈ up to
+`$3.03 × 10` data + `$1.00 × 10` LLM (bounded by the per-validate budget caps).
+Everything is cache-first, so a repeated lookup is free and real costs run far
+below these caps. The caps bind on the projection, before any spend.
+
 ## Configuration
 
 - `config/config.toml` — assumptions, preferences, score weights, gates (see
@@ -129,7 +184,7 @@ src/delium/
 ├── providers/    # Keepa / DataForSEO / review provider adapters
 ├── ingestion/    # fetch → normalize → cache-first pipeline (batched Keepa)
 ├── analysis/     # deterministic demand/competition/profit/risk/scoring engines
-├── discovery/    # discover/emerging orchestration, assembly, diagnostics, workspace
+├── discovery/    # discover/emerging/daily-scan orchestration, assembly, diagnostics, workspace, calibrate
 ├── profile/      # Research Profile model + store (DB-backed preferences)
 ├── agents/       # Scout / Analyst / Review Miner / Strategist (LLM layer)
 ├── reports/      # markdown rendering + deterministic plain-English cards

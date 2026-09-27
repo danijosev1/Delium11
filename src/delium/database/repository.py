@@ -1379,3 +1379,291 @@ def get_product_snapshots(
             (asin, marketplace),
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# Daily Scan (pipeline persistence — resumable funnel)
+# ---------------------------------------------------------------------------
+def create_scan(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    marketplaces: list[str],
+    profile_id: str | None,
+    profile_name: str | None,
+    params: Any,
+) -> str:
+    scan_id = _new_id()
+    conn.execute(
+        """
+        INSERT INTO scans (id, run_id, marketplaces, profile_id, profile_name, params)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (scan_id, run_id, _dumps(marketplaces), profile_id, profile_name, _dumps(params)),
+    )
+    return scan_id
+
+
+def get_scan(conn: sqlite3.Connection, scan_id: str) -> sqlite3.Row | None:
+    return _one(conn.execute("SELECT * FROM scans WHERE id = ?", (scan_id,)))
+
+
+def latest_scan(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return _one(conn.execute("SELECT * FROM scans ORDER BY created_at DESC, rowid DESC LIMIT 1"))
+
+
+def list_scans(conn: sqlite3.Connection, *, limit: int = 25) -> list[sqlite3.Row]:
+    return _all(
+        conn.execute("SELECT * FROM scans ORDER BY created_at DESC, rowid DESC LIMIT ?", (limit,))
+    )
+
+
+def update_scan(
+    conn: sqlite3.Connection,
+    scan_id: str,
+    *,
+    status: str | None = None,
+    stage: int | None = None,
+    keepa_tokens: int | None = None,
+    data_usd: float | None = None,
+    llm_usd: float | None = None,
+    notes: Any = None,
+) -> None:
+    sets: list[str] = ["updated_at = datetime('now')"]
+    params: list[Any] = []
+    if status is not None:
+        sets.append("status = ?")
+        params.append(status)
+    if stage is not None:
+        sets.append("stage = ?")
+        params.append(stage)
+    if keepa_tokens is not None:
+        sets.append("keepa_tokens = ?")
+        params.append(keepa_tokens)
+    if data_usd is not None:
+        sets.append("data_usd = ?")
+        params.append(data_usd)
+    if llm_usd is not None:
+        sets.append("llm_usd = ?")
+        params.append(llm_usd)
+    if notes is not None:
+        sets.append("notes = ?")
+        params.append(_dumps(notes))
+    params.append(scan_id)
+    conn.execute(f"UPDATE scans SET {', '.join(sets)} WHERE id = ?", params)
+
+
+def upsert_scan_stage(
+    conn: sqlite3.Connection,
+    *,
+    scan_id: str,
+    stage: int,
+    name: str,
+    status: str,
+    input_count: int = 0,
+    output_count: int = 0,
+    killed_count: int = 0,
+    keepa_tokens: int = 0,
+    data_usd: float = 0.0,
+    llm_usd: float = 0.0,
+    detail: Any = None,
+    started: bool = False,
+    finished: bool = False,
+) -> None:
+    started_at = "datetime('now')" if started else "started_at"
+    finished_at = "datetime('now')" if finished else "finished_at"
+    existing = _one(
+        conn.execute("SELECT id FROM scan_stages WHERE scan_id = ? AND stage = ?", (scan_id, stage))
+    )
+    if existing is None:
+        conn.execute(
+            """
+            INSERT INTO scan_stages
+                (id, scan_id, stage, name, status, input_count, output_count, killed_count,
+                 keepa_tokens, data_usd, llm_usd, detail, started_at, finished_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    CASE WHEN ? THEN datetime('now') END,
+                    CASE WHEN ? THEN datetime('now') END)
+            """,
+            (
+                _new_id(),
+                scan_id,
+                stage,
+                name,
+                status,
+                input_count,
+                output_count,
+                killed_count,
+                keepa_tokens,
+                data_usd,
+                llm_usd,
+                None if detail is None else _dumps(detail),
+                started,
+                finished,
+            ),
+        )
+        return
+    conn.execute(
+        f"""
+        UPDATE scan_stages SET
+            name = ?, status = ?, input_count = ?, output_count = ?, killed_count = ?,
+            keepa_tokens = ?, data_usd = ?, llm_usd = ?, detail = ?,
+            started_at = {started_at}, finished_at = {finished_at}
+        WHERE scan_id = ? AND stage = ?
+        """,
+        (
+            name,
+            status,
+            input_count,
+            output_count,
+            killed_count,
+            keepa_tokens,
+            data_usd,
+            llm_usd,
+            None if detail is None else _dumps(detail),
+            scan_id,
+            stage,
+        ),
+    )
+
+
+def get_scan_stages(conn: sqlite3.Connection, scan_id: str) -> list[sqlite3.Row]:
+    return _all(
+        conn.execute("SELECT * FROM scan_stages WHERE scan_id = ? ORDER BY stage", (scan_id,))
+    )
+
+
+def upsert_scan_candidate(
+    conn: sqlite3.Connection,
+    *,
+    scan_id: str,
+    asin: str,
+    marketplace: str,
+    outcome: str,
+    stage_reached: int,
+    parent_asin: str | None = None,
+    source: str | None = None,
+    kill_rule: str | None = None,
+    established_brand: bool = False,
+    cheap_score: float | None = None,
+    opportunity_score: float | None = None,
+    launchability: float | None = None,
+    sellability: float | None = None,
+    confidence: str | None = None,
+    verdict: str | None = None,
+    rank: int | None = None,
+    differentiation_status: str | None = None,
+    reason: str | None = None,
+    data: Any = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO scan_candidates
+            (id, scan_id, asin, marketplace, parent_asin, outcome, stage_reached, source,
+             kill_rule, established_brand, cheap_score, opportunity_score, launchability,
+             sellability, confidence, verdict, rank, differentiation_status, reason, data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(scan_id, asin, marketplace) DO UPDATE SET
+            parent_asin = excluded.parent_asin,
+            outcome = excluded.outcome,
+            stage_reached = excluded.stage_reached,
+            source = COALESCE(excluded.source, scan_candidates.source),
+            kill_rule = excluded.kill_rule,
+            established_brand = excluded.established_brand,
+            cheap_score = COALESCE(excluded.cheap_score, scan_candidates.cheap_score),
+            opportunity_score = COALESCE(
+                excluded.opportunity_score, scan_candidates.opportunity_score),
+            launchability = COALESCE(excluded.launchability, scan_candidates.launchability),
+            sellability = COALESCE(excluded.sellability, scan_candidates.sellability),
+            confidence = COALESCE(excluded.confidence, scan_candidates.confidence),
+            verdict = COALESCE(excluded.verdict, scan_candidates.verdict),
+            rank = excluded.rank,
+            differentiation_status = COALESCE(excluded.differentiation_status,
+                                              scan_candidates.differentiation_status),
+            reason = COALESCE(excluded.reason, scan_candidates.reason),
+            data = COALESCE(excluded.data, scan_candidates.data)
+        """,
+        (
+            _new_id(),
+            scan_id,
+            asin,
+            marketplace,
+            parent_asin,
+            outcome,
+            stage_reached,
+            source,
+            kill_rule,
+            int(established_brand),
+            cheap_score,
+            opportunity_score,
+            launchability,
+            sellability,
+            confidence,
+            verdict,
+            rank,
+            differentiation_status,
+            reason,
+            None if data is None else _dumps(data),
+        ),
+    )
+
+
+def get_scan_candidates(
+    conn: sqlite3.Connection, scan_id: str, *, outcome: str | None = None
+) -> list[sqlite3.Row]:
+    if outcome is None:
+        return _all(conn.execute("SELECT * FROM scan_candidates WHERE scan_id = ?", (scan_id,)))
+    return _all(
+        conn.execute(
+            "SELECT * FROM scan_candidates WHERE scan_id = ? AND outcome = ?", (scan_id, outcome)
+        )
+    )
+
+
+def scan_inbox(conn: sqlite3.Connection, scan_id: str) -> list[sqlite3.Row]:
+    """Finalists in the scan inbox, best-ranked first (SEPARATE from shortlist)."""
+    return _all(
+        conn.execute(
+            "SELECT * FROM scan_candidates WHERE scan_id = ? AND outcome = 'finalist' "
+            "ORDER BY rank",
+            (scan_id,),
+        )
+    )
+
+
+def upsert_scan_category(
+    conn: sqlite3.Connection,
+    *,
+    scan_id: str,
+    category: str,
+    momentum_score: float | None,
+    metrics: Any,
+    reason: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO scan_categories (id, scan_id, category, momentum_score, metrics, reason)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (_new_id(), scan_id, category, momentum_score, _dumps(metrics), reason),
+    )
+
+
+def get_scan_categories(conn: sqlite3.Connection, scan_id: str) -> list[sqlite3.Row]:
+    return _all(
+        conn.execute(
+            "SELECT * FROM scan_categories WHERE scan_id = ? "
+            "ORDER BY momentum_score DESC, category",
+            (scan_id,),
+        )
+    )
+
+
+def run_cost_total(conn: sqlite3.Connection, run_id: str) -> float:
+    """Total provider dollar spend logged against a run (from the fetch ledger)."""
+    row = _one(
+        conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM raw_fetches WHERE run_id = ?", (run_id,)
+        )
+    )
+    return float(row["c"]) if row is not None else 0.0
