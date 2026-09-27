@@ -1,0 +1,62 @@
+# Launchability thresholds — ABSOLUTE scales, EXTERNAL DATA (not hardcoded, not
+# batch-relative). Every component maps to 0-100 through the fixed thresholds
+# below, so a launchability score means the SAME thing on any day / any batch.
+#
+# ⚠️ ALL VALUES ARE ILLUSTRATIVE and MUST be calibrated (`delium calibrate` and
+# real launch outcomes) before they are trustworthy. Bump `version` on change.
+#
+# Launchability answers "how beatable is page one for a new entrant?" — HIGH =
+# beatable. Each component is 0-100 (100 = most launchable). The score is the
+# weighted mean over the AVAILABLE components; an absent component is dropped and
+# the weights renormalize (missing = unknown, never 0). No competitor set at all
+# → launchability is None (unknown), which lowers confidence, not the score.
+
+version = "us-2026"
+
+[weights]
+# Sum is normalized internally, so these are relative importances.
+median_reviews = 25       # review moat of the top 10 (fewer = more beatable)
+heavy_review_count = 15   # how many top-10 listings are deeply entrenched
+brand_presence = 15       # Amazon / big-brand wall
+listing_age = 15          # entrenched (old) vs fresh (young) incumbents
+listing_quality_gap = 15  # weak incumbent listings = room to win
+price_crowding = 15       # competitors clustered at MY target price
+
+[median_reviews]
+# 100 - log_norm(median_reviews, lo, hi): <=lo → 100 (climbable), >=hi → 0.
+lo = 100
+hi = 3000
+
+[heavy_review_count]
+# number of top-10 with > `threshold` reviews; norm(count, 0, cap) then inverted.
+threshold = 1000
+cap = 5                   # 5+ deeply-reviewed incumbents → 0
+
+[brand_presence]
+# Deductions from 100 (floored at 0). Amazon in the set is the hardest wall.
+amazon_penalty = 60
+established_brand_penalty = 30
+
+[listing_age]
+# Median top-10 listing age in days. Young page (fresh listings) = movable market
+# → high; old, entrenched page → low. 100 - norm(age, young_days, old_days).
+young_days = 180
+old_days = 1825           # ~5 years
+
+[listing_quality_gap]
+# Weak incumbent listings = room to win. Built ONLY from fields we store:
+#   images_count, rating, title length (characters).
+# Each sub-metric → 0-100 "quality", averaged, then inverted (100 - avg_quality).
+images_lo = 1
+images_hi = 7
+rating_lo = 3.5
+rating_hi = 4.8
+title_len_lo = 40
+title_len_hi = 180
+
+[price_crowding]
+# Competitors whose price is within ±band_pct of MY target price. A crowded band
+# at my entry price = little headroom → low; an empty band = headroom → high.
+# 100 - norm(count_in_band, 0, cap).
+band_pct = 0.15
+cap = 5

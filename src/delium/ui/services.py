@@ -713,3 +713,25 @@ def _top_opportunities(
     ]
     rows.sort(key=lambda r: float(r["opportunity_score"]), reverse=True)
     return rows[:top_n]
+
+
+# ---------------------------------------------------------------------------
+# Calibration (Daily Scan, Part 1) — stored-data comparison against Keepa
+# ---------------------------------------------------------------------------
+def calibration_report(
+    marketplace: str, config: DeliumConfig, asins: list[str] | None = None
+) -> Any:
+    """Run the calibration harness over stored data (no network)."""
+    from delium.discovery import calibrate as calib
+
+    initialize_database()
+    with get_connection() as conn:
+        return calib.run(conn, asins=asins or None, marketplace=marketplace)
+
+
+def calibration_stored_count(marketplace: str) -> int:
+    from delium.discovery import calibrate as calib
+
+    initialize_database()
+    with get_connection() as conn:
+        return len(calib.all_stored_asins(conn, marketplace))

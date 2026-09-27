@@ -1,0 +1,30 @@
+# Sellability weights — ABSOLUTE scale, EXTERNAL DATA (not batch-relative).
+#
+# ⚠️ ILLUSTRATIVE until calibrated against real launch outcomes. Bump `version`.
+#
+# Sellability answers "if I launched this tomorrow, would it sell?" WITHOUT
+# double-counting anything the opportunity score already prices. It combines:
+#   * opportunity      — the full 5-pillar opportunity score (demand, competition,
+#                        differentiation, PROFITABILITY, risk). Counts all of
+#                        those exactly once.
+#   * price_headroom   — room at MY target price (launchability's price-crowding
+#                        component). The opportunity score is price-agnostic to my
+#                        specific entry price, so this is genuinely new.
+#   * incumbent_freshness — how young/movable the page-one incumbents are
+#                        (launchability's listing-age component). Not used by any
+#                        opportunity pillar.
+#
+# The overlapping launchability parts (review moat, heavy-review count, brand
+# presence, listing-quality gap) are DELIBERATELY EXCLUDED here — the competition
+# pillar inside `opportunity` already prices them. Profitability is inside
+# `opportunity` and is never re-added. See docs/sellability.md.
+#
+# Score = weighted mean over the AVAILABLE components (missing → renormalize, same
+# rule as the composite). Confidence is a SEPARATE badge, never folded in.
+
+version = "us-2026"
+
+[weights]
+opportunity = 60           # the vetted 5-pillar score carries most of the weight
+price_headroom = 25        # non-overlapping: headroom at my target price
+incumbent_freshness = 15   # non-overlapping: how movable the incumbents are

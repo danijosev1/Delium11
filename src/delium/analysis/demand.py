@@ -81,6 +81,14 @@ def _parse_curves(raw: dict[str, Any]) -> VelocityCurves:
     )
 
 
+def curve_units_for_bsr(curves: VelocityCurves, category: str | None, bsr: int) -> float:
+    """Delium's BSR-curve monthly-unit estimate at a single current BSR — the
+    category's velocity curve interpolated at `bsr`. Pure; used by calibration to
+    compare against Keepa's `monthlySold`."""
+    curve, _known = curves.resolve(category)
+    return _curve_units(curve.anchors, bsr)
+
+
 def _curve_units(anchors: tuple[VelocityAnchor, ...], bsr: int) -> float:
     """Log-log interpolate monthly units at a BSR; clamp beyond the anchor ends."""
     if bsr <= anchors[0].bsr:

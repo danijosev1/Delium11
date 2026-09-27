@@ -1078,6 +1078,134 @@ def diagnose(
 
 
 @app.command()
+def calibrate(
+    asin: Annotated[
+        list[str] | None,
+        typer.Option("--asin", help="ASIN to calibrate (repeatable). Omit to use the whole DB."),
+    ] = None,
+    file: Annotated[
+        str | None,
+        typer.Option("--file", help="Path to a newline-separated list of ASINs."),
+    ] = None,
+    marketplace: Annotated[
+        str, typer.Option("--marketplace", "-m", help="Marketplace: US, CA, UK, AU, IN.")
+    ] = "US",
+    refresh: Annotated[
+        bool,
+        typer.Option("--refresh", help="Re-fetch Keepa first (PAID — confirms the token cost)."),
+    ] = False,
+    yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Skip the refresh confirmation prompt.")
+    ] = False,
+) -> None:
+    """Compare Delium's estimates against Keepa's ground truth (stored data).
+
+    Per product and per category: Delium's BSR-curve monthly-unit estimate vs
+    Keepa `monthlySold` (bucketed — compared against the bucket RANGE), and
+    Delium's fee-table FBA fee vs Keepa `fbaFees.pickAndPackFee`. Reports MAPE and
+    SUGGESTED (never applied) per-category curve/fee adjustments. Stored data only
+    unless --refresh.
+    """
+    from pathlib import Path
+
+    from delium.discovery import calibrate as calib
+
+    initialize_database()
+    config = load_config()
+    mp_code = _validate_marketplace(marketplace)
+
+    asins = [*(asin or [])]
+    if file:
+        asins.extend(
+            line.strip()
+            for line in Path(file).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+
+    if refresh:
+        keepa_factory, _dfs = _build_provider_factories()
+        if keepa_factory is None:
+            console.print("[bold red]--refresh needs Keepa.[/bold red] Set DELIUM_KEEPA_API_KEY.")
+            raise typer.Exit(code=1)
+        with get_connection() as conn:
+            targets = asins or calib.all_stored_asins(conn, mp_code)
+        if not targets:
+            console.print("[yellow]Nothing to refresh — no ASINs given and DB is empty.[/yellow]")
+            raise typer.Exit(code=0)
+        est_tokens = len(targets) * 2  # ~2 Keepa tokens per product (1 base + 1 rating)
+        console.print(
+            f"[yellow]Refresh will re-fetch {len(targets)} product(s) — "
+            f"~{est_tokens} Keepa tokens (batched, cache bypassed).[/yellow]"
+        )
+        if not yes and not typer.confirm("Proceed and spend Keepa tokens?"):
+            console.print("Aborted — no API calls made.")
+            raise typer.Exit(code=0)
+        with get_connection() as conn:
+            run_id = repository.insert_run(conn, command="calibrate", input_=f"{mp_code}:refresh")
+        used = calib.refresh_products(
+            targets, mp_code, config, keepa_client_factory=keepa_factory, run_id=run_id
+        )
+        with get_connection() as conn:
+            repository.finish_run(conn, run_id, status="complete")
+        console.print(f"[dim]Refreshed — {used} Keepa tokens used.[/dim]")
+
+    with get_connection() as conn:
+        report = calib.run(conn, asins=asins or None, marketplace=mp_code)
+    _render_calibration(report)
+
+
+def _render_calibration(report: object) -> None:
+    from delium.analysis.calibration import CalibrationReport
+
+    assert isinstance(report, CalibrationReport)
+    if report.sample_size == 0:
+        console.print(
+            "[yellow]No products with stored Keepa monthlySold/fee to calibrate against.[/yellow] "
+            "Fetch some products first, or run with --refresh."
+        )
+        return
+    console.print(
+        f"[bold]Calibration[/bold] — {report.sample_size} product(s).  "
+        f"Units MAPE: {_pct(report.units_mape)}  ·  Fee MAPE: {_pct(report.fee_mape)}  ·  "
+        f"Bucket hit-rate: {_rate(report.unit_bucket_hit_rate)}"
+    )
+    console.print(
+        "[dim]monthlySold is bucketed (e.g. '100+'); an estimate inside the bucket counts as a "
+        "hit (0 error). All thresholds are illustrative until calibrated.[/dim]"
+    )
+    console.print("\n[bold]Per product[/bold]:")
+    for p in report.products[:50]:
+        u = p.units
+        contained = "—" if u.contained is None else ("✓in-bucket" if u.contained else "✗out")
+        bucket = (
+            "—"
+            if u.bucket_low is None
+            else f"{u.bucket_low}+{'' if u.bucket_high is None else f'..{u.bucket_high}'}"
+        )
+        du = "—" if u.delium_units is None else f"{u.delium_units:.0f}"
+        f = p.fee
+        fee = (
+            "—"
+            if f.keepa_fee_cents is None or f.delium_fee_cents is None
+            else f"D ${f.delium_fee_cents / 100:.2f} vs K ${f.keepa_fee_cents / 100:.2f}"
+        )
+        console.print(
+            f"  {p.asin}  units: Delium {du} vs Keepa {bucket} [{contained}]  ·  fee: {fee}"
+        )
+    console.print("\n[bold]Suggested adjustments[/bold] (NOT applied):")
+    for s in report.suggestions:
+        console.print(f"  [cyan]{s.category}[/cyan] — {s.note}")
+
+
+def _pct(value: float | None) -> str:
+    return "—" if value is None else f"{value:.1f}%"
+
+
+def _rate(value: float | None) -> str:
+    return "—" if value is None else f"{value * 100:.0f}%"
+
+
+@app.command()
 def portfolio() -> None:
     """Show all validated candidates ranked by score, capital, and payback."""
     log.info("portfolio requested")

@@ -990,9 +990,13 @@ def _ws_risk(ws: Any) -> None:
 # ---------------------------------------------------------------------------
 def page_settings() -> None:
     st.header("Settings")
-    tab_profile, tab_creds = st.tabs(["Research Profile", "Credentials & Usage"])
+    tab_profile, tab_calib, tab_creds = st.tabs(
+        ["Research Profile", "Calibration", "Credentials & Usage"]
+    )
     with tab_profile:
         _settings_profile()
+    with tab_calib:
+        _settings_calibration()
     with tab_creds:
         st.subheader("API credentials")
         for p in credentials.provider_status():
@@ -1001,6 +1005,85 @@ def page_settings() -> None:
         st.caption("Values are read from the environment / .env and never shown.")
         st.divider()
         page_usage()
+
+
+def _settings_calibration() -> None:
+    st.subheader("Calibration")
+    st.caption(
+        "How well Delium's BSR-curve unit estimate and fee-table FBA fee match "
+        "Keepa's ground truth (`monthlySold` — bucketed — and `fbaFees.pickAndPackFee`), "
+        "from stored data only. All thresholds are illustrative until calibrated; "
+        "suggested adjustments are shown but never applied. Use `delium calibrate --refresh` "
+        "to re-fetch first (paid)."
+    )
+    config = _config()
+    marketplace = st.selectbox(
+        "Marketplace",
+        _MARKETPLACES,
+        index=_MARKETPLACES.index(_profile_marketplace()),
+        key="calib_mp",
+    )
+    count = services.calibration_stored_count(marketplace)
+    st.caption(f"{count} product(s) stored for {marketplace}.")
+    if not st.button("Run calibration (stored data, no API calls)"):
+        return
+    report = services.calibration_report(marketplace, config)
+    if report.sample_size == 0:
+        st.info(
+            "No products with stored Keepa monthlySold/fee to calibrate against. "
+            "Fetch some products first, or run `delium calibrate --refresh`."
+        )
+        return
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Units MAPE", "—" if report.units_mape is None else f"{report.units_mape:.1f}%")
+    c2.metric("Fee MAPE", "—" if report.fee_mape is None else f"{report.fee_mape:.1f}%")
+    c3.metric(
+        "Bucket hit-rate",
+        "—" if report.unit_bucket_hit_rate is None else f"{report.unit_bucket_hit_rate * 100:.0f}%",
+    )
+    st.subheader("Per product")
+    st.dataframe(
+        [
+            {
+                "asin": p.asin,
+                "category": p.category or "—",
+                "delium_units": p.units.delium_units,
+                "keepa_bucket": (
+                    "—"
+                    if p.units.bucket_low is None
+                    else f"{p.units.bucket_low}+"
+                    + ("" if p.units.bucket_high is None else f"..{p.units.bucket_high}")
+                ),
+                "in_bucket": p.units.contained,
+                "delium_fee_$": None
+                if p.fee.delium_fee_cents is None
+                else round(p.fee.delium_fee_cents / 100, 2),
+                "keepa_fee_$": None
+                if p.fee.keepa_fee_cents is None
+                else round(p.fee.keepa_fee_cents / 100, 2),
+            }
+            for p in report.products
+        ],
+        width="stretch",
+        hide_index=True,
+    )
+    st.subheader("Suggested adjustments (not applied)")
+    st.dataframe(
+        [
+            {
+                "category": s.category,
+                "sample": s.sample_size,
+                "unit_ratio": s.unit_median_ratio,
+                "→curve_x": s.suggested_curve_scale,
+                "bucket_hit": s.unit_bucket_hit_rate,
+                "fee_ratio": s.fee_median_ratio,
+                "→fee_x": s.suggested_fee_scale,
+            }
+            for s in report.suggestions
+        ],
+        width="stretch",
+        hide_index=True,
+    )
 
 
 def _settings_profile() -> None:

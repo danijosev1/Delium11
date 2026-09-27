@@ -1,0 +1,38 @@
+# Category Momentum thresholds — ABSOLUTE scale, EXTERNAL DATA (not batch-
+# relative). Categories may be RANKED against each other within a scan, but the
+# score itself is computed against these fixed thresholds, so "72/100" means the
+# same thing on any day.
+#
+# ⚠️ ILLUSTRATIVE until calibrated. Bump `version` on change.
+#
+# Category Momentum answers "which categories are heating up right now?" from a
+# scored product set. Score = weighted mean over the AVAILABLE components.
+
+version = "us-2026"
+
+[weights]
+emerging_count = 30        # how many emerging products the scan found here
+bsr_improvement = 30       # are incumbents' ranks improving (demand rising)?
+new_entrants = 20          # fresh listings launched in the last 90 days
+revenue = 20               # aggregate estimated monthly revenue (traction)
+
+[emerging_count]
+# log_norm(count, lo, hi): 1 emerging → low, hi+ → 100.
+lo = 1
+hi = 25
+
+[bsr_improvement]
+# Median 90-day BSR change across the category's products, as a signed fraction
+# (negative = rank improving = demand rising). We score the improvement:
+#   norm(-median_change, 0, improve_hi) → flat/worsening = 0, strong drop = 100.
+improve_hi = 0.30          # a 30% median rank improvement over 90d → 100
+
+[new_entrants]
+# Products first tracked within 90 days. norm(count, 0, cap).
+cap = 15
+
+[revenue]
+# Aggregate estimated monthly revenue (USD) from Keepa monthlySold × price.
+# log_norm(revenue_usd, lo, hi).
+lo = 20000
+hi = 2000000
