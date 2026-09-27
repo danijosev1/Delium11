@@ -225,14 +225,18 @@ def upsert_product(
     gtin: str | None = None,
     manufacturer: str | None = None,
     parent_asin: str | None = None,
+    monthly_sold: int | None = None,
+    fba_pick_pack_cents: int | None = None,
+    referral_fee_percent: float | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO products
             (asin, marketplace, title, brand, category_path, listing_date,
              dims_json, weight_g, size_tier, images_count, amazon_on_listing,
-             gtin, manufacturer, parent_asin, fetch_id, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+             gtin, manufacturer, parent_asin, monthly_sold, fba_pick_pack_cents,
+             referral_fee_percent, fetch_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(asin) DO UPDATE SET
             marketplace = excluded.marketplace,
             title = excluded.title,
@@ -247,6 +251,9 @@ def upsert_product(
             gtin = excluded.gtin,
             manufacturer = excluded.manufacturer,
             parent_asin = excluded.parent_asin,
+            monthly_sold = excluded.monthly_sold,
+            fba_pick_pack_cents = excluded.fba_pick_pack_cents,
+            referral_fee_percent = excluded.referral_fee_percent,
             fetch_id = excluded.fetch_id,
             updated_at = datetime('now')
         """,
@@ -265,6 +272,9 @@ def upsert_product(
             gtin,
             manufacturer,
             parent_asin,
+            monthly_sold,
+            fba_pick_pack_cents,
+            referral_fee_percent,
             fetch_id,
         ),
     )
@@ -296,6 +306,19 @@ def get_parent_map(
         row = get_product(conn, asin, marketplace)
         out[asin] = row["parent_asin"] if row is not None else None
     return out
+
+
+def get_products_by_parent(
+    conn: sqlite3.Connection, parent_asin: str, marketplace: str
+) -> list[sqlite3.Row]:
+    """All stored products sharing a Keepa parent ASIN in a marketplace (the
+    variation group)."""
+    return _all(
+        conn.execute(
+            "SELECT * FROM products WHERE parent_asin = ? AND marketplace = ? ORDER BY asin",
+            (parent_asin, marketplace),
+        )
+    )
 
 
 def get_products_by_marketplace(
@@ -1175,5 +1198,184 @@ def get_validation(
         conn.execute(
             "SELECT * FROM validations WHERE run_id = ? AND asin = ? AND marketplace = ?",
             (run_id, asin, marketplace),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# research_profiles (Phase 1 preference state)
+# ---------------------------------------------------------------------------
+_PROFILE_FIELDS: tuple[str, ...] = (
+    "name",
+    "is_active",
+    "budget_usd",
+    "target_net_margin",
+    "target_roi",
+    "price_min_cents",
+    "price_max_cents",
+    "min_monthly_sales",
+    "max_reviews",
+    "max_weight_g",
+    "max_size_tier",
+    "preferred_categories",
+    "excluded_categories",
+    "marketplaces",
+    "cogs_mode",
+    "cogs_value",
+    "freight_per_kg_usd",
+    "risk_tolerance",
+)
+
+
+def save_research_profile(
+    conn: sqlite3.Connection, *, profile_id: str | None = None, **values: Any
+) -> str:
+    """Insert or update a research profile by id (id generated when absent). JSON
+    fields (preferred_categories/excluded_categories/marketplaces) must already be
+    serialized to strings by the caller. `updated_at` is refreshed on update."""
+    pid = profile_id or _new_id()
+    cols = ("id", *_PROFILE_FIELDS)
+    placeholders = ", ".join("?" for _ in cols)
+    updates = ", ".join(f"{c} = excluded.{c}" for c in _PROFILE_FIELDS)
+    params = [pid, *(values.get(f) for f in _PROFILE_FIELDS)]
+    conn.execute(
+        f"INSERT INTO research_profiles ({', '.join(cols)}) VALUES ({placeholders}) "
+        f"ON CONFLICT(id) DO UPDATE SET {updates}, updated_at = datetime('now')",
+        params,
+    )
+    return pid
+
+
+def list_research_profiles(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return _all(conn.execute("SELECT * FROM research_profiles ORDER BY name"))
+
+
+def get_research_profile(conn: sqlite3.Connection, profile_id: str) -> sqlite3.Row | None:
+    return _one(conn.execute("SELECT * FROM research_profiles WHERE id = ?", (profile_id,)))
+
+
+def get_active_research_profile(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return _one(conn.execute("SELECT * FROM research_profiles WHERE is_active = 1 LIMIT 1"))
+
+
+def set_active_research_profile(conn: sqlite3.Connection, profile_id: str) -> None:
+    """Make exactly one profile active (clears the others first — the partial
+    unique index allows only one is_active = 1 row)."""
+    conn.execute("UPDATE research_profiles SET is_active = 0 WHERE is_active = 1")
+    conn.execute(
+        "UPDATE research_profiles SET is_active = 1, updated_at = datetime('now') WHERE id = ?",
+        (profile_id,),
+    )
+
+
+def delete_research_profile(conn: sqlite3.Connection, profile_id: str) -> None:
+    conn.execute("DELETE FROM research_profiles WHERE id = ?", (profile_id,))
+
+
+def count_research_profiles(conn: sqlite3.Connection) -> int:
+    row = _one(conn.execute("SELECT COUNT(*) AS n FROM research_profiles"))
+    return int(row["n"]) if row is not None else 0
+
+
+# ---------------------------------------------------------------------------
+# shortlist (working set of products under research)
+# ---------------------------------------------------------------------------
+def upsert_shortlist(
+    conn: sqlite3.Connection,
+    *,
+    asin: str,
+    marketplace: str = "US",
+    status: str = "researching",
+    notes: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO shortlist (asin, marketplace, status, notes)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(asin, marketplace) DO UPDATE SET
+            status = excluded.status,
+            notes = excluded.notes,
+            updated_at = datetime('now')
+        """,
+        (asin, marketplace, status, notes),
+    )
+
+
+def remove_from_shortlist(conn: sqlite3.Connection, asin: str, marketplace: str = "US") -> None:
+    conn.execute("DELETE FROM shortlist WHERE asin = ? AND marketplace = ?", (asin, marketplace))
+
+
+def get_shortlist_entry(
+    conn: sqlite3.Connection, asin: str, marketplace: str = "US"
+) -> sqlite3.Row | None:
+    return _one(
+        conn.execute(
+            "SELECT * FROM shortlist WHERE asin = ? AND marketplace = ?", (asin, marketplace)
+        )
+    )
+
+
+def list_shortlist(conn: sqlite3.Connection, *, status: str | None = None) -> list[sqlite3.Row]:
+    if status is None:
+        return _all(conn.execute("SELECT * FROM shortlist ORDER BY updated_at DESC"))
+    return _all(
+        conn.execute("SELECT * FROM shortlist WHERE status = ? ORDER BY updated_at DESC", (status,))
+    )
+
+
+# ---------------------------------------------------------------------------
+# product_snapshots (re-check series — evidence over time)
+# ---------------------------------------------------------------------------
+def insert_product_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    asin: str,
+    marketplace: str = "US",
+    run_id: str | None = None,
+    price_cents: int | None = None,
+    bsr: int | None = None,
+    review_count: int | None = None,
+    rating: float | None = None,
+    monthly_sold: int | None = None,
+    emergence_score: float | None = None,
+    opportunity_score: float | None = None,
+    verdict: str | None = None,
+    confidence: str | None = None,
+) -> str:
+    snap_id = _new_id()
+    conn.execute(
+        """
+        INSERT INTO product_snapshots
+            (id, asin, marketplace, run_id, price_cents, bsr, review_count, rating,
+             monthly_sold, emergence_score, opportunity_score, verdict, confidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            snap_id,
+            asin,
+            marketplace,
+            run_id,
+            price_cents,
+            bsr,
+            review_count,
+            rating,
+            monthly_sold,
+            emergence_score,
+            opportunity_score,
+            verdict,
+            confidence,
+        ),
+    )
+    return snap_id
+
+
+def get_product_snapshots(
+    conn: sqlite3.Connection, asin: str, marketplace: str = "US"
+) -> list[sqlite3.Row]:
+    return _all(
+        conn.execute(
+            "SELECT * FROM product_snapshots WHERE asin = ? AND marketplace = ? "
+            "ORDER BY captured_at",
+            (asin, marketplace),
         )
     )

@@ -138,11 +138,14 @@ def compute_scenarios(
     base_inputs: ProfitInputs,
     launch: LaunchAssumptions | None = None,
     assumptions: ScenarioAssumptions | None = None,
+    real_fulfillment_cents: int | None = None,
 ) -> ScenarioSet:
     """Compute optimistic / expected / stressed / worst-case profit.
 
     Fees are recomputed per scenario because the referral fee scales with the
     adjusted price (fulfillment/storage depend on size/weight, which are fixed).
+    `real_fulfillment_cents` (Keepa's real FBA fee) is applied to every scenario
+    when present — it does not scale with the price adjustment.
     """
     launch = launch or LaunchAssumptions()
     assumptions = assumptions or ScenarioAssumptions.default()
@@ -156,6 +159,7 @@ def compute_scenarios(
             dims=dims,
             weight_g=weight_g,
             prep_cost_cents=inputs.prep_cost_cents,
+            real_fulfillment_cents=real_fulfillment_cents,
         )
         return compute_profit(inputs, fees, launch)
 

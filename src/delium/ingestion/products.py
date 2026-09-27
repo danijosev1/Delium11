@@ -45,6 +45,9 @@ class ProductView:
     gtin: str | None = None
     manufacturer: str | None = None
     parent_asin: str | None = None
+    monthly_sold: int | None = None
+    fba_pick_pack_cents: int | None = None
+    referral_fee_percent: float | None = None
     latest_price_cents: int | None = None
     latest_bsr: int | None = None
     history_points: int = 0
@@ -99,6 +102,9 @@ def _view_from_db(
         gtin=product["gtin"],
         manufacturer=product["manufacturer"],
         parent_asin=product["parent_asin"],
+        monthly_sold=product["monthly_sold"],
+        fba_pick_pack_cents=product["fba_pick_pack_cents"],
+        referral_fee_percent=product["referral_fee_percent"],
         latest_price_cents=_latest(history, "price_cents"),
         latest_bsr=_latest(history, "bsr"),
         history_points=len(history),
@@ -124,6 +130,9 @@ def _store_normalized(conn: sqlite3.Connection, product: NormalizedProduct, fetc
         gtin=product.gtin,
         manufacturer=product.manufacturer,
         parent_asin=product.parent_asin,
+        monthly_sold=product.monthly_sold,
+        fba_pick_pack_cents=product.fba_pick_pack_cents,
+        referral_fee_percent=product.referral_fee_percent,
     )
     for point in product.history:
         repository.upsert_price_bsr_history(

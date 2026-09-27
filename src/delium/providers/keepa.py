@@ -125,6 +125,9 @@ class NormalizedProduct:
     gtin: str | None = None  # best barcode (EAN preferred, else UPC) — for identity
     manufacturer: str | None = None
     parent_asin: str | None = None  # Keepa `parentAsin` — variation grouping
+    monthly_sold: int | None = None  # Keepa `monthlySold` — units bought past month
+    fba_pick_pack_cents: int | None = None  # Keepa `fbaFees.pickAndPackFee` (cents)
+    referral_fee_percent: float | None = None  # Keepa `referralFeePercentage` (0-1)
     history: list[PriceBsrPoint] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -263,6 +266,25 @@ def _clean_str(value: Any) -> str | None:
     return text or None
 
 
+def _extract_fba_pick_pack(raw: dict[str, Any]) -> int | None:
+    """Keepa `fbaFees.pickAndPackFee` — the real FBA fulfilment fee in cents. A
+    0/absent value means Keepa had no valid dimensions, so we treat it as unknown
+    (None) rather than a free product."""
+    fees = raw.get("fbaFees")
+    if not isinstance(fees, dict):
+        return None
+    return _positive_or_none(fees.get("pickAndPackFee"))
+
+
+def _extract_referral_percent(raw: dict[str, Any]) -> float | None:
+    """Keepa `referralFeePercentage` → a 0-1 fraction. Keepa reports it as a
+    percentage number (e.g. 15 for 15%); store it as a fraction for the engine."""
+    value = raw.get("referralFeePercentage")
+    if not isinstance(value, int | float) or isinstance(value, bool) or value <= 0:
+        return None
+    return float(value) / 100.0
+
+
 def _is_found(raw: dict[str, Any]) -> bool:
     """A Keepa product entry with no title and no history is a dead/absent ASIN."""
     if raw.get("title"):
@@ -339,6 +361,9 @@ def normalize_product(raw: dict[str, Any], marketplace: str = "US") -> Normalize
         gtin=_extract_gtin(raw),
         manufacturer=_clean_str(raw.get("manufacturer")),
         parent_asin=_clean_str(raw.get("parentAsin")),
+        monthly_sold=_positive_or_none(raw.get("monthlySold")),
+        fba_pick_pack_cents=_extract_fba_pick_pack(raw),
+        referral_fee_percent=_extract_referral_percent(raw),
         history=history,
         raw=raw,
     )

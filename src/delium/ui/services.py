@@ -28,6 +28,7 @@ from delium.ingestion import (
     discover_cross_market,
     fetch_keywords,
     fetch_product,
+    fetch_reviews,
 )
 from delium.ingestion.products import ProductView
 from delium.providers import ReviewProviderChain, build_review_provider
@@ -476,3 +477,239 @@ __all__ = [
     "spend_by_provider_day",
     "validate",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Research Profile (Phase 1) — the shared preferences behind every page
+# ---------------------------------------------------------------------------
+def active_profile() -> Any:
+    """The active ResearchProfile (seeded on first use)."""
+    from delium.profile import store
+
+    initialize_database()
+    with get_connection() as conn:
+        return store.load_active(conn)
+
+
+def list_profiles() -> list[Any]:
+    from delium.profile import store
+
+    initialize_database()
+    with get_connection() as conn:
+        return store.list_profiles(conn)
+
+
+def save_profile(profile: Any) -> str:
+    from delium.profile import store
+
+    initialize_database()
+    with get_connection() as conn:
+        return store.save(conn, profile)
+
+
+def activate_profile(profile_id: str) -> None:
+    from delium.profile import store
+
+    with get_connection() as conn:
+        store.set_active(conn, profile_id)
+
+
+def delete_profile(profile_id: str) -> None:
+    from delium.profile import store
+
+    with get_connection() as conn:
+        store.delete(conn, profile_id)
+
+
+# ---------------------------------------------------------------------------
+# Product Workspace (Phase 1)
+# ---------------------------------------------------------------------------
+def workspace(asin: str, marketplace: str, config: DeliumConfig) -> Any:
+    """Assemble the full workspace for one product (read-only, cache-first)."""
+    from delium.discovery.workspace import assemble_workspace
+    from delium.profile import store
+
+    initialize_database()
+    with get_connection() as conn:
+        profile = store.load_active(conn)
+        return assemble_workspace(
+            conn, asin.strip().upper(), Marketplace(marketplace), config, profile
+        )
+
+
+def deep_dive_plan(ws: Any, config: DeliumConfig) -> Any:
+    """What the workspace is missing + a combined cost/token estimate."""
+    from delium.discovery.workspace import deep_dive_plan as _plan
+    from delium.ui import credentials
+
+    return _plan(
+        ws,
+        config,
+        reviews_configured=credentials.is_configured("reviews"),
+        dataforseo_configured=credentials.is_configured("dataforseo"),
+        keepa_configured=credentials.is_configured("keepa"),
+        serp_depth=config.discovery.serp_depth,
+    )
+
+
+def run_deep_dive(asin: str, marketplace: str, config: DeliumConfig, plan: Any) -> tuple[Any, int]:
+    """Fetch the missing evidence for a product (cache-first, batched Keepa) and
+    return (refreshed workspace, keepa tokens used). PAID — the UI confirms first.
+    Reverse-ASIN keywords (DataForSEO Labs) are not wired yet and are skipped."""
+    from delium.ingestion import hydrate_products
+
+    initialize_database()
+    asin = asin.strip().upper()
+    keepa_factory, dfs_factory = _provider_factories()
+    step_keys = {s.key for s in plan.steps}
+    with get_connection() as conn:
+        run_id = repository.insert_run(conn, command="deep-dive", input_=f"{marketplace}:{asin}")
+
+    if "product" in step_keys and keepa_factory is not None:
+        with contextlib.suppress(ProviderError):
+            fetch_product(
+                asin, run_id=run_id, client=keepa_factory(marketplace), config=config, force=False
+            )
+    if "competitors" in step_keys and dfs_factory is not None:
+        seed = _main_keyword(asin, marketplace)
+        if seed is not None:
+            with contextlib.suppress(ProviderError):
+                fetch_keywords(seed, run_id=run_id, client=dfs_factory(marketplace), config=config)
+            comp_asins = _serp_asins(seed, marketplace)
+            if comp_asins and keepa_factory is not None:
+                with contextlib.suppress(ProviderError):
+                    hydrate_products(
+                        comp_asins, run_id=run_id, client=keepa_factory(marketplace), config=config
+                    )
+    if "reviews" in step_keys:
+        provider = _review_probe()
+        if provider is not None:
+            with contextlib.suppress(ProviderError):
+                fetch_reviews(asin, run_id=run_id, provider=provider, config=config)
+
+    with get_connection() as conn:
+        repository.finish_run(conn, run_id, status="complete")
+        tokens = repository.run_token_total(conn, run_id)
+    ws = workspace(asin, marketplace, config)
+    _write_snapshot(ws, run_id=run_id)
+    return ws, tokens
+
+
+def _main_keyword(asin: str, marketplace: str) -> str | None:
+    with get_connection() as conn:
+        phrases = repository.get_serp_keyword_phrases(conn, asin, marketplace)
+    return phrases[0] if phrases else None
+
+
+def _serp_asins(seed: str, marketplace: str) -> list[str]:
+    with get_connection() as conn:
+        return [r["asin"] for r in repository.get_serp_rankings(conn, seed, marketplace)]
+
+
+# ---------------------------------------------------------------------------
+# Shortlist + re-check snapshots (Phase 1)
+# ---------------------------------------------------------------------------
+def set_shortlist(
+    asin: str, marketplace: str, *, status: str = "researching", notes: str | None = None
+) -> None:
+    initialize_database()
+    with get_connection() as conn:
+        repository.upsert_shortlist(
+            conn, asin=asin.strip().upper(), marketplace=marketplace, status=status, notes=notes
+        )
+
+
+def remove_from_shortlist(asin: str, marketplace: str) -> None:
+    with get_connection() as conn:
+        repository.remove_from_shortlist(conn, asin.strip().upper(), marketplace)
+
+
+def shortlist_rows(status: str | None = None) -> list[sqlite3.Row]:
+    initialize_database()
+    with get_connection() as conn:
+        return repository.list_shortlist(conn, status=status)
+
+
+def _write_snapshot(ws: Any, *, run_id: str | None = None) -> None:
+    """Record a point-in-time snapshot of a workspace's key metrics."""
+    m = ws.momentum
+    d = ws.diagnosis
+    latest_price = m.price_usd[-1] if (m and m.price_usd) else None
+    with get_connection() as conn:
+        repository.insert_product_snapshot(
+            conn,
+            asin=ws.asin,
+            marketplace=ws.marketplace,
+            run_id=run_id,
+            price_cents=None if latest_price is None else round(latest_price * 100),
+            bsr=(m.bsr[-1] if (m and m.bsr) else None),
+            review_count=(m.reviews[-1] if (m and m.reviews) else None),
+            monthly_sold=(m.keepa_monthly_sold if m else None),
+            emergence_score=(m.emergence if m else None),
+            opportunity_score=(d.score if d else None),
+            verdict=(d.verdict if d else None),
+            confidence=(d.confidence if d else None),
+        )
+
+
+def recheck(asin: str, marketplace: str, config: DeliumConfig) -> tuple[Any, int]:
+    """Refetch this product's Keepa data (cache-first) and store a fresh snapshot
+    so momentum can be compared over time. Returns (workspace, keepa tokens)."""
+    from delium.ingestion import hydrate_products
+
+    initialize_database()
+    asin = asin.strip().upper()
+    keepa_factory, _dfs = _provider_factories()
+    tokens = 0
+    with get_connection() as conn:
+        run_id = repository.insert_run(conn, command="recheck", input_=f"{marketplace}:{asin}")
+    if keepa_factory is not None:
+        with contextlib.suppress(ProviderError):
+            hydrate_products(
+                [asin], run_id=run_id, client=keepa_factory(marketplace), config=config, force=True
+            )
+    with get_connection() as conn:
+        repository.finish_run(conn, run_id, status="complete")
+        tokens = repository.run_token_total(conn, run_id)
+    ws = workspace(asin, marketplace, config)
+    _write_snapshot(ws, run_id=run_id)
+    return ws, tokens
+
+
+# ---------------------------------------------------------------------------
+# Home summary (Phase 1)
+# ---------------------------------------------------------------------------
+def home_summary(config: DeliumConfig, *, top_n: int = 10) -> dict[str, Any]:
+    """Shortlist, recent runs, top profile-matching opportunities, Keepa tokens.
+    DB-only except the free Keepa /token check (0 tokens)."""
+    from delium.profile import store
+
+    initialize_database()
+    with get_connection() as conn:
+        profile = store.load_active(conn)
+        shortlist = repository.list_shortlist(conn)
+        runs = repository.list_runs(conn, limit=10)
+        validations = repository.list_validations(conn, limit=200)
+    top = _top_opportunities(validations, profile, top_n)
+    return {
+        "profile": profile,
+        "shortlist": shortlist,
+        "runs": runs,
+        "top_opportunities": top,
+        "keepa_tokens": keepa_token_status(),
+    }
+
+
+def _top_opportunities(
+    validations: list[sqlite3.Row], profile: Any, top_n: int
+) -> list[sqlite3.Row]:
+    """Best recent validations, most-recent-first within score, filtered to the
+    profile's marketplaces. Sorting/highlighting only — no rule change."""
+    mps = set(profile.marketplaces) if profile.marketplaces else None
+    rows = [
+        r
+        for r in validations
+        if r["opportunity_score"] is not None and (mps is None or r["marketplace"] in mps)
+    ]
+    rows.sort(key=lambda r: float(r["opportunity_score"]), reverse=True)
+    return rows[:top_n]

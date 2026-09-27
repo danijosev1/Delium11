@@ -79,6 +79,56 @@ def _verdict_banner(verdict_value: str, subtitle: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Navigation + profile helpers
+# ---------------------------------------------------------------------------
+def _active_profile() -> Any:
+    """The active Research Profile (cached in session state for one rerun)."""
+    if "_profile" not in st.session_state:
+        st.session_state["_profile"] = services.active_profile()
+    return st.session_state["_profile"]
+
+
+def _refresh_profile() -> None:
+    st.session_state.pop("_profile", None)
+
+
+def _profile_banner() -> None:
+    try:
+        profile = _active_profile()
+    except Exception:  # noqa: BLE001 - never let the banner break a page
+        return
+    st.caption(
+        f"🧭 **Profile: {profile.name}** · risk {profile.risk_tolerance.value} · "
+        f"budget {_usd(profile.budget_usd or 0, places=0)} · "
+        f"price {_usd((profile.price_min_cents or 0) / 100, places=0)}–"
+        f"{_usd((profile.price_max_cents or 0) / 100, places=0)}"
+    )
+
+
+def _profile_marketplace() -> str:
+    mps = _active_profile().marketplaces or ("US",)
+    return mps[0] if mps[0] in _MARKETPLACES else "US"
+
+
+def _goto(section: str, **state: Any) -> None:
+    """Switch the top-level section (and stash any state) then rerun."""
+    st.session_state.update(state)
+    st.session_state["_section"] = section
+    st.rerun()
+
+
+def _open_workspace_picker(asins: list[str], marketplace: str, *, key: str) -> None:
+    """Offer to open one of a result's ASINs in the Product workspace."""
+    asins = [a for a in dict.fromkeys(asins) if a]
+    if not asins:
+        return
+    col1, col2 = st.columns([3, 1])
+    choice = col1.selectbox("Open a product in the workspace", asins, key=f"{key}_pick")
+    if col2.button("Open →", key=f"{key}_open"):
+        _goto("Product", ws_asin=choice, ws_mp=marketplace)
+
+
+# ---------------------------------------------------------------------------
 # Pages
 # ---------------------------------------------------------------------------
 def page_keyword_research() -> None:
@@ -93,7 +143,9 @@ def page_keyword_research() -> None:
 
     seed = st.text_input("Seed keyword", placeholder="silicone baby food tray")
     col1, col2 = st.columns(2)
-    marketplace = col1.selectbox("Marketplace", _MARKETPLACES, key="kw_mp")
+    marketplace = col1.selectbox(
+        "Marketplace", _MARKETPLACES, index=_MARKETPLACES.index(_profile_marketplace()), key="kw_mp"
+    )
     force = col2.checkbox("Bypass cache (refetch)", key="kw_force")
     if not seed.strip():
         return
@@ -116,7 +168,9 @@ def page_keyword_research() -> None:
     st.subheader("Related keywords")
     st.dataframe(format.related_rows(result), width="stretch", hide_index=True)
     st.subheader("Top SERP ASINs")
-    st.dataframe(format.serp_rows(result), width="stretch", hide_index=True)
+    serp = format.serp_rows(result)
+    st.dataframe(serp, width="stretch", hide_index=True)
+    _open_workspace_picker([r["asin"] for r in serp], marketplace, key="kw")
 
 
 def page_product_lookup() -> None:
@@ -264,7 +318,12 @@ def page_discover() -> None:
 
     raw = st.text_area("Seed keyword(s), one per line", placeholder="silicone baby food tray")
     col1, col2 = st.columns(2)
-    marketplace = col1.selectbox("Marketplace", _MARKETPLACES, key="disc_mp")
+    marketplace = col1.selectbox(
+        "Marketplace",
+        _MARKETPLACES,
+        index=_MARKETPLACES.index(_profile_marketplace()),
+        key="disc_mp",
+    )
     force = col2.checkbox("Bypass cache (refetch)", key="disc_force")
     keywords = [line.strip() for line in raw.splitlines() if line.strip()]
     if not keywords:
@@ -298,6 +357,7 @@ def page_discover() -> None:
     if rows:
         st.subheader("Ranked candidates (variations collapsed by parent)")
         st.dataframe(rows, width="stretch", hide_index=True)
+        _open_workspace_picker(ranked_asins, marketplace, key="disc")
 
     if report.killed:
         st.subheader(f"Eliminated by hard kills ({len(report.killed)})")
@@ -344,9 +404,16 @@ def page_emerging() -> None:
         return
 
     config = _config()
+    profile = _active_profile()
     col1, col2 = st.columns(2)
-    marketplace = col1.selectbox("Marketplace", _MARKETPLACES, key="em_mp")
-    cats_raw = col2.text_input("Keepa category ids (comma-separated, optional)", key="em_cats")
+    marketplace = col1.selectbox(
+        "Marketplace", _MARKETPLACES, index=_MARKETPLACES.index(_profile_marketplace()), key="em_mp"
+    )
+    cats_raw = col2.text_input(
+        "Keepa category ids (comma-separated, optional)",
+        value=",".join(str(c) for c in profile.category_ids()),
+        key="em_cats",
+    )
     col3, col4 = st.columns(2)
     max_reviews = col3.number_input(
         "Max reviews override", min_value=0, value=0, step=10, key="em_rev"
@@ -355,11 +422,14 @@ def page_emerging() -> None:
         "Max age days override", min_value=0, value=0, step=30, key="em_age"
     )
     category_ids = [int(x) for x in cats_raw.replace(" ", "").split(",") if x.strip().isdigit()]
-    overrides: dict[str, int] = {}
+    # Profile drives the finder defaults (price band, review ceiling); explicit
+    # per-run overrides below win.
+    overrides: dict[str, int] = dict(profile.finder_overrides())
     if max_reviews:
         overrides["reviews_max"] = int(max_reviews)
     if max_age:
         overrides["age_max_days"] = int(max_age)
+    st.caption(f"Finder defaults from profile: {overrides or 'none'}")
 
     est, finder_tok, product_tok = costs.emerging_estimate(
         config, dataforseo=credentials.is_configured("dataforseo")
@@ -399,6 +469,7 @@ def page_emerging() -> None:
             width="stretch",
             hide_index=True,
         )
+        _open_workspace_picker([c.asin for c in report.ranked], marketplace, key="em")
         _emerging_cards(report, facts)
     else:
         st.info("No emerging candidates survived scoring.")
@@ -570,26 +641,501 @@ def page_usage() -> None:
         st.caption("no runs recorded yet")
 
 
-_PAGES = {
-    "Keyword research": page_keyword_research,
-    "Product lookup": page_product_lookup,
-    "Validate": page_validate,
-    "Discover": page_discover,
+# ---------------------------------------------------------------------------
+# Home
+# ---------------------------------------------------------------------------
+def page_home() -> None:
+    st.header("Home")
+    config = _config()
+    summary = services.home_summary(config)
+
+    tokens = summary["keepa_tokens"]
+    if tokens is not None and tokens.tokens_left is not None:
+        st.metric("Keepa tokens left", f"{tokens.tokens_left:,}")
+
+    st.subheader("Shortlist")
+    shortlist = summary["shortlist"]
+    if shortlist:
+        st.dataframe(
+            [
+                {
+                    "asin": r["asin"],
+                    "marketplace": r["marketplace"],
+                    "status": r["status"],
+                    "notes": r["notes"] or "",
+                    "updated": r["updated_at"],
+                }
+                for r in shortlist
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+        _open_workspace_picker([r["asin"] for r in shortlist], "US", key="home_short")
+    else:
+        st.caption("Nothing shortlisted yet — open a product and add it.")
+
+    st.subheader("Top opportunities matching your profile")
+    top = summary["top_opportunities"]
+    if top:
+        st.dataframe(format.validation_rows(top), width="stretch", hide_index=True)
+        _open_workspace_picker([r["asin"] for r in top], "US", key="home_top")
+    else:
+        st.caption("No validated candidates yet — run a Find or Validate.")
+
+    st.subheader("Recent runs")
+    runs = format.run_rows(summary["runs"])
+    st.dataframe(runs, width="stretch", hide_index=True) if runs else st.caption("none yet")
+
+    st.divider()
+    if st.button("Open a product by ASIN →"):
+        _goto("Product")
+
+
+# ---------------------------------------------------------------------------
+# Find (Emerging / Keyword / Discover / Cross-market / History)
+# ---------------------------------------------------------------------------
+_FIND_MODES = {
     "Emerging": page_emerging,
+    "Keyword": page_keyword_research,
+    "Black Box (Discover)": page_discover,
     "Cross-market": page_cross_market,
     "History": page_history,
-    "Usage": page_usage,
+}
+
+
+def page_find() -> None:
+    st.header("Find")
+    mode = st.radio("Mode", list(_FIND_MODES), horizontal=True, key="find_mode")
+    st.divider()
+    _FIND_MODES[mode]()
+
+
+# ---------------------------------------------------------------------------
+# Product workspace
+# ---------------------------------------------------------------------------
+def page_product() -> None:
+    st.header("Product workspace")
+    config = _config()
+    default_asin = str(st.session_state.get("ws_asin", ""))
+    default_mp = str(st.session_state.get("ws_mp", _profile_marketplace()))
+    col1, col2 = st.columns([3, 1])
+    asin = col1.text_input("ASIN", value=default_asin, placeholder="B0XXXXXXXX", key="ws_asin_in")
+    marketplace = col2.selectbox(
+        "Marketplace",
+        _MARKETPLACES,
+        index=_MARKETPLACES.index(default_mp if default_mp in _MARKETPLACES else "US"),
+    )
+    if not asin.strip():
+        st.info("Enter an ASIN, or open one from a Find result / the shortlist.")
+        return
+
+    ws = services.workspace(asin, marketplace, config)
+    if not ws.found:
+        st.warning(
+            f"{ws.asin} has not been fetched in {marketplace} yet. Run a Deep dive below to "
+            "fetch it (Keepa)."
+        )
+    _workspace_actions(ws, marketplace, config)
+
+    tabs = st.tabs(
+        [
+            "Overview",
+            "Sales & momentum",
+            "Keywords",
+            "Competitors",
+            "Reviews & ideas",
+            "Profit",
+            "Risk & verdict",
+        ]
+    )
+    with tabs[0]:
+        _ws_overview(ws)
+    with tabs[1]:
+        _ws_momentum(ws)
+    with tabs[2]:
+        _ws_keywords(ws)
+    with tabs[3]:
+        _ws_competitors(ws)
+    with tabs[4]:
+        _ws_reviews(ws)
+    with tabs[5]:
+        _ws_profit(ws)
+    with tabs[6]:
+        _ws_risk(ws)
+
+
+def _workspace_actions(ws: Any, marketplace: str, config: Any) -> None:
+    """Shortlist controls, re-check, and the single Deep-dive button."""
+    c1, c2, c3 = st.columns(3)
+    statuses = ["researching", "sampling", "rejected", "launched"]
+    with c1:
+        cur = ws.shortlist.status or "researching"
+        status = st.selectbox("Shortlist status", statuses, index=statuses.index(cur))
+        notes = st.text_input("Notes", value=ws.shortlist.notes or "")
+        if ws.shortlist.on_shortlist:
+            if st.button("Update shortlist"):
+                services.set_shortlist(ws.asin, marketplace, status=status, notes=notes)
+                _goto("Product", ws_asin=ws.asin, ws_mp=marketplace)
+            if st.button("Remove from shortlist"):
+                services.remove_from_shortlist(ws.asin, marketplace)
+                _goto("Product", ws_asin=ws.asin, ws_mp=marketplace)
+        elif st.button("Add to shortlist"):
+            services.set_shortlist(ws.asin, marketplace, status=status, notes=notes)
+            _goto("Product", ws_asin=ws.asin, ws_mp=marketplace)
+    with c2:
+        st.caption("Re-check refreshes Keepa data and stores a snapshot to compare momentum.")
+        if credentials.is_configured("keepa") and st.button("Re-check now (Keepa)"):
+            with st.spinner("Refreshing Keepa data…"):
+                _ws, tokens = services.recheck(ws.asin, marketplace, config)
+            st.success(f"Re-checked — {tokens} Keepa tokens used.")
+            _goto("Product", ws_asin=ws.asin, ws_mp=marketplace)
+    with c3:
+        _deep_dive_control(ws, marketplace, config)
+
+
+def _deep_dive_control(ws: Any, marketplace: str, config: Any) -> None:
+    plan = services.deep_dive_plan(ws, config)
+    if not plan.has_work:
+        st.caption("Deep dive: nothing missing (or no providers configured).")
+        return
+    st.markdown("**Deep dive** — fetch what's missing:")
+    for step in plan.steps:
+        st.caption(f"• {step.label} — {_escape_money(step.reason)}")
+    st.caption(
+        f"Estimated: {_usd(plan.total_cost_usd)} + ~{plan.total_keepa_tokens} Keepa tokens "
+        "(cache-first)."
+    )
+    if st.button("Confirm & run Deep dive", type="primary"):
+        with st.spinner("Fetching missing evidence…"):
+            _ws, tokens = services.run_deep_dive(ws.asin, marketplace, config, plan)
+        st.success(f"Deep dive complete — {tokens} Keepa tokens used.")
+        _goto("Product", ws_asin=ws.asin, ws_mp=marketplace)
+
+
+def _ws_overview(ws: Any) -> None:
+    if ws.card is not None:
+        st.markdown(f"### {_escape_money(ws.card.headline)}")
+        for label, items in (
+            ("Why it looks promising", ws.card.promising),
+            ("Why confidence is uncertain", ws.card.low_confidence),
+            ("What would raise confidence", ws.card.to_raise),
+        ):
+            if items:
+                st.markdown(f"**{label}:**")
+                for it in items:
+                    st.markdown("- " + _escape_money(it))
+        for flag in ws.card.flags:
+            st.warning(_escape_money(flag))
+        st.markdown("**Next action:** " + _escape_money(ws.card.next_action))
+    else:
+        st.info("Not enough data to score yet. Run a Deep dive to fetch this product.")
+    f = ws.facts
+    st.divider()
+    st.markdown(f"**{f.title or ws.asin}** · {f.brand or '—'} · {f.category or '—'}")
+    if ws.variation.parent_asin:
+        st.caption(
+            f"Variation group: parent {ws.variation.parent_asin} · "
+            f"{ws.variation.variation_count} variations."
+        )
+
+
+def _ws_momentum(ws: Any) -> None:
+    m = ws.momentum
+    if m is None or not m.dates:
+        st.info("No price/BSR history yet.")
+        return
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "Keepa monthly sold", "—" if m.keepa_monthly_sold is None else f"{m.keepa_monthly_sold:,}"
+    )
+    c2.metric(
+        "Delium est. units/mo",
+        "—" if m.delium_units_estimate is None else f"{m.delium_units_estimate:,}",
+    )
+    c3.metric("Launch age (days)", "—" if m.age_days is None else f"{m.age_days:,}")
+    frame = pd.DataFrame(
+        {"date": m.dates, "price_usd": m.price_usd, "bsr": m.bsr, "reviews": m.reviews}
+    ).set_index("date")
+    st.line_chart(frame[["price_usd"]])
+    st.line_chart(frame[["bsr"]])
+    st.line_chart(frame[["reviews"]])
+    if ws.snapshots:
+        st.subheader("Re-check history (momentum over time)")
+        st.dataframe(
+            [
+                {
+                    "captured": s["captured_at"],
+                    "bsr": s["bsr"],
+                    "monthly_sold": s["monthly_sold"],
+                    "verdict": s["verdict"],
+                }
+                for s in ws.snapshots
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+
+def _ws_keywords(ws: Any) -> None:
+    kw = ws.keywords
+    if kw.keywords:
+        st.dataframe(
+            [
+                {"keyword": k.phrase, "volume": k.volume, "primary": k.is_primary}
+                for k in kw.keywords
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.caption("No keywords resolved yet.")
+    st.info(kw.note)
+
+
+def _ws_competitors(ws: Any) -> None:
+    cs = ws.competitors
+    if cs.launchability_pct is not None:
+        st.metric("Launchability", f"{cs.launchability_pct:.0f}%")
+    st.caption(cs.note)
+    if cs.competitors:
+        st.dataframe(
+            [
+                {
+                    "asin": c.asin,
+                    "brand": c.brand,
+                    "price_usd": None if c.price_cents is None else round(c.price_cents / 100, 2),
+                    "reviews": c.reviews,
+                    "rating": c.rating,
+                    "bsr": c.bsr,
+                    "monthly_sold": c.monthly_sold,
+                    "age_days": c.age_days,
+                    "variations": c.variation_count,
+                }
+                for c in cs.competitors
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.caption("No competitor set yet — run a Deep dive.")
+
+
+def _ws_reviews(ws: Any) -> None:
+    if ws.reviews.available:
+        st.success(ws.reviews.note)
+        st.caption(
+            "Pains, feature gaps, and improvement ideas come from the review-mining agents "
+            "in a full Validate run."
+        )
+    else:
+        st.info(ws.reviews.note)
+
+
+def _ws_profit(ws: Any) -> None:
+    p = ws.profit
+    if not p.available or p.scenarios is None:
+        st.info(p.note)
+        return
+    st.caption(p.note + f"  Profit uses **Profile: {ws.profile_name}** COGS/freight.")
+    e = p.scenarios.expected
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Net margin", f"{(p.net_margin or 0) * 100:.0f}%")
+    c2.metric("ROI", f"{(p.roi or 0) * 100:.0f}%")
+    c3.metric("Units affordable", "—" if p.units_affordable is None else f"{p.units_affordable:,}")
+    c4.metric("Break-even units", "—" if p.break_even_units is None else f"{p.break_even_units:,}")
+    st.markdown(
+        f"Fees: **{p.fee_source}** · FBA fulfilment {_usd(e.fees.fulfillment_cents / 100)} · "
+        f"referral {_usd(e.fees.referral_cents / 100)} · landed {_usd(e.landed_cost_cents / 100)}"
+    )
+    st.caption(
+        "Meets your profile targets."
+        if p.meets_targets
+        else "Below your profile margin/ROI targets (highlight only — not a hard gate)."
+    )
+
+
+def _ws_risk(ws: Any) -> None:
+    d = ws.diagnosis
+    if d is None:
+        st.info("No verdict yet — run a Deep dive.")
+        return
+    _verdict_banner(d.verdict, f"opportunity {d.score:.0f}/100 · {d.confidence} confidence")
+    if d.kill_reasons:
+        st.subheader("Hard kills")
+        for k in d.kill_reasons:
+            st.markdown("- " + _escape_money(k))
+    if d.gate_reasons:
+        st.subheader("Gate failures")
+        for g in d.gate_reasons:
+            st.markdown("- " + _escape_money(g))
+    st.subheader("Pillars")
+    st.dataframe(
+        [
+            {
+                "pillar": p.pillar,
+                "score": p.capped,
+                "confidence": p.confidence,
+                "status": "absent" if not p.available else ("partial" if p.partial else "ok"),
+                "driver": p.driver,
+            }
+            for p in d.pillars
+        ],
+        width="stretch",
+        hide_index=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Settings (Research Profile + credentials + usage)
+# ---------------------------------------------------------------------------
+def page_settings() -> None:
+    st.header("Settings")
+    tab_profile, tab_creds = st.tabs(["Research Profile", "Credentials & Usage"])
+    with tab_profile:
+        _settings_profile()
+    with tab_creds:
+        st.subheader("API credentials")
+        for p in credentials.provider_status():
+            icon = "✅" if p.configured else "⬜"
+            st.markdown(f"{icon} **{p.label}** — {p.enables}")
+        st.caption("Values are read from the environment / .env and never shown.")
+        st.divider()
+        page_usage()
+
+
+def _settings_profile() -> None:
+    from delium.profile.models import CogsMode, ResearchProfile, RiskTolerance
+
+    profiles = services.list_profiles()
+    names = [p.name for p in profiles]
+    active = _active_profile()
+    idx = names.index(active.name) if active.name in names else 0
+    chosen_name = st.selectbox("Preset", names, index=idx)
+    chosen = next(p for p in profiles if p.name == chosen_name)
+
+    if not chosen.is_active and st.button(f"Make “{chosen.name}” the active profile"):
+        services.activate_profile(chosen.id or "")
+        _refresh_profile()
+        _goto("Settings")
+
+    st.divider()
+    st.markdown("**Edit profile** (drives finder defaults + profit; never the hard rules)")
+    c1, c2, c3 = st.columns(3)
+    budget = c1.number_input(
+        "Budget (USD)", min_value=0.0, value=float(chosen.budget_usd or 0), step=500.0
+    )
+    margin = c2.number_input(
+        "Target net margin",
+        min_value=0.0,
+        max_value=1.0,
+        value=float(chosen.target_net_margin or 0.0),
+        step=0.05,
+    )
+    roi = c3.number_input(
+        "Target ROI (x)", min_value=0.0, value=float(chosen.target_roi or 0.0), step=0.25
+    )
+    c4, c5, c6 = st.columns(3)
+    price_min = c4.number_input(
+        "Price min ($)", min_value=0.0, value=float((chosen.price_min_cents or 0) / 100), step=1.0
+    )
+    price_max = c5.number_input(
+        "Price max ($)", min_value=0.0, value=float((chosen.price_max_cents or 0) / 100), step=1.0
+    )
+    max_reviews = c6.number_input(
+        "Max reviews", min_value=0, value=int(chosen.max_reviews or 0), step=50
+    )
+    c7, c8, c9 = st.columns(3)
+    min_sales = c7.number_input(
+        "Min monthly sales", min_value=0, value=int(chosen.min_monthly_sales or 0), step=50
+    )
+    max_weight = c8.number_input(
+        "Max weight (g)", min_value=0, value=int(chosen.max_weight_g or 0), step=100
+    )
+    risk = c9.selectbox(
+        "Risk tolerance",
+        [r.value for r in RiskTolerance],
+        index=[r.value for r in RiskTolerance].index(chosen.risk_tolerance.value),
+    )
+    c10, c11, c12 = st.columns(3)
+    cogs_mode = c10.selectbox(
+        "COGS mode",
+        [m.value for m in CogsMode],
+        index=[m.value for m in CogsMode].index(chosen.cogs_mode.value),
+    )
+    cogs_value = c11.number_input(
+        "COGS value (pct 0-1 or $/unit)", min_value=0.0, value=float(chosen.cogs_value), step=0.05
+    )
+    freight = c12.number_input(
+        "Freight ($/kg)", min_value=0.0, value=float(chosen.freight_per_kg_usd), step=0.5
+    )
+    marketplaces = st.multiselect(
+        "Marketplaces", _MARKETPLACES, default=list(chosen.marketplaces) or ["US"]
+    )
+    excluded = st.text_input(
+        "Excluded categories (comma-separated, soft filter)",
+        value=", ".join(chosen.excluded_categories),
+    )
+
+    if st.button("Save profile", type="primary"):
+        updated = ResearchProfile(
+            id=chosen.id,
+            name=chosen.name,
+            is_active=chosen.is_active,
+            budget_usd=budget or None,
+            target_net_margin=margin or None,
+            target_roi=roi or None,
+            price_min_cents=int(price_min * 100) or None,
+            price_max_cents=int(price_max * 100) or None,
+            min_monthly_sales=int(min_sales) or None,
+            max_reviews=int(max_reviews) or None,
+            max_weight_g=int(max_weight) or None,
+            max_size_tier=chosen.max_size_tier,
+            preferred_categories=chosen.preferred_categories,
+            excluded_categories=tuple(t.strip() for t in excluded.split(",") if t.strip()),
+            marketplaces=tuple(marketplaces) or ("US",),
+            cogs_mode=CogsMode(cogs_mode),
+            cogs_value=cogs_value,
+            freight_per_kg_usd=freight,
+            risk_tolerance=RiskTolerance(risk),
+        )
+        services.save_profile(updated)
+        _refresh_profile()
+        st.success("Saved.")
+        _goto("Settings")
+
+    st.divider()
+    new_name = st.text_input("New preset name")
+    if st.button("Create preset") and new_name.strip():
+        services.save_profile(ResearchProfile(name=new_name.strip()))
+        _goto("Settings")
+    if len(profiles) > 1 and st.button(f"Delete “{chosen.name}”"):
+        services.delete_profile(chosen.id or "")
+        _refresh_profile()
+        _goto("Settings")
+
+
+_SECTIONS = ["Home", "Find", "Product", "Settings"]
+_SECTION_PAGES = {
+    "Home": page_home,
+    "Find": page_find,
+    "Product": page_product,
+    "Settings": page_settings,
 }
 
 
 def main() -> None:
     st.set_page_config(page_title="Delium", page_icon="🔎", layout="wide")
+    st.session_state.setdefault("_section", "Home")
     st.sidebar.title("🔎 Delium")
-    choice = st.sidebar.radio("Page", list(_PAGES), label_visibility="collapsed")
+    section = st.sidebar.radio(
+        "Navigate", _SECTIONS, index=_SECTIONS.index(st.session_state["_section"])
+    )
+    st.session_state["_section"] = section
     st.sidebar.divider()
     _sidebar_credentials()
+    _profile_banner()
     try:
-        _PAGES[choice]()
+        _SECTION_PAGES[section]()
     except ConfigError as exc:
         st.error(f"Configuration error: {exc}")
 

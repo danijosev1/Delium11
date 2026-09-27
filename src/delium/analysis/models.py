@@ -75,6 +75,9 @@ class FeeBreakdown:
     prep_cents: int
     size_tier: str
     fee_table_version: str
+    # Where the FBA fulfilment fee came from: our fee table (estimate) or Keepa's
+    # real per-unit fee. Referral/closing/storage stay table-derived either way.
+    fulfillment_source: str = "table"  # 'table' | 'keepa'
 
     @property
     def amazon_fees_cents(self) -> int:

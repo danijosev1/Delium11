@@ -57,13 +57,55 @@ uv sync --group ui        # one-time: install the optional UI dependencies
 uv run delium ui          # launches http://localhost:8501 (use --port to change)
 ```
 
-Pages: **Keyword research**, **Product lookup** (with price/BSR history chart),
-**Validate** (verdict + pillar scores + kills/gates + full report), **Discover**,
-**Cross-market**, and **History** (past runs/validations/reports from the local
-DB, no API calls). A sidebar panel shows which credentials are configured
-(never their values). Before any paid provider call the app shows the providers
-and an estimated cost and requires a confirm click, then reports the actual
-cost; cached data is reused and shown as $0.00.
+The UI is organised into four sections (sidebar):
+
+- **Home** — your shortlist, top opportunities matching the active profile,
+  recent runs, and Keepa tokens left.
+- **Find** — one page with modes: **Emerging** (Keepa Product Finder, profile-
+  driven filters + variation dedupe), **Keyword** research, **Black Box
+  (Discover)**, **Cross-market**, and **History**. Every result links to the
+  workspace ("Open →").
+- **Product** — the **workspace**: everything about ONE product across seven
+  tabs — Overview (plain-English card), Sales & momentum (Keepa history, Keepa
+  monthly-sold vs Delium's estimate, emergence, launch age), Keywords,
+  Competitors (page-one set, deduped, with a launchability stat), Reviews &
+  improvement ideas, Profit (real Keepa FBA fee where available, profile
+  COGS/freight, units affordable + break-even), and Risk & verdict. One
+  **Deep dive** button fetches whatever is missing (competitors, keywords,
+  reviews, fees) after showing a combined cost/token estimate. You can add to
+  the **shortlist** (status + notes) and **Re-check** to refresh Keepa data and
+  store a snapshot so you can see whether momentum held.
+- **Settings** — the **Research Profile** (+ named presets), API credential
+  status, and Usage.
+
+Every page shows the active profile at the top ("Profile: Conservative $5k").
+A sidebar panel shows which credentials are configured (never their values).
+Before any paid provider call the app shows the providers and an estimated cost
+and requires a confirm click, then reports the actual cost; cached data is
+reused and shown as \$0.00.
+
+### Research Profile
+
+One shared, DB-backed set of seller preferences drives every finder/search
+default and every profit calculation, and steers how results are sorted and
+highlighted. Fields: budget, target sell-price range, min monthly sales, max
+reviews, preferred/excluded categories, marketplaces, max size tier/weight,
+default COGS (% of price or $/unit), freight per kg, target net margin/ROI, and
+risk tolerance. It is a **preferences layer only** — it never relaxes a hard
+kill, gate, or scoring weight (those stay in `config` + `scoring.py`). Ships with
+two presets ("Conservative $5k", "Growth $20k"); edit them or add your own in
+Settings. Profit everywhere uses the profile's COGS/freight unless you override
+per product.
+
+### Keepa evidence
+
+Delium captures three extra fields from the same `stats`-enabled Keepa `/product`
+call (no extra tokens), verified against Keepa's official product object
+(`github.com/keepacom/api_backend`): `monthlySold` (units bought in the past
+month — Keepa's real figure, not an estimate), `fbaFees.pickAndPackFee` (the real
+FBA fulfilment fee, cents), and `referralFeePercentage`. The real FBA fee is fed
+into the profit engine when present (falling back to the fee table, clearly
+labelled), so profit confidence rises through the existing rules.
 
 ## Configuration
 
@@ -81,14 +123,17 @@ Both support path overrides via environment variables
 
 ```
 src/delium/
-├── cli/          # Typer app: discover · validate · pains · watch · portfolio
+├── cli/          # Typer app: discover · validate · emerging · diagnose · ui · …
 ├── config/       # config.toml loading (models.py) + secrets (secrets.py)
-├── database/     # SQLite connection handling
-├── providers/    # Keepa / DataForSEO / review provider adapters (not yet implemented)
-├── ingestion/     # fetch → normalize → cache pipeline (not yet implemented)
-├── analysis/     # deterministic demand/competition/profit/risk/scoring (not yet implemented)
-├── agents/       # Scout / Analyst / Review Miner / Strategist (not yet implemented)
-├── reports/      # typed-block → markdown rendering (not yet implemented)
+├── database/     # SQLite connection, numbered migrations, repository
+├── providers/    # Keepa / DataForSEO / review provider adapters
+├── ingestion/    # fetch → normalize → cache-first pipeline (batched Keepa)
+├── analysis/     # deterministic demand/competition/profit/risk/scoring engines
+├── discovery/    # discover/emerging orchestration, assembly, diagnostics, workspace
+├── profile/      # Research Profile model + store (DB-backed preferences)
+├── agents/       # Scout / Analyst / Review Miner / Strategist (LLM layer)
+├── reports/      # markdown rendering + deterministic plain-English cards
+├── ui/           # Streamlit app + tested service/format helpers
 └── utils/        # logging, filesystem paths
 ```
 

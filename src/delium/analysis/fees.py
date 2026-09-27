@@ -163,19 +163,30 @@ def compute_fees(
     dims: Dimensions | None,
     weight_g: int | None,
     prep_cost_cents: int | None = None,
+    real_fulfillment_cents: int | None = None,
 ) -> FeeBreakdown:
-    """Full per-unit Amazon fee breakdown. Missing dims/weight is blocking."""
+    """Full per-unit Amazon fee breakdown. Missing dims/weight is blocking.
+
+    When `real_fulfillment_cents` is supplied (Keepa's `fbaFees.pickAndPackFee`),
+    it replaces the table's estimated fulfilment fee and the breakdown is marked
+    `fulfillment_source = 'keepa'`. Referral/closing/storage stay table-derived —
+    Keepa gives only the fulfilment (pick&pack) fee directly."""
     if dims is None or weight_g is None or weight_g <= 0:
         raise FeeError("Dimensions and a positive weight are required to compute fees.")
 
     tier = select_size_tier(table, dims, weight_g)
+    if real_fulfillment_cents is not None and real_fulfillment_cents > 0:
+        fulfillment, source = real_fulfillment_cents, "keepa"
+    else:
+        fulfillment, source = fulfillment_fee(tier, weight_g), "table"
     return FeeBreakdown(
         referral_cents=referral_fee(table, category, price_cents),
-        fulfillment_cents=fulfillment_fee(tier, weight_g),
+        fulfillment_cents=fulfillment,
         closing_cents=closing_fee(table, category),
         storage_monthly_cents=blended_storage_monthly(table, dims),
         storage_peak_cents=storage_fee_monthly(table, dims, peak=True),
         prep_cents=prep_cost_cents if prep_cost_cents is not None else table.prep_default_cents,
         size_tier=tier.name,
         fee_table_version=table.version,
+        fulfillment_source=source,
     )

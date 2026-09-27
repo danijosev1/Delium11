@@ -20,6 +20,7 @@ import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
+from typing import Any
 
 from delium.analysis.competition import analyze_competition
 from delium.analysis.demand import analyze_demand, load_velocity_curves
@@ -84,6 +85,15 @@ class ProfitOverrides:
 # ---------------------------------------------------------------------------
 # Row → model helpers
 # ---------------------------------------------------------------------------
+def _row_value(row: sqlite3.Row, column: str) -> Any:
+    """Safe column read: None when the column is absent (older rows / test stubs)
+    rather than raising, so optional evidence columns degrade gracefully."""
+    try:
+        return row[column]
+    except (IndexError, KeyError):
+        return None
+
+
 def _parse_date(value: str | None) -> date | None:
     if not value:
         return None
@@ -298,12 +308,16 @@ def build_profit(
         monthly_sales_units=monthly_units or 0,
         estimated_fields=frozenset(estimated),
     )
+    # Keepa's real per-unit FBA fee, when captured, replaces the table estimate
+    # (raising profit confidence through the existing engine — no rule change).
+    real_fba = _row_value(row, "fba_pick_pack_cents")
     return compute_scenarios(
         load_fee_table(),
         category=row["category_path"],
         dims=dims,
         weight_g=int(weight_g),
         base_inputs=base,
+        real_fulfillment_cents=real_fba,
     )
 
 
