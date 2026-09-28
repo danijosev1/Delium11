@@ -1310,6 +1310,20 @@ def scan_main(
             console.print(f"  [yellow]{note}[/yellow]")
         return bool(typer.confirm("Proceed and spend?"))
 
+    # A scheduled run that fires after a missed launchd interval (Mac was asleep)
+    # must not double-spend: skip if a scan already completed today.
+    if scheduled and resume is None:
+        from datetime import UTC, datetime
+
+        today = datetime.now(UTC).date().isoformat()
+        with get_connection() as conn:
+            done_today = repository.scan_completed_on(conn, today)
+        if done_today is not None:
+            console.print(f"[yellow]A scan already completed today ({today}); skipping.[/yellow]")
+            return
+
+    from delium.scheduler import notify
+
     try:
         with get_connection() as conn:
             report = daily_scan.run_scan(
@@ -1323,7 +1337,16 @@ def scan_main(
             )
     except daily_scan.ScanAbortedError as exc:
         console.print(f"[bold red]Scan aborted:[/bold red] {exc}")
+        if scheduled:
+            notify("Delium scan aborted", str(exc))
         raise typer.Exit(code=1) from exc
+    if scheduled:
+        n = report.funnel.get("finalists", 0)
+        notify(
+            "Delium scan complete",
+            f"{n} finalists · {report.keepa_tokens} tokens · "
+            f"${report.data_usd + report.llm_usd:.2f}",
+        )
     _render_scan(report)
 
 
@@ -1346,6 +1369,110 @@ def scan_report(
             scan_id = latest["id"]
         report = build_report(conn, scan_id)
     _render_scan(report)
+
+
+# ---------------------------------------------------------------------------
+# Scheduler (launchd) — `delium schedule …`
+# ---------------------------------------------------------------------------
+schedule_app = typer.Typer(help="Schedule the Daily Scan via macOS launchd.")
+app.add_typer(schedule_app, name="schedule")
+
+
+def _fmt_times(times: tuple[tuple[int, int], ...]) -> str:
+    return ", ".join(f"{h:02d}:{m:02d}" for h, m in times) or "—"
+
+
+@schedule_app.command("install")
+def schedule_install(
+    times: Annotated[
+        str,
+        typer.Option("--times", help="Daily run time(s), e.g. 06:00 or 06:00,18:00."),
+    ] = "06:00",
+) -> None:
+    """Generate + load a launchd agent that runs `delium scan --scheduled` daily."""
+    from delium.scheduler import Scheduler, parse_times
+
+    try:
+        parsed = parse_times(times)
+    except ValueError as exc:
+        console.print(f"[bold red]{exc}[/bold red]")
+        raise typer.Exit(code=1) from exc
+    sched = Scheduler()
+    path = sched.install(parsed)
+    console.print(f"[green]Installed[/green] launchd agent → {path}")
+    console.print(f"  Runs daily at: [bold]{_fmt_times(parsed)}[/bold]")
+    console.print(f"  Command: uv run delium scan --scheduled  (cwd {sched.repo_dir()})")
+    console.print(f"  Log: {sched.log_path}")
+    if not sched.is_macos():
+        console.print(
+            "[yellow]Not macOS — the plist was written but not loaded into launchd.[/yellow]"
+        )
+
+
+@schedule_app.command("uninstall")
+def schedule_uninstall() -> None:
+    """Unload + remove the launchd agent."""
+    from delium.scheduler import Scheduler
+
+    sched = Scheduler()
+    if sched.uninstall():
+        console.print("[green]Uninstalled[/green] the Daily Scan launchd agent.")
+    else:
+        console.print("[yellow]No scheduled scan was installed.[/yellow]")
+
+
+@schedule_app.command("status")
+def schedule_status() -> None:
+    """Show whether the agent is installed, its times, last run, and log tail."""
+    from delium.scheduler import Scheduler
+
+    initialize_database()
+    sched = Scheduler()
+    st = sched.status()
+    if not st.installed:
+        console.print(
+            "[yellow]No scheduled scan installed.[/yellow] Run `delium schedule install`."
+        )
+    else:
+        console.print(f"[green]Installed[/green]: {st.plist_path}")
+        console.print(f"  Times: [bold]{_fmt_times(st.times)}[/bold]")
+    with get_connection() as conn:
+        last = repository.latest_scan(conn)
+    if last is not None:
+        spent = float(last["data_usd"]) + float(last["llm_usd"])
+        console.print(
+            f"  Last run: {last['created_at']} → [bold]{last['status']}[/bold] "
+            f"({last['keepa_tokens']} tokens, ${spent:.2f})"
+        )
+    else:
+        console.print("  Last run: [dim]none yet[/dim]")
+    if st.log_tail:
+        console.print(f"  Log tail ({st.log_path}):")
+        for line in st.log_tail.splitlines():
+            console.print(f"    [dim]{line}[/dim]")
+
+
+@schedule_app.command("run-now")
+def schedule_run_now() -> None:
+    """Trigger the scheduled scan immediately (kickstarts the launchd agent when
+    installed on macOS; otherwise runs `uv run delium scan --scheduled` here)."""
+    import subprocess
+
+    from delium.scheduler import Scheduler
+
+    sched = Scheduler()
+    if sched.is_macos() and sched.plist_path.exists():
+        sched.run_now()
+        console.print("[green]Kicked off[/green] the launchd agent. See `delium schedule status`.")
+        return
+    console.print("Running the scan inline: uv run delium scan --scheduled …")
+    proc = subprocess.run(  # noqa: S603
+        [sched.uv_path(), "run", "delium", "scan", "--scheduled"],
+        cwd=str(sched.repo_dir()),
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise typer.Exit(code=proc.returncode)
 
 
 def _build_scan_clients(config: object, *, light: bool = False) -> ScanClients:

@@ -1420,6 +1420,19 @@ def list_scans(conn: sqlite3.Connection, *, limit: int = 25) -> list[sqlite3.Row
     )
 
 
+def scan_completed_on(conn: sqlite3.Connection, day: str) -> sqlite3.Row | None:
+    """The most recent scan that reached 'complete' on the given local day
+    (YYYY-MM-DD). Used by the scheduler to skip a duplicate run when the Mac woke
+    after a missed launchd interval and a scan already succeeded today."""
+    return _one(
+        conn.execute(
+            "SELECT * FROM scans WHERE status = 'complete' AND date(created_at) = ? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (day,),
+        )
+    )
+
+
 def update_scan(
     conn: sqlite3.Connection,
     scan_id: str,
