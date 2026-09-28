@@ -1251,6 +1251,10 @@ def scan_main(
     resume: Annotated[
         str | None, typer.Option("--resume", help="Resume a scan by id (from the last stage).")
     ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Skip the cost confirmation (non-interactive, no TTY)."),
+    ] = False,
 ) -> None:
     """Run a daily scan (interactive: shows the projected cost and confirms)."""
     if ctx.invoked_subcommand is not None:
@@ -1332,7 +1336,7 @@ def scan_main(
                 profile=profile,
                 config=config,
                 clients=clients,
-                confirm=None if scheduled else _confirm,
+                confirm=None if (scheduled or yes) else _confirm,
                 resume_scan_id=resume,
             )
     except daily_scan.ScanAbortedError as exc:

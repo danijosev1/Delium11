@@ -17,12 +17,14 @@ import contextlib
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 from delium.analysis.models import Marketplace, SourceMaturity
 from delium.config.models import DeliumConfig
 from delium.database import initialize_database, repository
 from delium.database.connection import get_connection
+from delium.discovery.daily_scan import STAGE_NAMES
 from delium.ingestion import (
     CrossMarketCandidate,
     discover_cross_market,
@@ -713,6 +715,343 @@ def _top_opportunities(
     ]
     rows.sort(key=lambda r: float(r["opportunity_score"]), reverse=True)
     return rows[:top_n]
+
+
+# ---------------------------------------------------------------------------
+# Command Center (Daily Scan, Part 3B) — top bar, background scan, live progress,
+# emerging categories, and the scan inbox as product cards. All reads are DB-only
+# (the free Keepa /token check aside); the scan itself runs as a detached
+# background process, NOT in Streamlit's thread.
+# ---------------------------------------------------------------------------
+def background_scan_command(
+    *, marketplaces: tuple[str, ...] = ("US",), light: bool = True, top: int = 10
+) -> list[str]:
+    """The exact argv for a background Daily Scan — the SAME `delium scan` CLI the
+    scheduler and terminal use. `--yes` skips the interactive confirm (there is no
+    TTY); caps still bind in preflight. Pure, so it is unit-testable."""
+    from delium.scheduler import Scheduler
+
+    args = [
+        Scheduler.uv_path(),
+        "run",
+        "delium",
+        "scan",
+        "--yes",
+        "--marketplaces",
+        ",".join(marketplaces),
+        "--top",
+        str(top),
+        "--light" if light else "--full",
+    ]
+    return args
+
+
+def launch_background_scan(
+    *, marketplaces: tuple[str, ...] = ("US",), light: bool = True, top: int = 10
+) -> int:
+    """Start a Daily Scan as a DETACHED background process and return its PID.
+    `start_new_session=True` puts it in its own process group so closing the
+    browser (or the Streamlit server) does not kill the scan; progress is read
+    back from SQLite by `scan_progress()`."""
+    import subprocess
+
+    from delium.scheduler import Scheduler
+
+    cmd = background_scan_command(marketplaces=marketplaces, light=light, top=top)
+    proc = subprocess.Popen(  # noqa: S603
+        cmd,
+        cwd=str(Scheduler.repo_dir()),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return proc.pid
+
+
+def scan_progress(scan_id: str | None = None) -> dict[str, Any] | None:
+    """Live progress for the latest (or a given) scan, read straight from SQLite so
+    the UI can poll it while a background scan runs. Returns None if no scan yet."""
+    initialize_database()
+    with get_connection() as conn:
+        scan = (
+            repository.get_scan(conn, scan_id)
+            if scan_id is not None
+            else repository.latest_scan(conn)
+        )
+        if scan is None:
+            return None
+        sid, run_id = scan["id"], scan["run_id"]
+        stages = repository.get_scan_stages(conn, sid)
+        candidates = repository.get_scan_candidates(conn, sid)
+        # Live cost from the run ledger (scans.* cost columns are only final on
+        # completion; the run totals update as each stage spends).
+        tokens = repository.run_token_total(conn, run_id)
+        data_usd = repository.run_cost_total(conn, run_id)
+    stage_idx = int(scan["stage"])
+    llm_usd = sum(float(s["llm_usd"]) for s in stages)
+    funnel = {
+        "swept": sum(1 for c in candidates if c["stage_reached"] >= 1),
+        "hydrated": sum(
+            1 for c in candidates if c["stage_reached"] >= 2 and c["outcome"] != "killed"
+        ),
+        "killed": sum(1 for c in candidates if c["outcome"] == "killed"),
+        "scored": sum(1 for c in candidates if c["cheap_score"] is not None),
+        "competitor_set": sum(1 for c in candidates if c["launchability"] is not None),
+        "finalists": sum(1 for c in candidates if c["outcome"] == "finalist"),
+    }
+    running = scan["status"] == "running"
+    next_stage = (
+        STAGE_NAMES[stage_idx + 1] if running and stage_idx + 1 < len(STAGE_NAMES) else None
+    )
+    return {
+        "scan_id": sid,
+        "status": scan["status"],
+        "running": running,
+        "stage_index": stage_idx,
+        "stage_name": STAGE_NAMES[stage_idx] if 0 <= stage_idx < len(STAGE_NAMES) else "—",
+        "next_stage": next_stage,
+        "total_stages": len(STAGE_NAMES),
+        "created_at": scan["created_at"],
+        "funnel": funnel,
+        "keepa_tokens": tokens,
+        "data_usd": round(data_usd, 4),
+        "llm_usd": round(llm_usd, 4),
+        "stages": [
+            {
+                "name": s["name"],
+                "status": s["status"],
+                "in": s["input_count"],
+                "out": s["output_count"],
+            }
+            for s in stages
+        ],
+    }
+
+
+def _next_scheduled_run(
+    times: tuple[tuple[int, int], ...], *, now: datetime | None = None
+) -> datetime | None:
+    """The next wall-clock datetime one of `times` (hour, minute) fires, from now.
+    Pure (inject `now` in tests)."""
+    if not times:
+        return None
+    now = now or datetime.now()
+    candidates: list[datetime] = []
+    for h, m in times:
+        today = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        candidates.append(today if today > now else today + timedelta(days=1))
+    return min(candidates)
+
+
+def command_center() -> dict[str, Any]:
+    """Top-bar summary for the Command Center: last scan (time + result), inbox
+    count, Keepa tokens left, next scheduled run, active profile, and live
+    progress for a running scan. DB-only aside from the free token check."""
+    from delium.profile import store
+    from delium.scheduler import Scheduler
+
+    initialize_database()
+    with get_connection() as conn:
+        profile = store.load_active(conn)
+        last = repository.latest_scan(conn)
+        inbox_count = len(repository.scan_inbox(conn, last["id"])) if last is not None else 0
+    times = Scheduler().installed_times()
+    return {
+        "profile": profile,
+        "last_scan": last,
+        "inbox_count": inbox_count,
+        "keepa_tokens": keepa_token_status(),
+        "scheduled_times": times,
+        "next_scheduled_run": _next_scheduled_run(times),
+        "progress": scan_progress(last["id"]) if last is not None else None,
+    }
+
+
+def emerging_categories(scan_id: str | None = None, *, top_n: int = 5) -> list[dict[str, Any]]:
+    """Top emerging categories from the latest (or given) scan — momentum score +
+    a one-line reason."""
+    initialize_database()
+    with get_connection() as conn:
+        if scan_id is None:
+            latest = repository.latest_scan(conn)
+            if latest is None:
+                return []
+            scan_id = latest["id"]
+        cats = repository.get_scan_categories(conn, scan_id)
+    return [
+        {"category": c["category"], "score": c["momentum_score"], "reason": c["reason"]}
+        for c in cats[:top_n]
+    ]
+
+
+@dataclass(frozen=True)
+class InboxCard:
+    """One Scan Inbox product card — everything the UI renders, already resolved."""
+
+    asin: str
+    marketplace: str
+    image_url: str | None
+    title: str | None
+    brand: str | None
+    price_usd: float | None
+    monthly_sales: int | None
+    sales_source: str  # "amazon" | "estimated" | "unknown"
+    profit_per_unit_usd: float | None
+    net_margin: float | None
+    sellability: float | None
+    confidence: str | None
+    differentiation_status: str | None
+    why: str | None
+    rank: int | None
+
+
+def _sales_source_label(is_amazon: bool | None) -> str:
+    if is_amazon is None:
+        return "unknown"
+    return "amazon" if is_amazon else "estimated"
+
+
+def inbox_cards(
+    config: DeliumConfig,
+    scan_id: str | None = None,
+    *,
+    min_confidence: str | None = None,
+    category: str | None = None,
+    price_min_usd: float | None = None,
+    price_max_usd: float | None = None,
+    marketplace: str | None = None,
+    sales_source: str | None = None,
+) -> list[InboxCard]:
+    """Build the Scan Inbox cards for the latest (or given) scan, applying the
+    filter bar. Profit/unit + margin and the sales source are recomputed from
+    persisted data via the SAME assembly the scan used — no re-fetch, no re-score
+    of the verdict."""
+    from delium.discovery.assembly import build_scoring_input
+    from delium.profile import store
+
+    _conf_rank = {"low": 0, "medium": 1, "high": 2}
+    initialize_database()
+    cards: list[InboxCard] = []
+    with get_connection() as conn:
+        if scan_id is None:
+            latest = repository.latest_scan(conn)
+            if latest is None:
+                return []
+            scan_id = latest["id"]
+        profile = store.load_active(conn)
+        finalists = repository.scan_inbox(conn, scan_id)
+        for c in finalists:
+            asin, mp = c["asin"], c["marketplace"]
+            if marketplace is not None and mp != marketplace:
+                continue
+            facts = _loads_json(c["data"])
+            prod = repository.get_product(conn, asin, mp)
+            price_cents = facts.get("price_cents")
+            weight = prod["weight_g"] if prod is not None else None
+            overrides = profile.profit_overrides(price_cents=price_cents, weight_g=weight)
+            profit_pu: float | None = None
+            net_margin: float | None = None
+            monthly_sales: int | None = facts.get("monthly_sold")
+            is_amazon: bool | None = monthly_sales is not None or None
+            try:
+                inp, _ = build_scoring_input(
+                    conn, asin, Marketplace(mp), config, profit_overrides=overrides
+                )
+            except Exception:  # noqa: BLE001 - a card must never crash the inbox
+                inp = None
+            if inp is not None and inp.profit is not None:
+                exp = inp.profit.expected
+                profit_pu = exp.net_profit_cents / 100.0
+                net_margin = exp.net_margin
+            if inp is not None and inp.demand is not None:
+                est = next((e for e in inp.demand.sales_estimates if e.asin == asin), None)
+                if est is not None:
+                    monthly_sales = est.expected_units
+                    is_amazon = est.is_amazon_source
+            source = _sales_source_label(is_amazon)
+            # -- filters --
+            if (
+                min_confidence is not None
+                and c["confidence"] is not None
+                and _conf_rank.get(c["confidence"], 0) < _conf_rank.get(min_confidence, 0)
+            ):
+                continue
+            if category is not None and (facts.get("category") or "") != category:
+                continue
+            price_usd = None if price_cents is None else price_cents / 100.0
+            if price_min_usd is not None and (price_usd is None or price_usd < price_min_usd):
+                continue
+            if price_max_usd is not None and (price_usd is None or price_usd > price_max_usd):
+                continue
+            if sales_source is not None and source != sales_source:
+                continue
+            cards.append(
+                InboxCard(
+                    asin=asin,
+                    marketplace=mp,
+                    image_url=prod["image_url"] if prod is not None else None,
+                    title=prod["title"] if prod is not None else None,
+                    brand=prod["brand"] if prod is not None else None,
+                    price_usd=price_usd,
+                    monthly_sales=monthly_sales,
+                    sales_source=source,
+                    profit_per_unit_usd=profit_pu,
+                    net_margin=net_margin,
+                    sellability=c["sellability"],
+                    confidence=c["confidence"],
+                    differentiation_status=c["differentiation_status"],
+                    why=c["reason"],
+                    rank=c["rank"],
+                )
+            )
+    return cards
+
+
+def shortlist_from_inbox(
+    scan_id: str, asin: str, marketplace: str, *, notes: str | None = None
+) -> None:
+    """Inbox action: add a finalist to the shortlist and remove it from the inbox."""
+    initialize_database()
+    with get_connection() as conn:
+        repository.upsert_shortlist(
+            conn,
+            asin=asin.strip().upper(),
+            marketplace=marketplace,
+            status="researching",
+            notes=notes,
+        )
+        repository.set_scan_candidate_outcome(
+            conn, scan_id=scan_id, asin=asin, marketplace=marketplace, outcome="shortlisted"
+        )
+
+
+def reject_from_inbox(
+    scan_id: str, asin: str, marketplace: str, *, reason: str | None = None
+) -> None:
+    """Inbox action: reject a finalist (optionally with a reason) — leaves the
+    inbox, never touches its score or verdict."""
+    initialize_database()
+    with get_connection() as conn:
+        repository.set_scan_candidate_outcome(
+            conn,
+            scan_id=scan_id,
+            asin=asin,
+            marketplace=marketplace,
+            outcome="rejected",
+            reason=reason,
+        )
+
+
+def _loads_json(value: str | None) -> dict[str, Any]:
+    import json
+
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 # ---------------------------------------------------------------------------

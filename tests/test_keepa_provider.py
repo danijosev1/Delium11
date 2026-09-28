@@ -44,6 +44,8 @@ def test_normalize_product_maps_all_fields() -> None:
     assert product.dims == {"length_mm": 200, "width_mm": 150, "height_mm": 40}
     assert product.weight_g == 300
     assert product.images_count == 3
+    # Main image URL from the FIRST imagesCSV filename (Part 3B card image).
+    assert product.image_url == "https://m.media-amazon.com/images/I/a.jpg"
     assert product.amazon_on_listing is True
 
 
@@ -232,9 +234,17 @@ def test_normalize_missing_dims_and_images() -> None:
     assert product.dims is None
     assert product.weight_g is None
     assert product.images_count == 2
+    # List-form images: first entry becomes the main image URL.
+    assert product.image_url == "https://m.media-amazon.com/images/I/x.jpg"
     assert product.category_path is None
     assert product.history == []
     assert product.amazon_on_listing is False
+
+
+def test_normalize_no_images_has_no_image_url() -> None:
+    product = normalize_product({"asin": "B0NOIMG0001", "title": "No image", "csv": [None] * 4})
+    assert product.image_url is None
+    assert product.images_count is None
 
 
 def test_normalize_falls_back_to_new_price() -> None:

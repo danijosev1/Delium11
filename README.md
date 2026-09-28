@@ -118,10 +118,17 @@ delium scan                              # interactive: shows projected cost, co
 delium scan --marketplaces US,CA,UK
 delium scan --top 10 --budget-cap 1500 --max-spend 5
 delium scan --min-confidence medium
+delium scan --light --enrich-limit 5     # light finalists (default for --scheduled)
+delium scan --full                       # full validate path for every finalist
+delium scan --yes                        # skip the confirm (non-interactive, no TTY)
 delium scan --scheduled                  # non-interactive; aborts if over caps
 delium scan --resume <scan_id>           # continue a crashed scan from its last stage
 delium scan report [<scan_id>]           # print a past scan (latest if omitted)
 ```
+
+When `--budget-cap` / `--max-spend` are omitted, the scan uses the **active
+Research Profile's per-scan caps** (defaults: $5 / 1,500 Keepa tokens) so an
+unattended run is always bounded.
 
 **Stages** (each persists progress to SQLite, logs Keepa tokens + $, and records
 its funnel counts, so a crash resumes from the last completed stage):
@@ -147,7 +154,12 @@ its funnel counts, so a crash resumes from the last completed stage):
 7. **Finalists** — reviews + Claude differentiation (the validation pipeline,
    per-product budget caps) for the top N only, then re-score and re-rank.
    Products without differentiation show **"differentiation pending"**, never a
-   heuristic score mixed in as if it were real.
+   heuristic score mixed in as if it were real. **Light mode** (`--light`, the
+   default for `--scheduled`) fetches reviews for the *finalist only* (no
+   competitor reviews) and makes a *single* Claude call each, and enriches only
+   the top `--enrich-limit` (default 5) — the rest stay "differentiation
+   pending". **Full mode** (`--full`) runs the whole validate path for every
+   finalist; it is also what the Workspace "Deep dive" uses.
 8. **Report** — persist the funnel, per-stage cost, top N with one-line reasons,
    and emerging categories. Finalists go to the **scan inbox** — *separate* from
    the shortlist; you promote them manually.
@@ -155,12 +167,52 @@ its funnel counts, so a crash resumes from the last completed stage):
 Australia has no Keepa coverage: a requested `AU` marketplace is reported as
 "AU pending — Keepa has no Australia data" and skipped; the scan continues.
 
-**Cost model (projected worst case, default scan — US, ~300 swept, 40
-competitor sets, top 10):** sweep ≈ 44 Keepa tokens; hydrate ≈ 600 tokens;
-competitor sets ≈ 800 tokens + ~$1.20 DataForSEO; finalists ≈ up to
-`$3.03 × 10` data + `$1.00 × 10` LLM (bounded by the per-validate budget caps).
+**Cost model (projected worst case, US, ~300 swept, 40 competitor sets, top 10):**
+sweep ≈ 44 Keepa tokens; hydrate ≈ 600 tokens; competitor sets ≈ 800 tokens +
+~$1.20 DataForSEO.
+
+- **Full mode** finalists ≈ up to `$3.03 × 10` data + `$1.00 × 10` LLM → worst
+  case ~$41/scan.
+- **Light mode** finalists (default for `--scheduled`, top 5 enriched) ≈
+  `($0.30 + $0.03) × 5` data + `$1.00 × 5` LLM ≈ **~$6.65 worst case**, and
+  **typically ~$1–2/scan** because reviews and analysis are cache-first (reused
+  when fetched recently). The $5 profile cap binds this on the projection,
+  before any spend.
+
 Everything is cache-first, so a repeated lookup is free and real costs run far
 below these caps. The caps bind on the projection, before any spend.
+
+### Scheduler (`delium schedule`) — macOS launchd
+
+Run the Daily Scan automatically once (or more) per day via a generated launchd
+agent (never hand-edit the plist):
+
+```bash
+delium schedule install                  # once daily at 06:00 (default)
+delium schedule install --times 06:00,18:00
+delium schedule status                   # install state, times, last run, log tail
+delium schedule run-now                  # trigger immediately
+delium schedule uninstall
+```
+
+The agent runs `uv run delium scan --scheduled` from the repo, logging to
+`data/scheduled-scan.log`. It uses the profile's per-scan caps and aborts before
+spending if over them. A sleeping Mac runs a missed interval on the next wake;
+the scan **skips if one already completed today**, so a catch-up never
+double-spends. macOS posts a notification when the scan finishes or aborts.
+
+### Command Center (the UI Home)
+
+`delium ui` opens on the **Command Center**: a top bar (last scan + result, #
+in the inbox, Keepa tokens left, next scheduled run, active profile), a **Run
+Daily Scan** button that launches the scan as a **detached background process**
+(closing the browser does not stop it) with live stage-by-stage progress, funnel
+counts and cost polled from SQLite, the top emerging categories, and the **Scan
+Inbox** as product cards (image, title, price, monthly sales *with source* —
+"amazon" vs "estimated" — profit/unit, margin, sellability, confidence, a
+one-line "why", and Open / Shortlist / Reject actions). A filter bar narrows by
+confidence, category, price band, marketplace and sales source. (Keyboard
+shortcuts were skipped: Streamlit has no reliable cross-browser shortcut API.)
 
 ## Configuration
 
@@ -178,7 +230,7 @@ Both support path overrides via environment variables
 
 ```
 src/delium/
-├── cli/          # Typer app: discover · validate · emerging · diagnose · ui · …
+├── cli/          # Typer app: discover · validate · emerging · scan · schedule · ui · …
 ├── config/       # config.toml loading (models.py) + secrets (secrets.py)
 ├── database/     # SQLite connection, numbered migrations, repository
 ├── providers/    # Keepa / DataForSEO / review provider adapters
@@ -188,7 +240,8 @@ src/delium/
 ├── profile/      # Research Profile model + store (DB-backed preferences)
 ├── agents/       # Scout / Analyst / Review Miner / Strategist (LLM layer)
 ├── reports/      # markdown rendering + deterministic plain-English cards
-├── ui/           # Streamlit app + tested service/format helpers
+├── ui/           # Streamlit app (Command Center) + tested service/format helpers
+├── scheduler.py  # macOS launchd agent for the Daily Scan (delium schedule)
 └── utils/        # logging, filesystem paths
 ```
 

@@ -644,51 +644,228 @@ def page_usage() -> None:
 # ---------------------------------------------------------------------------
 # Home
 # ---------------------------------------------------------------------------
-def page_home() -> None:
-    st.header("Home")
-    config = _config()
-    summary = services.home_summary(config)
+_COMMAND_CENTER_CSS = """
+<style>
+/* Tighten the inbox card metrics so a card reads as one compact unit. */
+div[data-testid="stMetric"] { padding: 2px 0; }
+div[data-testid="stMetricValue"] { font-size: 1.05rem; }
+</style>
+"""
 
-    tokens = summary["keepa_tokens"]
-    if tokens is not None and tokens.tokens_left is not None:
-        st.metric("Keepa tokens left", f"{tokens.tokens_left:,}")
 
-    st.subheader("Shortlist")
-    shortlist = summary["shortlist"]
-    if shortlist:
-        st.dataframe(
-            [
-                {
-                    "asin": r["asin"],
-                    "marketplace": r["marketplace"],
-                    "status": r["status"],
-                    "notes": r["notes"] or "",
-                    "updated": r["updated_at"],
-                }
-                for r in shortlist
-            ],
-            width="stretch",
-            hide_index=True,
+def _fmt_dt(value: Any) -> str:
+    if value is None:
+        return "—"
+    return str(value)[:16]
+
+
+def _command_center_topbar(cc: dict[str, Any]) -> None:
+    last = cc["last_scan"]
+    tokens = cc["keepa_tokens"]
+    nxt = cc["next_scheduled_run"]
+    profile = cc["profile"]
+    c1, c2, c3, c4, c5 = st.columns(5)
+    if last is not None:
+        c1.metric("Last scan", _fmt_dt(last["created_at"]), last["status"])
+    else:
+        c1.metric("Last scan", "none yet")
+    c2.metric("In inbox", cc["inbox_count"])
+    c3.metric(
+        "Keepa tokens",
+        f"{tokens.tokens_left:,}" if tokens is not None and tokens.tokens_left is not None else "—",
+    )
+    c4.metric("Next scheduled", nxt.strftime("%a %H:%M") if nxt is not None else "not scheduled")
+    c5.metric("Active profile", profile.name if profile is not None else "—")
+
+
+def _render_progress(prog: dict[str, Any] | None) -> None:
+    if prog is None:
+        st.caption("No scan yet — press **Run Daily Scan** to start one.")
+        return
+    done = prog["stage_index"] + 1
+    total = prog["total_stages"]
+    label = f"Stage {done}/{total}: {prog['stage_name']}"
+    if prog["running"] and prog["next_stage"]:
+        label += f" → next: {prog['next_stage']}"
+    st.progress(min(1.0, done / total), text=label)
+    f = prog["funnel"]
+    cols = st.columns(6)
+    for col, key in zip(
+        cols, ("swept", "hydrated", "killed", "scored", "competitor_set", "finalists"), strict=True
+    ):
+        col.metric(key.replace("_", " "), f.get(key, 0))
+    st.caption(
+        f"Cost so far: {prog['keepa_tokens']:,} Keepa tokens · "
+        f"${prog['data_usd'] + prog['llm_usd']:.2f} · status **{prog['status']}**"
+    )
+
+
+@st.fragment(run_every=3)
+def _live_progress_fragment() -> None:
+    """Polls SQLite for the running scan's progress every 3s WITHOUT blocking the
+    rest of the page (the scan itself runs in a detached background process)."""
+    _render_progress(services.scan_progress())
+
+
+def _run_scan_controls() -> None:
+    col1, col2 = st.columns([1, 3])
+    if col1.button("▶ Run Daily Scan", type="primary", key="cc_run"):
+        try:
+            pid = services.launch_background_scan(light=True)
+            st.session_state["_scan_pid"] = pid
+            st.toast(f"Daily Scan started (pid {pid}). It runs in the background.")
+        except Exception as exc:  # noqa: BLE001 - show, never crash the page
+            st.error(f"Could not start the scan: {exc}")
+    col2.caption(
+        "Runs the same `delium scan` command as a background process — closing this "
+        "tab will not stop it. Progress below updates live."
+    )
+    _live_progress_fragment()
+
+
+def _emerging_categories_section() -> None:
+    st.subheader("Emerging categories")
+    cats = services.emerging_categories(top_n=5)
+    if not cats:
+        st.caption("No categories yet — run a scan.")
+        return
+    for c in cats:
+        score = c["score"]
+        score_txt = "—" if score is None else f"{score:.0f}"
+        st.markdown(f"**{c['category']}** · momentum {score_txt}")
+        if c["reason"]:
+            st.caption(c["reason"])
+
+
+def _inbox_filter_bar(config: Any) -> dict[str, Any]:
+    with st.expander("Filters", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        conf = c1.selectbox("Min confidence", ["any", "low", "medium", "high"], key="cc_conf")
+        source = c2.selectbox("Sales source", ["any", "amazon", "estimated"], key="cc_src")
+        mp = c3.selectbox("Marketplace", ["any", *_MARKETPLACES], key="cc_mp")
+        c4, c5 = st.columns(2)
+        pmin = c4.number_input("Min price $", min_value=0.0, value=0.0, step=1.0, key="cc_pmin")
+        pmax = c5.number_input(
+            "Max price $ (0 = no cap)", min_value=0.0, value=0.0, step=1.0, key="cc_pmax"
         )
-        _open_workspace_picker([r["asin"] for r in shortlist], "US", key="home_short")
-    else:
-        st.caption("Nothing shortlisted yet — open a product and add it.")
+    return {
+        "min_confidence": None if conf == "any" else conf,
+        "sales_source": None if source == "any" else source,
+        "marketplace": None if mp == "any" else mp,
+        "price_min_usd": pmin or None,
+        "price_max_usd": pmax or None,
+    }
 
-    st.subheader("Top opportunities matching your profile")
-    top = summary["top_opportunities"]
-    if top:
-        st.dataframe(format.validation_rows(top), width="stretch", hide_index=True)
-        _open_workspace_picker([r["asin"] for r in top], "US", key="home_top")
-    else:
-        st.caption("No validated candidates yet — run a Find or Validate.")
 
-    st.subheader("Recent runs")
-    runs = format.run_rows(summary["runs"])
-    st.dataframe(runs, width="stretch", hide_index=True) if runs else st.caption("none yet")
+def _confidence_badge(level: str | None) -> str:
+    return {"high": "🟢 high", "medium": "🟡 medium", "low": "🔴 low"}.get(
+        level or "", "⚪ unknown"
+    )
+
+
+def _render_inbox_card(config: Any, scan_id: str, card: Any) -> None:
+    with st.container(border=True):
+        img_col, body_col = st.columns([1, 4])
+        if card.image_url:
+            img_col.image(card.image_url, width=90)
+        else:
+            img_col.caption("no image")
+        title = card.title or card.asin
+        body_col.markdown(f"**#{card.rank or '—'} · {title}**")
+        meta = f"{card.brand or '—'} · {card.asin} · {card.marketplace}"
+        body_col.caption(meta)
+        m1, m2, m3, m4 = body_col.columns(4)
+        m1.metric("Price", "—" if card.price_usd is None else f"${card.price_usd:,.2f}")
+        sales = "—" if card.monthly_sales is None else f"{card.monthly_sales:,}"
+        m2.metric("Monthly sales", sales, card.sales_source)
+        m3.metric(
+            "Profit/unit",
+            "—" if card.profit_per_unit_usd is None else f"${card.profit_per_unit_usd:,.2f}",
+        )
+        m4.metric("Margin", "—" if card.net_margin is None else f"{card.net_margin * 100:.0f}%")
+        sell = "—" if card.sellability is None else f"{card.sellability:.0f}"
+        body_col.markdown(
+            f"Sellability **{sell}** · {_confidence_badge(card.confidence)} · "
+            f"differentiation: {card.differentiation_status or 'pending'}"
+        )
+        if card.why:
+            body_col.caption(f"Why: {card.why}")
+        b1, b2, b3 = body_col.columns(3)
+        if b1.button("Open", key=f"open_{card.asin}_{card.marketplace}"):
+            _goto("Product", ws_asin=card.asin, ws_mp=card.marketplace)
+        if b2.button("Shortlist", key=f"short_{card.asin}_{card.marketplace}"):
+            services.shortlist_from_inbox(scan_id, card.asin, card.marketplace)
+            st.toast(f"{card.asin} shortlisted.")
+            st.rerun()
+        with b3.popover("Reject"):
+            reason = st.text_input("Reason (optional)", key=f"rej_reason_{card.asin}")
+            if st.button("Confirm reject", key=f"rej_{card.asin}_{card.marketplace}"):
+                services.reject_from_inbox(
+                    scan_id, card.asin, card.marketplace, reason=reason or None
+                )
+                st.toast(f"{card.asin} rejected.")
+                st.rerun()
+
+
+def _scan_inbox_section(config: Any, cc: dict[str, Any]) -> None:
+    st.subheader("Scan inbox")
+    last = cc["last_scan"]
+    if last is None:
+        st.caption("No scan yet.")
+        return
+    scan_id = last["id"]
+    filters = _inbox_filter_bar(config)
+    cards = services.inbox_cards(config, scan_id, **filters)
+    if not cards:
+        st.caption("No finalists match the current filters.")
+        return
+    for card in cards:
+        _render_inbox_card(config, scan_id, card)
+
+
+def page_home() -> None:
+    st.markdown(_COMMAND_CENTER_CSS, unsafe_allow_html=True)
+    st.header("Command Center")
+    config = _config()
+    cc = services.command_center()
+    _command_center_topbar(cc)
+    _run_scan_controls()
+    st.divider()
+    _emerging_categories_section()
+    st.divider()
+    _scan_inbox_section(config, cc)
 
     st.divider()
-    if st.button("Open a product by ASIN →"):
-        _goto("Product")
+    with st.expander("Shortlist & top opportunities"):
+        summary = services.home_summary(config)
+        st.markdown("**Shortlist**")
+        shortlist = summary["shortlist"]
+        if shortlist:
+            st.dataframe(
+                [
+                    {
+                        "asin": r["asin"],
+                        "marketplace": r["marketplace"],
+                        "status": r["status"],
+                        "notes": r["notes"] or "",
+                        "updated": r["updated_at"],
+                    }
+                    for r in shortlist
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+            _open_workspace_picker([r["asin"] for r in shortlist], "US", key="home_short")
+        else:
+            st.caption("Nothing shortlisted yet — open a product and add it.")
+
+        st.markdown("**Top opportunities matching your profile**")
+        top = summary["top_opportunities"]
+        if top:
+            st.dataframe(format.validation_rows(top), width="stretch", hide_index=True)
+            _open_workspace_picker([r["asin"] for r in top], "US", key="home_top")
+        else:
+            st.caption("No validated candidates yet — run a Find or Validate.")
 
 
 # ---------------------------------------------------------------------------

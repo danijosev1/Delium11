@@ -221,6 +221,7 @@ def upsert_product(
     weight_g: int | None = None,
     size_tier: str | None = None,
     images_count: int | None = None,
+    image_url: str | None = None,
     amazon_on_listing: bool = False,
     gtin: str | None = None,
     manufacturer: str | None = None,
@@ -233,10 +234,10 @@ def upsert_product(
         """
         INSERT INTO products
             (asin, marketplace, title, brand, category_path, listing_date,
-             dims_json, weight_g, size_tier, images_count, amazon_on_listing,
+             dims_json, weight_g, size_tier, images_count, image_url, amazon_on_listing,
              gtin, manufacturer, parent_asin, monthly_sold, fba_pick_pack_cents,
              referral_fee_percent, fetch_id, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(asin) DO UPDATE SET
             marketplace = excluded.marketplace,
             title = excluded.title,
@@ -247,6 +248,7 @@ def upsert_product(
             weight_g = excluded.weight_g,
             size_tier = excluded.size_tier,
             images_count = excluded.images_count,
+            image_url = excluded.image_url,
             amazon_on_listing = excluded.amazon_on_listing,
             gtin = excluded.gtin,
             manufacturer = excluded.manufacturer,
@@ -268,6 +270,7 @@ def upsert_product(
             weight_g,
             size_tier,
             images_count,
+            image_url,
             int(amazon_on_listing),
             gtin,
             manufacturer,
@@ -1636,13 +1639,34 @@ def get_scan_candidates(
 
 
 def scan_inbox(conn: sqlite3.Connection, scan_id: str) -> list[sqlite3.Row]:
-    """Finalists in the scan inbox, best-ranked first (SEPARATE from shortlist)."""
+    """Finalists in the scan inbox, best-ranked first (SEPARATE from shortlist).
+    Only candidates still 'finalist' — once shortlisted or rejected they leave."""
     return _all(
         conn.execute(
             "SELECT * FROM scan_candidates WHERE scan_id = ? AND outcome = 'finalist' "
             "ORDER BY rank",
             (scan_id,),
         )
+    )
+
+
+def set_scan_candidate_outcome(
+    conn: sqlite3.Connection,
+    *,
+    scan_id: str,
+    asin: str,
+    marketplace: str,
+    outcome: str,
+    reason: str | None = None,
+) -> None:
+    """Move one inbox candidate to a terminal user decision ('shortlisted' /
+    'rejected'), optionally recording a reason. Used by the Command Center inbox
+    actions — it never changes a score, kill, or verdict."""
+    conn.execute(
+        "UPDATE scan_candidates SET outcome = ?, "
+        "reason = COALESCE(?, reason) "
+        "WHERE scan_id = ? AND asin = ? AND marketplace = ?",
+        (outcome, reason, scan_id, asin, marketplace),
     )
 
 

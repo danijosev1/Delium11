@@ -126,6 +126,7 @@ def _store_normalized(conn: sqlite3.Connection, product: NormalizedProduct, fetc
         weight_g=product.weight_g,
         size_tier=None,  # size-tier classification is analysis/fees, not ingestion
         images_count=product.images_count,
+        image_url=product.image_url,
         amazon_on_listing=product.amazon_on_listing,
         gtin=product.gtin,
         manufacturer=product.manufacturer,

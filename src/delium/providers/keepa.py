@@ -121,6 +121,7 @@ class NormalizedProduct:
     dims: dict[str, int] | None
     weight_g: int | None
     images_count: int | None
+    image_url: str | None
     amazon_on_listing: bool
     gtin: str | None = None  # best barcode (EAN preferred, else UPC) — for identity
     manufacturer: str | None = None
@@ -224,6 +225,30 @@ def _extract_images_count(raw: dict[str, Any]) -> int | None:
     images = raw.get("images")
     if isinstance(images, list):
         return len(images)
+    return None
+
+
+def _extract_main_image(raw: dict[str, Any]) -> str | None:
+    """The listing's MAIN image URL. Keepa returns `imagesCSV` — a comma-separated
+    list of image filenames whose first entry is the main image; the full URL is
+    `https://m.media-amazon.com/images/I/<filename>`. Falls back to an `images`
+    list of {imageUrl|filename} objects if present. None when neither is usable."""
+    images_csv = raw.get("imagesCSV")
+    if isinstance(images_csv, str) and images_csv.strip():
+        first = images_csv.split(",")[0].strip()
+        if first:
+            return f"https://m.media-amazon.com/images/I/{first}"
+    images = raw.get("images")
+    if isinstance(images, list) and images:
+        head = images[0]
+        if isinstance(head, str) and head.strip():
+            return f"https://m.media-amazon.com/images/I/{head.strip()}"
+        if isinstance(head, dict):
+            url = head.get("imageUrl") or head.get("l") or head.get("filename")
+            if isinstance(url, str) and url.strip():
+                if url.startswith("http"):
+                    return url
+                return f"https://m.media-amazon.com/images/I/{url.strip()}"
     return None
 
 
@@ -357,6 +382,7 @@ def normalize_product(raw: dict[str, Any], marketplace: str = "US") -> Normalize
         dims=_extract_dims(raw),
         weight_g=_positive_or_none(raw.get("packageWeight")),
         images_count=_extract_images_count(raw),
+        image_url=_extract_main_image(raw),
         amazon_on_listing=bool(amazon),
         gtin=_extract_gtin(raw),
         manufacturer=_clean_str(raw.get("manufacturer")),
