@@ -222,8 +222,14 @@ def run_validation(
                 discovery_evidence=discovery_evidence,
             )
 
-    # 5. Reviews — the validate-tier spend — only for survivors.
-    competitor_review_asins = _top_competitors(conn, asin, resolution.seed, mp, _REVIEW_COMPETITORS)
+    # 5. Reviews — the validate-tier spend — only for survivors. LIGHT mode
+    #    (scheduled daily scan) fetches the FINALIST's reviews only — no competitor
+    #    reviews — to keep per-product cost down.
+    competitor_review_asins = (
+        []
+        if request.light
+        else _top_competitors(conn, asin, resolution.seed, mp, _REVIEW_COMPETITORS)
+    )
     review_asins = [asin, *competitor_review_asins]
     reviews = hydrate_reviews(
         review_asins,
@@ -239,14 +245,18 @@ def run_validation(
     # 6. Review Miner (LLM) — persists structured evidence the engine recomputes.
     agents = _run_miner(conn, request, config, clients, asin, competitor_review_asins, notes)
 
-    # 6b. Analyst (LLM) — persists the competitor feature matrix (top-10 listings)
-    #     the differentiation engine reads to confirm F2 gaps / F4 bundle openings.
-    analyst_competitor_asins = _top_competitors(
-        conn, asin, resolution.seed, mp, _ANALYST_COMPETITORS
-    )
-    agents = _run_analyst(
-        conn, request, config, clients, asin, analyst_competitor_asins, agents, notes
-    )
+    # 6b. Analyst (LLM) — the competitor feature matrix. LIGHT mode skips it, so a
+    #     light validation is a SINGLE Claude call (the miner) on the finalist only.
+    if request.light:
+        analyst_competitor_asins: list[str] = []
+        notes.append("light mode — competitor reviews + Analyst skipped (finalist only)")
+    else:
+        analyst_competitor_asins = _top_competitors(
+            conn, asin, resolution.seed, mp, _ANALYST_COMPETITORS
+        )
+        agents = _run_analyst(
+            conn, request, config, clients, asin, analyst_competitor_asins, agents, notes
+        )
 
     # 7. Differentiation from the real review sample + (Miner-persisted) evidence.
     #    Competitor absence is derived from the Analyst matrix, coverage-gated.

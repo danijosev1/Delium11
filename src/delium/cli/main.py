@@ -1236,6 +1236,18 @@ def scan_main(
         bool,
         typer.Option("--scheduled", help="Non-interactive; abort (never prompt) if over caps."),
     ] = False,
+    light: Annotated[
+        bool | None,
+        typer.Option(
+            "--light/--full",
+            help="Light finalist mode: finalist-only reviews + one Claude call, top "
+            "--enrich-limit only. Default: light for --scheduled, full otherwise.",
+        ),
+    ] = None,
+    enrich_limit: Annotated[
+        int,
+        typer.Option("--enrich-limit", help="How many finalists to enrich (light mode)."),
+    ] = 5,
     resume: Annotated[
         str | None, typer.Option("--resume", help="Resume a scan by id (from the last stage).")
     ] = None,
@@ -1260,20 +1272,37 @@ def scan_main(
 
     with get_connection() as conn:
         profile = profile_store.load_active(conn)
+    # Light mode is the default for unattended (--scheduled) runs; interactive
+    # runs default to the full validate path unless --light is passed.
+    light_mode = scheduled if light is None else light
+    # Caps default to the active Research Profile's per-scan caps when the flags
+    # are omitted, so an unattended run is always bounded (Fix B).
+    budget_cap_tokens = budget_cap if budget_cap is not None else profile.keepa_token_cap
+    max_spend_usd = max_spend if max_spend is not None else profile.max_scan_usd
     params = ScanParams(
         marketplaces=mps,
         top_n=top,
-        budget_cap_tokens=budget_cap,
-        max_spend_usd=max_spend,
+        budget_cap_tokens=budget_cap_tokens,
+        max_spend_usd=max_spend_usd,
         min_confidence=Confidence(min_confidence.lower()),
         scheduled=scheduled,
+        light_finalists=light_mode,
+        enrich_limit=enrich_limit,
     )
-    clients = _build_scan_clients(config)
+    clients = _build_scan_clients(config, light=light_mode)
 
     def _confirm(projection: daily_scan.CostProjection) -> bool:
+        mode = (
+            "light (finalist-only reviews + 1 Claude call each)" if light_mode else "full validate"
+        )
+        console.print(
+            f"[bold]Finalist mode[/bold]: {mode}"
+            + (f"; enriching top {enrich_limit}." if light_mode else ".")
+        )
         console.print(
             f"[bold]Projected cost[/bold]: ~{projection.total_tokens} Keepa tokens + "
-            f"${projection.total_usd:.2f}."
+            f"${projection.total_usd:.2f} (caps: {budget_cap_tokens} tokens / "
+            f"${max_spend_usd:.2f})."
         )
         for s in projection.stages:
             console.print(f"  {s.name}: ~{s.keepa_tokens} tokens, ${s.data_usd + s.llm_usd:.2f}")
@@ -1319,9 +1348,13 @@ def scan_report(
     _render_scan(report)
 
 
-def _build_scan_clients(config: object) -> ScanClients:
+def _build_scan_clients(config: object, *, light: bool = False) -> ScanClients:
     """Provider factories + an optional finalist enricher (reviews + Claude
-    differentiation + re-score, via the validation pipeline)."""
+    differentiation + re-score, via the validation pipeline).
+
+    `light` runs the enricher in the validation pipeline's light mode:
+    finalist-only reviews + a single Claude call (no competitor reviews, no
+    Analyst), reusing cached reviews/analysis. Full mode runs the full path."""
     from delium.analysis.models import Marketplace
     from delium.config.models import DeliumConfig
     from delium.discovery.daily_scan import EnrichResult, ScanClients
@@ -1345,7 +1378,11 @@ def _build_scan_clients(config: object) -> ScanClients:
 
             val_clients = Clients(keepa=keepa_factory, dfs=dfs_factory, reviews=reviews, llm=llm)
             request = ValidationRequest(
-                target=asin, marketplace=Marketplace(marketplace), run_id=run_id, force=False
+                target=asin,
+                marketplace=Marketplace(marketplace),
+                run_id=run_id,
+                force=False,
+                light=light,
             )
             with get_connection() as vconn:
                 report = run_validation(vconn, request, config, val_clients)

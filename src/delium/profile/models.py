@@ -93,6 +93,12 @@ class ResearchProfile:
     cogs_value: float = 0.25
     freight_per_kg_usd: float = 6.0
     risk_tolerance: RiskTolerance = RiskTolerance.BALANCED
+    # -- daily-scan spending caps (Part 3) ---------------------------------
+    # A scan aborts in preflight before spending if its projection exceeds
+    # either cap. Conservative defaults suit an unattended daily run; the CLI
+    # uses these when --max-spend / --budget-cap are not passed.
+    max_scan_usd: float = 5.0
+    keepa_token_cap: int = 1500
 
     # -- profit ------------------------------------------------------------
     @property
@@ -190,6 +196,8 @@ class ResearchProfile:
             cogs_value=row["cogs_value"],
             freight_per_kg_usd=row["freight_per_kg_usd"],
             risk_tolerance=RiskTolerance(row["risk_tolerance"]),
+            max_scan_usd=row["max_scan_usd"],
+            keepa_token_cap=row["keepa_token_cap"],
         )
 
     def to_values(self) -> dict[str, Any]:
@@ -214,6 +222,8 @@ class ResearchProfile:
             "cogs_value": self.cogs_value,
             "freight_per_kg_usd": self.freight_per_kg_usd,
             "risk_tolerance": self.risk_tolerance.value,
+            "max_scan_usd": self.max_scan_usd,
+            "keepa_token_cap": self.keepa_token_cap,
         }
 
 
@@ -236,6 +246,8 @@ DEFAULT_PRESETS: tuple[ResearchProfile, ...] = (
         cogs_value=0.28,
         freight_per_kg_usd=7.0,
         risk_tolerance=RiskTolerance.CONSERVATIVE,
+        max_scan_usd=5.0,
+        keepa_token_cap=1500,
     ),
     ResearchProfile(
         name="Growth $20k",
@@ -254,5 +266,7 @@ DEFAULT_PRESETS: tuple[ResearchProfile, ...] = (
         cogs_value=0.25,
         freight_per_kg_usd=6.0,
         risk_tolerance=RiskTolerance.AGGRESSIVE,
+        max_scan_usd=8.0,
+        keepa_token_cap=2500,
     ),
 )

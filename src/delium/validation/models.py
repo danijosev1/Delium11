@@ -44,6 +44,7 @@ class ValidationRequest:
     run_id: str
     tier: str = "validate"
     force: bool = False
+    light: bool = False  # scan light mode: finalist-only reviews + single Claude call
     cogs_usd: float | None = None
     freight_usd: float | None = None
     dims_mm: tuple[int, int, int] | None = None

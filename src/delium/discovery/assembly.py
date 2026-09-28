@@ -103,14 +103,26 @@ def _parse_date(value: str | None) -> date | None:
         return None
 
 
-def _asin_history(conn: sqlite3.Connection, asin: str) -> AsinHistory:
+def _asin_history(
+    conn: sqlite3.Connection, asin: str, marketplace: str | None = None
+) -> AsinHistory:
     rows = repository.get_price_bsr_history(conn, asin)
     points = tuple(
         BsrPoint(date=d, bsr=int(r["bsr"]))
         for r in rows
         if r["bsr"] is not None and (d := _parse_date(r["captured_on"])) is not None
     )
-    return AsinHistory(asin=asin, observations=points)
+    # Keepa `monthlySold` (Amazon's real bucketed figure) is the PRIMARY units
+    # source when present. It is a per-listing/variation-family figure: our
+    # parent-ASIN grouping keeps one representative child per family, so the
+    # family's monthlySold is counted once, never summed across duplicated
+    # variation rows.
+    monthly_sold: int | None = None
+    if marketplace is not None:
+        product = repository.get_product(conn, asin, marketplace)
+        if product is not None:
+            monthly_sold = _row_value(product, "monthly_sold")
+    return AsinHistory(asin=asin, observations=points, monthly_sold=monthly_sold)
 
 
 def _price_history(conn: sqlite3.Connection, asin: str) -> tuple[PricePoint, ...]:
@@ -224,10 +236,13 @@ def build_demand(
     category: str | None,
     competitor_asins: list[str],
 ) -> DemandReport | None:
-    target = _asin_history(conn, asin)
+    target = _asin_history(conn, asin, marketplace)
     if not target.observations:
         return None  # no BSR history → demand not assessable at discovery
-    histories = [target, *(_asin_history(conn, c) for c in competitor_asins if c != asin)]
+    histories = [
+        target,
+        *(_asin_history(conn, c, marketplace) for c in competitor_asins if c != asin),
+    ]
     keywords, primary, series = _keyword_data(conn, asin, marketplace)
     return analyze_demand(
         as_of=_as_of(histories),

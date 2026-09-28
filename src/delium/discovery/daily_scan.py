@@ -56,6 +56,11 @@ log = get_logger(__name__)
 # Keepa has no Australia coverage.
 _NO_KEEPA = frozenset({"AU"})
 
+# Fix B — projected data cost of a light-mode finalist: reviews for the finalist
+# ONLY (a small sample), no competitor reviews. A fraction of a full validate's
+# review spend; used only for the preflight projection (actual cost is metered).
+_LIGHT_REVIEW_USD = 0.30
+
 STAGE_NAMES = (
     "preflight",
     "sweep",
@@ -106,6 +111,15 @@ class ScanParams:
     min_confidence: Confidence = Confidence.LOW
     scheduled: bool = False  # non-interactive; abort (never prompt) if over caps
     cross_market: bool = True
+    # Fix B — finalist enrichment cost control:
+    #  light_finalists: reviews for the finalist ONLY (no competitors) + a single
+    #    Claude call each; the enricher reuses cached reviews/analysis. Default for
+    #    --scheduled runs. The full validate path stays available for the Workspace
+    #    "Deep dive".
+    #  enrich_limit: only the top N finalists are enriched; the rest keep
+    #    differentiation_status "pending" ("differentiation pending" in the UI).
+    light_finalists: bool = False
+    enrich_limit: int = 5
 
 
 @dataclass(frozen=True)
@@ -176,9 +190,21 @@ def project_costs(
     serp_depth = config.discovery.serp_depth
     comp_usd = round(params.competitor_pool * 3 * dfs_call, 2)
     comp_tokens = params.competitor_pool * serp_depth * 2
-    # Finalists: reviews (capped) + LLM (capped) + one keyword bundle each.
-    fin_data = round(params.top_n * (config.budgets.max_data_usd_per_validate + 3 * dfs_call), 2)
-    fin_llm = round(params.top_n * config.budgets.max_llm_usd_per_validate, 2)
+    # Finalists: reviews + LLM + one keyword bundle each, for the enriched subset.
+    #   full mode  → every finalist runs the full validate path (competitor
+    #                reviews + Analyst + Strategist): worst-case validate cost each.
+    #   light mode → only the top `enrich_limit` finalists, each finalist-only
+    #                reviews (a fraction of a full validate) + a single Claude call;
+    #                the rest are reported "differentiation pending" (no spend).
+    if params.light_finalists:
+        n_enriched = max(0, min(params.top_n, params.enrich_limit))
+        fin_data = round(n_enriched * (_LIGHT_REVIEW_USD + 3 * dfs_call), 2)
+        fin_llm = round(n_enriched * config.budgets.max_llm_usd_per_validate, 2)
+    else:
+        fin_data = round(
+            params.top_n * (config.budgets.max_data_usd_per_validate + 3 * dfs_call), 2
+        )
+        fin_llm = round(params.top_n * config.budgets.max_llm_usd_per_validate, 2)
 
     stages = (
         StageCost(1, "sweep", sweep_tokens, 0.0, 0.0),
@@ -434,6 +460,8 @@ def _params_json(params: ScanParams) -> dict[str, Any]:
         "max_spend_usd": params.max_spend_usd,
         "min_confidence": params.min_confidence.value,
         "cross_market": params.cross_market,
+        "light_finalists": params.light_finalists,
+        "enrich_limit": params.enrich_limit,
     }
 
 
@@ -989,14 +1017,18 @@ def _stage_finalists(
     ranked = repository.get_scan_candidates(conn, scan_id, outcome="ranked")
     ranked.sort(key=lambda r: r["rank"] if r["rank"] is not None else 1_000_000)
     llm_usd = 0.0
+    # In light mode only the top `enrich_limit` finalists are enriched (reviews +
+    # one Claude call each); the rest keep differentiation "pending". Full mode
+    # enriches every finalist.
+    enrich_cap = params.enrich_limit if params.light_finalists else params.top_n
     finals: list[tuple[float, str, sqlite3.Row, str]] = []
-    for c in ranked[: params.top_n]:
+    for idx, c in enumerate(ranked[: params.top_n]):
         asin, mp = c["asin"], c["marketplace"]
         facts = _loads(c["data"]) or {}
         opp = c["opportunity_score"]
         diff_status = "pending"
         eligible = (c["verdict"] or "") != "avoid"
-        if clients.enrich_finalist is not None:
+        if clients.enrich_finalist is not None and idx < enrich_cap:
             conn.commit()  # the enricher runs the validation pipeline on its own connection
             er = clients.enrich_finalist(asin, mp, run_id)
             llm_usd += er.llm_usd

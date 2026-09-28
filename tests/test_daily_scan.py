@@ -281,6 +281,69 @@ def test_resume_finished_scan_is_noop(initialized_db: Path) -> None:
 # ---------------------------------------------------------------------------
 # min-confidence gate
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Fix B — light finalist mode + per-scan caps
+# ---------------------------------------------------------------------------
+def test_light_mode_projects_cheaper_finalists_than_full() -> None:
+    """Light mode enriches only `enrich_limit` finalists, each finalist-only
+    reviews + one Claude call — strictly cheaper than the full validate path."""
+    from delium.profile.models import ResearchProfile
+
+    profile = ResearchProfile(name="p")
+    full = daily_scan.project_costs(
+        ScanParams(marketplaces=("US",), top_n=10, light_finalists=False), profile, CFG
+    )
+    light = daily_scan.project_costs(
+        ScanParams(marketplaces=("US",), top_n=10, light_finalists=True, enrich_limit=5),
+        profile,
+        CFG,
+    )
+    assert light.total_usd < full.total_usd
+    # Sweep/hydrate tokens are identical (only the finalist stage changes).
+    assert light.total_tokens == full.total_tokens
+
+
+def test_light_mode_enriches_only_enrich_limit(initialized_db: Path) -> None:
+    calls: list[str] = []
+
+    def _counting(asin: str, mp: str, run_id: str) -> EnrichResult:
+        calls.append(asin)
+        return EnrichResult(
+            opportunity_score=70.0, differentiation_available=True, data_usd=0.0, llm_usd=0.2
+        )
+
+    transport = RoutingKeepa(FINDER_ASINS)
+    report = _run(
+        ScanParams(marketplaces=("US",), top_n=3, light_finalists=True, enrich_limit=1),
+        ScanClients(keepa_factory=_keepa_factory(transport), enrich_finalist=_counting),
+    )
+    # Exactly one finalist enriched; the rest report "differentiation pending".
+    assert len(calls) == 1
+    done = [f for f in report.finalists if f["differentiation"] == "done"]
+    pending = [f for f in report.finalists if f["differentiation"] == "pending"]
+    assert len(done) == 1
+    assert len(pending) == len(report.finalists) - 1
+
+
+def test_profile_caps_roundtrip_and_presets(initialized_db: Path) -> None:
+    from delium.profile.models import DEFAULT_PRESETS, ResearchProfile
+
+    # Presets ship with the Fix B defaults ($5 / 1500 tokens on Conservative).
+    conservative = DEFAULT_PRESETS[0]
+    assert conservative.max_scan_usd == 5.0
+    assert conservative.keepa_token_cap == 1500
+
+    with get_connection() as conn:
+        pid = profile_store.save(
+            conn, ResearchProfile(name="Capped", max_scan_usd=7.5, keepa_token_cap=2200)
+        )
+        conn.commit()
+        loaded = profile_store.get(conn, pid)
+    assert loaded is not None
+    assert loaded.max_scan_usd == 7.5
+    assert loaded.keepa_token_cap == 2200
+
+
 def test_min_confidence_high_filters_finalists(initialized_db: Path) -> None:
     # With no competitor set + no differentiation, sellability confidence is low,
     # so a HIGH floor should admit no finalists.

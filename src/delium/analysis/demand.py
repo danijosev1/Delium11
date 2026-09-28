@@ -22,6 +22,7 @@ from statistics import median
 from typing import Any
 
 from delium.analysis import curves
+from delium.analysis.amazon_buckets import bucket_representative, monthly_sold_bucket
 from delium.analysis.models import (
     AsinHistory,
     BsrTrend,
@@ -89,17 +90,26 @@ def curve_units_for_bsr(curves: VelocityCurves, category: str | None, bsr: int) 
     return _curve_units(curve.anchors, bsr)
 
 
+def _loglog(lo: VelocityAnchor, hi: VelocityAnchor, bsr: int) -> float:
+    """Units at `bsr` on the log-log line through two anchors (inter/extrapolated)."""
+    t = (log10(bsr) - log10(lo.bsr)) / (log10(hi.bsr) - log10(lo.bsr))
+    return float(10.0 ** (log10(lo.units) + t * (log10(hi.units) - log10(lo.units))))
+
+
 def _curve_units(anchors: tuple[VelocityAnchor, ...], bsr: int) -> float:
-    """Log-log interpolate monthly units at a BSR; clamp beyond the anchor ends."""
+    """Log-log monthly units at a BSR. EXTRAPOLATES smoothly beyond the anchor
+    ends instead of clamping — the old flat clamp put a hard ceiling (~4,000
+    units) on every low-BSR product, which massively under-read the best sellers.
+    Below the first anchor we extend the first segment's slope; above the last
+    anchor we extend the last segment's (floored at 1 unit)."""
+    bsr = max(1, bsr)
     if bsr <= anchors[0].bsr:
-        return float(anchors[0].units)
+        return max(1.0, _loglog(anchors[0], anchors[1], bsr))  # extrapolate below
     if bsr >= anchors[-1].bsr:
-        return float(anchors[-1].units)
+        return max(1.0, _loglog(anchors[-2], anchors[-1], bsr))  # extrapolate above
     for lo, hi in zip(anchors, anchors[1:], strict=False):
         if lo.bsr <= bsr <= hi.bsr:
-            t = (log10(bsr) - log10(lo.bsr)) / (log10(hi.bsr) - log10(lo.bsr))
-            log_units = log10(lo.units) + t * (log10(hi.units) - log10(lo.units))
-            return float(10.0**log_units)
+            return _loglog(lo, hi, bsr)
     return float(anchors[-1].units)  # pragma: no cover - anchors are sorted
 
 
@@ -134,6 +144,29 @@ def _sales_estimate(
     n_obs = len(window)
     drops = sum(1 for k in range(len(window) - 1) if window[k + 1][1] < window[k][1])
     observed_days = window[0][0] - window[-1][0] if len(window) >= 2 else 0
+
+    # PRIMARY source: Amazon's own bucketed "bought in past month" (Keepa
+    # `monthlySold`). It is a real figure, not an estimate, so it wins over the
+    # illustrative BSR curve whenever present. We keep the bucket RANGE
+    # (low = floor, expected = geometric representative, high = next floor).
+    if history.monthly_sold is not None and history.monthly_sold > 0:
+        low_b, high_b = monthly_sold_bucket(history.monthly_sold)
+        expected = round(bucket_representative(low_b, high_b))
+        low = low_b
+        high = high_b if high_b is not None else round(low_b * 1.5)
+        return SalesEstimate(
+            asin=history.asin,
+            low_units=low,
+            expected_units=expected,
+            high_units=max(high, expected),
+            confidence=Confidence.HIGH,  # Amazon's own figure — not our estimate
+            method="amazon_bucketed",
+            observed_days=observed_days,
+            n_observations=n_obs,
+            drops=drops,
+            current_bsr=current_bsr,
+            rank_reference_units=rank_ref,
+        )
 
     if observed_days >= cfg.partial_history_days:
         monthly = drops / observed_days * 30

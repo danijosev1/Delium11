@@ -45,6 +45,23 @@ So calibration compares Delium's estimate against the **bucket range**:
 The report shows, per product, whether Delium's estimate is **inside** Keepa's
 bucket, and aggregates a **bucket hit-rate** alongside the MAPE.
 
+## `monthlySold` is now the primary units source (not just a calibration target)
+
+As of Fix A, Keepa `monthlySold` is the **primary** monthly-units input to the
+demand pillar (and thus profit, revenue, and category momentum) whenever present
+— it is Amazon's own figure, used as the bucket range at `HIGH` confidence and
+labelled "amazon (bucketed)". The illustrative BSR→units curve is now only the
+**fallback** (labelled "estimated (illustrative curve)", lower confidence) and no
+longer has the artificial ~4,000-unit ceiling (it extrapolates log-log). So
+calibration's units MAPE now measures the *fallback curve's* error against
+`monthlySold`, on the products where `monthlySold` is absent — its whole purpose.
+
+**Calibration scales stay diagnostic-only.** The suggested per-category curve/fee
+scales are *not applied* anywhere; the curve stays illustrative until refit by
+hand from a broader sample. The earlier ×37.5 / ×7.7 suggestions were **not**
+applied — the ceiling removal + monthlySold-primary switch address the miss
+directly instead.
+
 ## Aggregates & suggestions
 
 - **Units MAPE / Fee MAPE** — mean absolute % error across products (units are

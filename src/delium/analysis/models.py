@@ -261,10 +261,15 @@ class BsrPoint:
 
 @dataclass(frozen=True)
 class AsinHistory:
-    """A single ASIN's BSR observations (target first, then competitors)."""
+    """A single ASIN's BSR observations (target first, then competitors).
+
+    `monthly_sold` is Keepa's `monthlySold` (Amazon's real bucketed "bought past
+    month"): when present it is the PRIMARY monthly-units source and the BSR curve
+    is used only as a fallback."""
 
     asin: str
     observations: tuple[BsrPoint, ...]
+    monthly_sold: int | None = None
 
 
 @dataclass(frozen=True)
@@ -348,12 +353,25 @@ class SalesEstimate:
     expected_units: int
     high_units: int
     confidence: Confidence
-    method: str  # 'rank_drop' | 'curve_fallback'
+    method: str  # 'amazon_bucketed' | 'rank_drop' | 'curve_fallback'
     observed_days: int
     n_observations: int
     drops: int
     current_bsr: int
     rank_reference_units: int
+
+    @property
+    def units_source(self) -> str:
+        """Human label for where the monthly-units figure came from."""
+        return {
+            "amazon_bucketed": "amazon (bucketed)",
+            "rank_drop": "estimated (rank-drop)",
+            "curve_fallback": "estimated (illustrative curve)",
+        }.get(self.method, "estimated")
+
+    @property
+    def is_amazon_source(self) -> bool:
+        return self.method == "amazon_bucketed"
 
 
 @dataclass(frozen=True)
