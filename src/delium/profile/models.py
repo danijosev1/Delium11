@@ -99,6 +99,12 @@ class ResearchProfile:
     # uses these when --max-spend / --budget-cap are not passed.
     max_scan_usd: float = 5.0
     keepa_token_cap: int = 1500
+    # -- daily-scan sizing (drives the projected token/USD cost) -----------
+    # sweep_size: raw ASINs the sweep brings back; scan_competitor_sets: how many
+    # top products get a page-one competitor set. The CLI uses these when
+    # --sweep-size / --competitor-sets are omitted.
+    scan_sweep_size: int = 300
+    scan_competitor_sets: int = 40
 
     # -- profit ------------------------------------------------------------
     @property
@@ -198,6 +204,8 @@ class ResearchProfile:
             risk_tolerance=RiskTolerance(row["risk_tolerance"]),
             max_scan_usd=row["max_scan_usd"],
             keepa_token_cap=row["keepa_token_cap"],
+            scan_sweep_size=row["scan_sweep_size"],
+            scan_competitor_sets=row["scan_competitor_sets"],
         )
 
     def to_values(self) -> dict[str, Any]:
@@ -224,6 +232,8 @@ class ResearchProfile:
             "risk_tolerance": self.risk_tolerance.value,
             "max_scan_usd": self.max_scan_usd,
             "keepa_token_cap": self.keepa_token_cap,
+            "scan_sweep_size": self.scan_sweep_size,
+            "scan_competitor_sets": self.scan_competitor_sets,
         }
 
 
@@ -248,6 +258,8 @@ DEFAULT_PRESETS: tuple[ResearchProfile, ...] = (
         risk_tolerance=RiskTolerance.CONSERVATIVE,
         max_scan_usd=5.0,
         keepa_token_cap=1500,
+        scan_sweep_size=200,
+        scan_competitor_sets=25,
     ),
     ResearchProfile(
         name="Growth $20k",
@@ -268,5 +280,7 @@ DEFAULT_PRESETS: tuple[ResearchProfile, ...] = (
         risk_tolerance=RiskTolerance.AGGRESSIVE,
         max_scan_usd=8.0,
         keepa_token_cap=2500,
+        scan_sweep_size=300,
+        scan_competitor_sets=40,
     ),
 )

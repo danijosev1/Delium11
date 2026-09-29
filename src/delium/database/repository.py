@@ -1229,6 +1229,8 @@ _PROFILE_FIELDS: tuple[str, ...] = (
     "risk_tolerance",
     "max_scan_usd",
     "keepa_token_cap",
+    "scan_sweep_size",
+    "scan_competitor_sets",
 )
 
 

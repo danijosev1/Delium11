@@ -117,6 +117,7 @@ ranked "scan inbox". It never loosens a kill or gate and preserves
 delium scan                              # interactive: shows projected cost, confirms
 delium scan --marketplaces US,CA,UK
 delium scan --top 10 --budget-cap 1500 --max-spend 5
+delium scan --sweep-size 200 --competitor-sets 25   # size the funnel (else profile defaults)
 delium scan --min-confidence medium
 delium scan --light --enrich-limit 5     # light finalists (default for --scheduled)
 delium scan --full                       # full validate path for every finalist
@@ -128,14 +129,21 @@ delium scan report [<scan_id>]           # print a past scan (latest if omitted)
 
 When `--budget-cap` / `--max-spend` are omitted, the scan uses the **active
 Research Profile's per-scan caps** (defaults: $5 / 1,500 Keepa tokens) so an
-unattended run is always bounded.
+unattended run is always bounded. Likewise `--sweep-size` (raw ASINs swept) and
+`--competitor-sets` (how many top products get a page-one competitor set)
+default to the profile's sizing (Conservative: 200 / 25, Growth: 300 / 40).
 
 **Stages** (each persists progress to SQLite, logs Keepa tokens + $, and records
 its funnel counts, so a crash resumes from the last completed stage):
 
 0. **Preflight** — load the active Research Profile, a free Keepa `/token`
    check, project the cost of every later stage, and **abort before spending**
-   if it would exceed `--budget-cap` (tokens) or `--max-spend` (USD).
+   only if the projection exceeds the token **cap** (`--budget-cap`) or USD cap
+   (`--max-spend`). The current Keepa **balance** is *not* a hard limit: if the
+   projection exceeds it, the scan reports **"will pace: ~N min waiting for
+   Keepa refills"** and continues — the client waits for refills as it runs
+   (useful on small Keepa plans, e.g. a 1,200-token balance refilling
+   20/min).
 1. **Sweep** — Keepa Product Finder across BSR sub-bands per profile category,
    with as many hard-kill rules as the finder supports pushed **into** the query
    (price band → `current_NEW_gte/lte` for K1/K2; not sold by Amazon →

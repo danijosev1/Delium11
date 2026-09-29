@@ -404,6 +404,8 @@ def _stage_preflight(
     detail: dict[str, Any] = {
         "projected_tokens": projection.total_tokens,
         "projected_usd": projection.total_usd,
+        "sweep_size": params.sweep_target,
+        "competitor_sets": params.competitor_pool,
         "per_stage": [
             {"stage": s.name, "tokens": s.keepa_tokens, "usd": round(s.data_usd + s.llm_usd, 2)}
             for s in projection.stages
@@ -411,27 +413,41 @@ def _stage_preflight(
     }
     # Free Keepa token check.
     tokens_left: int | None = None
+    refill_rate: int | None = None
     if clients.keepa_factory is not None and active_mps:
         try:
             status = clients.keepa_factory(active_mps[0]).token_status()
             tokens_left = status.tokens_left
+            refill_rate = status.refill_rate
         except Exception:  # noqa: BLE001 - a token check must never crash preflight
             tokens_left = None
     detail["keepa_tokens_left"] = tokens_left
 
+    # A cap is the only hard limit. The Keepa BALANCE is not: the client paces
+    # (waits for refills) when it runs low, so a projection that exceeds the
+    # current balance just means the scan will spend time waiting, not that it
+    # cannot complete. Abort only when the projection exceeds the token/USD caps.
     over = projection.over_caps(params)
     if over is not None:
         raise ScanAbortedError(over)
-    if (
-        params.budget_cap_tokens is not None
-        and tokens_left is not None
-        and projection.total_tokens > tokens_left
-    ):
-        raise ScanAbortedError(
-            f"projected {projection.total_tokens} tokens exceeds Keepa balance {tokens_left}"
-        )
     if not active_mps:
         raise ScanAbortedError("no Keepa-covered marketplaces requested")
+    if tokens_left is not None and projection.total_tokens > tokens_left:
+        deficit = projection.total_tokens - tokens_left
+        detail["pace_deficit_tokens"] = deficit
+        if refill_rate and refill_rate > 0:
+            pace_minutes = -(-deficit // refill_rate)  # ceil
+            detail["pace_minutes"] = pace_minutes
+            notes.append(
+                f"will pace: projected {projection.total_tokens} tokens exceeds the current "
+                f"Keepa balance {tokens_left}; ~{pace_minutes} min waiting for refills "
+                f"(~{refill_rate} tokens/min). The scan continues — token pacing handles the waits."
+            )
+        else:
+            notes.append(
+                f"will pace: projected {projection.total_tokens} tokens exceeds the current "
+                f"Keepa balance {tokens_left}; the scan waits for refills as it runs."
+            )
     out = _StageOut(input_count=0, output_count=len(active_mps), detail=detail)
     out.notes = list(projection.notes)
     return out

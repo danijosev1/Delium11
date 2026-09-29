@@ -1222,6 +1222,14 @@ def scan_main(
         str, typer.Option("--marketplaces", help="Comma-separated, e.g. US,CA,UK.")
     ] = "US",
     top: Annotated[int, typer.Option("--top", help="How many finalists to keep.")] = 10,
+    sweep_size: Annotated[
+        int | None,
+        typer.Option("--sweep-size", help="Raw ASINs to bring back from the sweep."),
+    ] = None,
+    competitor_sets: Annotated[
+        int | None,
+        typer.Option("--competitor-sets", help="How many top products get a competitor set."),
+    ] = None,
     budget_cap: Annotated[
         int | None,
         typer.Option("--budget-cap", help="Abort if projected Keepa tokens exceed this."),
@@ -1283,9 +1291,16 @@ def scan_main(
     # are omitted, so an unattended run is always bounded (Fix B).
     budget_cap_tokens = budget_cap if budget_cap is not None else profile.keepa_token_cap
     max_spend_usd = max_spend if max_spend is not None else profile.max_scan_usd
+    # Sweep size + competitor-set count default to the active profile's sizing.
+    sweep_target = sweep_size if sweep_size is not None else profile.scan_sweep_size
+    competitor_pool = (
+        competitor_sets if competitor_sets is not None else profile.scan_competitor_sets
+    )
     params = ScanParams(
         marketplaces=mps,
         top_n=top,
+        sweep_target=sweep_target,
+        competitor_pool=competitor_pool,
         budget_cap_tokens=budget_cap_tokens,
         max_spend_usd=max_spend_usd,
         min_confidence=Confidence(min_confidence.lower()),
@@ -1302,6 +1317,10 @@ def scan_main(
         console.print(
             f"[bold]Finalist mode[/bold]: {mode}"
             + (f"; enriching top {enrich_limit}." if light_mode else ".")
+        )
+        console.print(
+            f"[bold]Sizing[/bold]: sweep {sweep_target} ASINs · {competitor_pool} competitor "
+            f"sets · top {top} finalists."
         )
         console.print(
             f"[bold]Projected cost[/bold]: ~{projection.total_tokens} Keepa tokens + "

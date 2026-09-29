@@ -54,10 +54,14 @@ class RoutingKeepa:
     """Fake Keepa transport: routes by URL. /query → finder asinList, /token →
     balance, /product → a synthesized product per requested ASIN."""
 
-    def __init__(self, finder_asins: list[str]) -> None:
+    def __init__(
+        self, finder_asins: list[str], *, tokens_left: int = 9000, refill_rate: int = 20
+    ) -> None:
         self.finder_asins = finder_asins
         self.finder_params: list[dict[str, str]] = []
         self.product_calls = 0
+        self.tokens_left = tokens_left
+        self.refill_rate = refill_rate
 
     def request_json(self, url: str, params: Any) -> HttpResult:
         if "/query" in url:
@@ -68,11 +72,11 @@ class RoutingKeepa:
                     "asinList": self.finder_asins,
                     "totalResults": len(self.finder_asins),
                     "tokensConsumed": 11,
-                    "tokensLeft": 9000,
+                    "tokensLeft": self.tokens_left,
                 },
             )
         if "/token" in url:
-            return HttpResult(200, {"tokensLeft": 9000, "refillRate": 20})
+            return HttpResult(200, {"tokensLeft": self.tokens_left, "refillRate": self.refill_rate})
         # /product — synthesize a product for each requested ASIN.
         self.product_calls += 1
         asins = str(params.get("asin", "")).split(",")
@@ -80,7 +84,7 @@ class RoutingKeepa:
             200,
             {
                 "tokensConsumed": len(asins),
-                "tokensLeft": 9000,
+                "tokensLeft": self.tokens_left,
                 "products": [_product(a) for a in asins if a],
             },
         )
@@ -88,6 +92,10 @@ class RoutingKeepa:
 
 def _keepa_factory(transport: RoutingKeepa):  # type: ignore[no-untyped-def]
     return lambda mp: KeepaClient("k", transport=transport, sleep=lambda _s: None, marketplace=mp)
+
+
+def transport_clients(transport: RoutingKeepa) -> ScanClients:
+    return ScanClients(keepa_factory=_keepa_factory(transport))
 
 
 def _profile(conn: Any):  # type: ignore[no-untyped-def]
@@ -213,6 +221,60 @@ def test_max_spend_aborts(initialized_db: Path) -> None:
         )
 
 
+def test_cap_abort_message_names_the_cap_not_the_balance(initialized_db: Path) -> None:
+    # Over the token CAP → abort, and the message is about the cap (never the balance).
+    transport = RoutingKeepa(FINDER_ASINS, tokens_left=50)
+    with pytest.raises(ScanAbortedError, match="--budget-cap"):
+        _run(ScanParams(marketplaces=("US",), budget_cap_tokens=1), transport_clients(transport))
+
+
+# ---------------------------------------------------------------------------
+# Pacing: over the Keepa BALANCE (but under the cap) continues, does not abort
+# ---------------------------------------------------------------------------
+def test_over_balance_paces_and_completes(initialized_db: Path) -> None:
+    # Balance far below the projection, but the cap is generous: the scan must
+    # NOT abort — it paces (waits for refills) and completes.
+    transport = RoutingKeepa(FINDER_ASINS, tokens_left=10, refill_rate=20)
+    report = _run(
+        ScanParams(marketplaces=("US",), top_n=3, sweep_target=50, budget_cap_tokens=100_000),
+        transport_clients(transport),
+    )
+    assert report.status == "complete"
+    assert transport.product_calls > 0  # it actually ran (hydrated)
+    assert any("will pace" in n for n in report.notes)
+    assert any("min waiting for refills" in n for n in report.notes)
+
+
+def test_within_balance_has_no_pacing_note(initialized_db: Path) -> None:
+    transport = RoutingKeepa(FINDER_ASINS, tokens_left=100_000)
+    report = _run(
+        ScanParams(marketplaces=("US",), top_n=3, sweep_target=50, budget_cap_tokens=100_000),
+        transport_clients(transport),
+    )
+    assert report.status == "complete"
+    assert not any("will pace" in n for n in report.notes)
+
+
+# ---------------------------------------------------------------------------
+# Sweep-size / competitor-sets sizing drives the projection
+# ---------------------------------------------------------------------------
+def test_sizing_options_change_projected_tokens() -> None:
+    from delium.profile.models import ResearchProfile
+
+    profile = ResearchProfile(name="p")
+    small = daily_scan.project_costs(
+        ScanParams(marketplaces=("US",), sweep_target=100, competitor_pool=10), profile, CFG
+    )
+    big = daily_scan.project_costs(
+        ScanParams(marketplaces=("US",), sweep_target=400, competitor_pool=50), profile, CFG
+    )
+    assert big.total_tokens > small.total_tokens
+    # Hydrate scales with sweep size (~2 tokens/ASIN, worst case).
+    small_hydrate = next(s for s in small.stages if s.name == "hydrate").keepa_tokens
+    big_hydrate = next(s for s in big.stages if s.name == "hydrate").keepa_tokens
+    assert big_hydrate == 800 and small_hydrate == 200
+
+
 # ---------------------------------------------------------------------------
 # AU message
 # ---------------------------------------------------------------------------
@@ -332,16 +394,27 @@ def test_profile_caps_roundtrip_and_presets(initialized_db: Path) -> None:
     conservative = DEFAULT_PRESETS[0]
     assert conservative.max_scan_usd == 5.0
     assert conservative.keepa_token_cap == 1500
+    assert conservative.scan_sweep_size == 200
+    assert conservative.scan_competitor_sets == 25
 
     with get_connection() as conn:
         pid = profile_store.save(
-            conn, ResearchProfile(name="Capped", max_scan_usd=7.5, keepa_token_cap=2200)
+            conn,
+            ResearchProfile(
+                name="Capped",
+                max_scan_usd=7.5,
+                keepa_token_cap=2200,
+                scan_sweep_size=120,
+                scan_competitor_sets=15,
+            ),
         )
         conn.commit()
         loaded = profile_store.get(conn, pid)
     assert loaded is not None
     assert loaded.max_scan_usd == 7.5
     assert loaded.keepa_token_cap == 2200
+    assert loaded.scan_sweep_size == 120
+    assert loaded.scan_competitor_sets == 15
 
 
 def test_min_confidence_high_filters_finalists(initialized_db: Path) -> None:
