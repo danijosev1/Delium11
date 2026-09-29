@@ -149,7 +149,13 @@ its funnel counts, so a crash resumes from the last completed stage):
    (price band → `current_NEW_gte/lte` for K1/K2; not sold by Amazon →
    `buyBoxIsAmazon=false` for K4; review cap → `current_COUNT_REVIEWS_lte` for
    K6; weight limit → `packageWeight_lte` for K3) so less junk comes back. Also
-   runs the existing cross-market pass.
+   runs the existing cross-market pass. Category ids are **marketplace-specific**,
+   so the profile's category filter is applied only for the marketplace it was
+   declared for and omitted (with a note) elsewhere — US ids are never sent to
+   UK/CA. If Keepa rejects a selection (HTTP 400, its error message surfaced in
+   the log), the sweep **retries once without the optional filters** rather than
+   failing on one bad filter; a sweep that returns 0 ASINs *because of errors*
+   ends the scan as **failed** (with the reason), not "complete".
 2. **Hydrate** — batched, cache-first Keepa `/product` (≤100/call) for the sweep.
 3. **Normalize + hard kill** — merge variations by parent ASIN, flag established
    brands, apply the existing kill rules (every kill logged with its reason).

@@ -9,6 +9,8 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from delium.analysis.emerging import (
     EmergenceInput,
     build_finder_selection,
@@ -44,7 +46,10 @@ def test_build_finder_selection_maps_thresholds() -> None:
     assert sel["current_NEW_lte"] == DATA.finder.price_max_cents
     assert sel["current_COUNT_REVIEWS_lte"] == DATA.finder.reviews_max
     assert sel["buyBoxIsAmazon"] is False  # exclude Amazon
-    assert sel["rootCategory"] == [3760901]
+    # Category ids go in categories_include (long[]), NOT rootCategory (String[]).
+    assert sel["categories_include"] == [3760901]
+    assert "rootCategory" not in sel
+    assert sel["productType"] == [0]  # standard physical only (1 = downloadable)
     assert sel["perPage"] == 50
     # trackingSince cutoff == age_max_days before as_of, in Keepa minutes.
     assert sel["trackingSince_gte"] == _km(AS_OF - timedelta(days=DATA.finder.age_max_days))
@@ -56,7 +61,8 @@ def test_build_finder_selection_overrides() -> None:
     )
     assert sel["current_COUNT_REVIEWS_lte"] == 30
     assert sel["current_SALES_lte"] == 9000
-    assert "rootCategory" not in sel  # no category → omitted
+    assert "categories_include" not in sel  # no category → omitted
+    assert "rootCategory" not in sel
 
 
 def test_finder_token_estimate() -> None:
@@ -83,6 +89,26 @@ def test_product_finder_parses_asin_list() -> None:
     assert result.asins == ("B0AAA00001", "B0BBB00002")
     assert result.total_results == 512
     assert result.tokens_consumed == 11
+
+
+def test_product_finder_400_surfaces_keepa_error_body_no_key() -> None:
+    from delium.providers.base import ProviderResponseError
+    from keepa_support import http
+
+    body = {
+        "error": {"type": "invalidParameter", "message": "unknown field: badField"},
+        "tokensLeft": 812,
+    }
+    client = KeepaClient(
+        "SECRET-KEY", transport=FakeTransport([http(400, body)]), sleep=lambda _: None
+    )
+    with pytest.raises(ProviderResponseError) as exc:
+        client.product_finder({"perPage": 50, "badField": 1})
+    msg = str(exc.value)
+    assert "HTTP 400" in msg
+    assert "tokensLeft=812" in msg
+    assert "unknown field: badField" in msg  # Keepa's own message surfaced
+    assert "SECRET-KEY" not in msg  # the API key is never leaked
 
 
 # ---------------------------------------------------------------------------

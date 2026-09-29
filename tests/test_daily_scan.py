@@ -221,6 +221,103 @@ def test_max_spend_aborts(initialized_db: Path) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Finder resilience: per-marketplace categories, 400 fallback, failed-on-empty
+# ---------------------------------------------------------------------------
+def test_category_ids_applied_only_for_declared_marketplace() -> None:
+    from delium.discovery.daily_scan import _category_ids_for
+    from delium.profile.models import ResearchProfile
+
+    profile = ResearchProfile(name="p", preferred_categories=("3760901",), marketplaces=("US",))
+    us_ids, us_note = _category_ids_for(profile, "US")
+    assert us_ids == [3760901] and us_note is None
+    # UK is NOT the declared marketplace → US ids are dropped, with a clear note.
+    uk_ids, uk_note = _category_ids_for(profile, "UK")
+    assert uk_ids == []
+    assert uk_note is not None and "UK" in uk_note and "marketplace-specific" in uk_note
+    # No category ids at all → nothing to apply, no note.
+    assert _category_ids_for(ResearchProfile(name="p"), "UK") == ([], None)
+
+
+class _BadFilterKeepa(RoutingKeepa):
+    """400s on any /query that still carries an optional filter; succeeds on the
+    core selection (price band + sales band + productType + paging only)."""
+
+    def request_json(self, url: str, params: Any) -> HttpResult:
+        if "/query" in url:
+            import json as _json
+
+            sel = _json.loads(params["selection"])
+            optional = {
+                "buyBoxIsAmazon",
+                "packageWeight_lte",
+                "categories_include",
+                "current_COUNT_REVIEWS_lte",
+                "trackingSince_gte",
+                "sort",
+            }
+            if optional & set(sel):
+                return HttpResult(
+                    400,
+                    {
+                        "error": {"type": "invalidParameter", "message": "bad optional filter"},
+                        "tokensLeft": self.tokens_left,
+                    },
+                )
+        return super().request_json(url, params)
+
+
+def test_finder_falls_back_without_optional_filters_on_400(initialized_db: Path) -> None:
+    transport = _BadFilterKeepa(FINDER_ASINS)
+    report = _run(
+        ScanParams(marketplaces=("US",), top_n=3, sweep_target=50), transport_clients(transport)
+    )
+    # The full selection 400s, the core-only retry succeeds → the sweep still runs.
+    assert report.status == "complete"
+    assert report.funnel["swept"] == 3
+    assert any("retried without optional filters" in n for n in report.notes)
+
+
+class _AlwaysErrorKeepa(RoutingKeepa):
+    """Every /query returns HTTP 400, even the core selection."""
+
+    def request_json(self, url: str, params: Any) -> HttpResult:
+        if "/query" in url:
+            return HttpResult(
+                400,
+                {
+                    "error": {"type": "invalidParameter", "message": "nope"},
+                    "tokensLeft": self.tokens_left,
+                },
+            )
+        return super().request_json(url, params)
+
+
+def test_empty_sweep_due_to_errors_fails_not_completes(initialized_db: Path) -> None:
+    from delium.discovery.daily_scan import ScanError
+
+    transport = _AlwaysErrorKeepa(FINDER_ASINS)
+    with pytest.raises(ScanError, match="finder error"):
+        _run(
+            ScanParams(marketplaces=("US",), top_n=3, sweep_target=50), transport_clients(transport)
+        )
+    # The scan record is persisted as FAILED with the reason (not 'complete').
+    with get_connection() as conn:
+        scans = repository.list_scans(conn)
+        assert scans and scans[0]["status"] == "failed"
+        notes = " ".join(_loads_notes(scans[0]["notes"]))
+    assert "0 ASINs" in notes
+
+
+def _loads_notes(value: str | None) -> list[str]:
+    import json
+
+    if not value:
+        return []
+    parsed = json.loads(value)
+    return [str(x) for x in parsed] if isinstance(parsed, list) else []
+
+
 def test_cap_abort_message_names_the_cap_not_the_balance(initialized_db: Path) -> None:
     # Over the token CAP → abort, and the message is about the cap (never the balance).
     transport = RoutingKeepa(FINDER_ASINS, tokens_left=50)

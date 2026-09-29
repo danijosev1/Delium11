@@ -556,8 +556,10 @@ class KeepaClient:
                     self._sleep(_BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)])
                     continue
                 break
-            # Other 4xx: not retryable.
-            raise ProviderResponseError(f"Keepa returned HTTP {result.status}.")
+            # Other 4xx: not retryable. Surface Keepa's own error body (status,
+            # tokensLeft, message/type) so the caller logs exactly what was
+            # rejected — never the API key (see _keepa_error_detail).
+            raise ProviderResponseError(f"Keepa returned {_keepa_error_detail(result)}.")
 
         raise ProviderResponseError(
             f"Keepa request failed after retries (last status {last_status})."

@@ -140,6 +140,12 @@ def build_finder_selection(
     f = data.finder
     ov = overrides or {}
     age_days = int(ov.get("age_max_days", f.age_max_days))
+    # Field names/types verified against the official Keepa backend request
+    # struct (github.com/keepacom/api_backend ProductFinderRequest):
+    #   current_SALES_gte/lte, current_NEW_gte/lte (cents), current_COUNT_REVIEWS_lte,
+    #   trackingSince_gte (Keepa minutes, Integer), buyBoxIsAmazon (Boolean),
+    #   productType (Byte[]), page/perPage (int), sort (String[][]),
+    #   categories_include (long[]).
     selection: dict[str, Any] = {
         "current_SALES_gte": int(ov.get("bsr_min", f.bsr_min)),
         "current_SALES_lte": int(ov.get("bsr_max", f.bsr_max)),
@@ -148,7 +154,7 @@ def build_finder_selection(
         "current_COUNT_REVIEWS_lte": int(ov.get("reviews_max", f.reviews_max)),
         # Recently tracked = first appeared in Keepa within the age window.
         "trackingSince_gte": _days_ago_to_keepa_minute(as_of, age_days),
-        "productType": [0, 1],  # physical products only
+        "productType": [0],  # 0 = standard physical product (1 is downloadable)
         "page": page,
         "perPage": per_page,
         "sort": [[f.sort_field, "asc"]],  # best-selling (lowest BSR) first within the band
@@ -156,7 +162,11 @@ def build_finder_selection(
     if f.exclude_amazon:
         selection["buyBoxIsAmazon"] = False
     if category_ids:
-        selection["rootCategory"] = list(category_ids)
+        # `categories_include` (long[]) accepts any category node id; `rootCategory`
+        # is String[] and only for top-level departments. Category ids are
+        # marketplace-specific — the CALLER must only pass ids resolved for the
+        # target marketplace (never US ids to UK/CA).
+        selection["categories_include"] = [int(c) for c in category_ids]
     return selection
 
 

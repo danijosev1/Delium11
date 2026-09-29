@@ -1363,6 +1363,11 @@ def scan_main(
         if scheduled:
             notify("Delium scan aborted", str(exc))
         raise typer.Exit(code=1) from exc
+    except daily_scan.ScanError as exc:
+        console.print(f"[bold red]Scan failed:[/bold red] {exc}")
+        if scheduled:
+            notify("Delium scan failed", str(exc))
+        raise typer.Exit(code=1) from exc
     if scheduled:
         n = report.funnel.get("finalists", 0)
         notify(

@@ -161,6 +161,35 @@ class ScanAbortedError(Exception):
     """Raised in preflight when the projection exceeds a cap (before any spend)."""
 
 
+class ScanError(Exception):
+    """Raised when a stage cannot produce a usable result (e.g. the sweep returned
+    0 ASINs because every finder call errored). The scan is marked 'failed' with
+    this reason — distinct from a legitimate empty result, which completes."""
+
+
+# Keepa Product Finder fields we send. The CORE set (price band + sales-rank band
+# + paging) is the minimum a sweep needs; everything else is an OPTIONAL filter
+# that a fallback retry drops if Keepa rejects the full selection (HTTP 400), so
+# one bad optional filter can never kill the whole sweep.
+_CORE_FINDER_KEYS = frozenset(
+    {
+        "current_NEW_gte",
+        "current_NEW_lte",
+        "current_SALES_gte",
+        "current_SALES_lte",
+        "productType",
+        "page",
+        "perPage",
+    }
+)
+
+
+def _core_finder_selection(selection: dict[str, Any]) -> dict[str, Any]:
+    """The selection stripped to its core keys — used to retry once after a 400
+    so an unsupported/rejected optional filter can't kill the sweep."""
+    return {k: v for k, v in selection.items() if k in _CORE_FINDER_KEYS}
+
+
 # ---------------------------------------------------------------------------
 # Cost projection (pure)
 # ---------------------------------------------------------------------------
@@ -585,19 +614,25 @@ def _stage_sweep(
     active_mps: tuple[str, ...],
     as_of: date,
 ) -> _StageOut:
-    from delium.providers.base import ProviderError
-
     data = load_emerging_data(config.emerging.data_version)
     overrides = dict(profile.finder_overrides())
-    slices: list[int] = profile.category_ids() or [0]  # 0 → broad (no category filter)
     seen: set[tuple[str, str]] = set()
     swept = 0
     finder_calls = 0
+    finder_errors = 0
+    last_error: str | None = None
+    notes: list[str] = []
 
     for mp in active_mps:
         if clients.keepa_factory is None or swept >= params.sweep_target:
             break
         client = clients.keepa_factory(mp)
+        # Category ids are marketplace-specific — only apply the profile's ids to
+        # the marketplace(s) they were declared for; otherwise omit with a note.
+        cat_ids, cat_note = _category_ids_for(profile, mp)
+        if cat_note is not None:
+            notes.append(cat_note)
+        slices: list[int] = cat_ids or [0]  # 0 → broad (no category filter)
         for slice_id in slices:
             cats = [slice_id] if slice_id else []
             selections = build_finder_selections(
@@ -606,12 +641,15 @@ def _stage_sweep(
             for sel in selections:
                 if swept >= params.sweep_target:
                     break
-                if profile.max_weight_g is not None:  # finder-level K3 proxy (grams)
+                # Optional finder-level K3 proxy (grams); dropped by the fallback.
+                if profile.max_weight_g is not None and profile.max_weight_g > 0:
                     sel["packageWeight_lte"] = int(profile.max_weight_g)
-                try:
-                    finder = client.product_finder(sel)
-                except ProviderError as exc:
-                    log.warning("finder call failed (%s slice %s): %s", mp, slice_id, exc)
+                finder, note = _run_finder_with_fallback(client, sel, mp=mp, slice_id=slice_id)
+                if note is not None:
+                    notes.append(note)
+                if finder is None:
+                    finder_errors += 1
+                    last_error = note
                     continue
                 finder_calls += 1
                 for asin in finder.asins:
@@ -667,14 +705,69 @@ def _stage_sweep(
                         source="cross_market",
                     )
 
-    return _StageOut(
+    # An empty sweep caused by finder ERRORS is a failure (surface the reason),
+    # NOT a legitimate "no matches" completion. A zero result with no errors is a
+    # valid empty scan and completes normally.
+    if swept == 0 and finder_errors > 0:
+        raise ScanError(
+            f"sweep produced 0 ASINs after {finder_errors} finder error(s). "
+            f"Last error: {last_error or 'unknown'}"
+        )
+
+    out = _StageOut(
         output_count=swept,
         detail={
             "finder_calls": finder_calls,
+            "finder_errors": finder_errors,
             "from_finder": swept - xm_count,
             "from_cross_market": xm_count,
         },
     )
+    out.notes = notes
+    return out
+
+
+def _category_ids_for(profile: ResearchProfile, marketplace: str) -> tuple[list[int], str | None]:
+    """The profile's numeric category ids to apply for `marketplace`, plus an
+    optional note. Category ids are marketplace-specific (a US node id is
+    meaningless in UK/CA), so they are applied ONLY for the marketplace(s) the
+    profile declares — otherwise the filter is omitted and the reason noted."""
+    ids = profile.category_ids()
+    if not ids:
+        return [], None
+    if marketplace in profile.marketplaces:
+        return ids, None
+    declared = ", ".join(profile.marketplaces) or "US"
+    return [], (
+        f"category filter omitted for {marketplace}: the profile's category ids are "
+        f"marketplace-specific (declared for {declared}) and were not resolved for {marketplace}"
+    )
+
+
+def _run_finder_with_fallback(
+    client: Any, selection: dict[str, Any], *, mp: str, slice_id: int
+) -> tuple[Any, str | None]:
+    """Call the Keepa Product Finder; on a rejection (e.g. HTTP 400 from one bad
+    optional filter) retry ONCE with only the core selection. Returns
+    (FinderResult, note) — note is set when the fallback ran or when both attempts
+    failed (finder is then None). Never raises; one bad filter can't kill a sweep."""
+    from delium.providers.base import ProviderError
+
+    try:
+        return client.product_finder(selection), None
+    except ProviderError as exc:
+        log.warning("finder call failed (%s slice %s): %s", mp, slice_id, exc)
+        core = _core_finder_selection(selection)
+        if core == selection:  # nothing optional left to drop
+            return None, f"finder failed ({mp} slice {slice_id}): {exc}"
+        try:
+            result = client.product_finder(core)
+            note = f"finder retried without optional filters ({mp} slice {slice_id}) after: {exc}"
+            log.info(note)
+            return result, note
+        except ProviderError as exc2:
+            log.warning("finder fallback also failed (%s slice %s): %s", mp, slice_id, exc2)
+            return None, f"finder failed even on core selection ({mp} slice {slice_id}): {exc2}"
 
 
 # --- Stage 2: hydrate -------------------------------------------------------
