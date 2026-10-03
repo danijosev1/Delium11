@@ -1,0 +1,33 @@
+# Zombie-listing thresholds — CA (amazon.ca). Smaller still than the UK, so a
+# lower review floor and lower BSR bands. ILLUSTRATIVE until calibrated. See
+# us.toml for the field-by-field explanation.
+
+version = "ca-2026"
+
+[duration]
+min_months = 6
+ideal_months = 24
+
+[social_proof]
+min_rating = 4.0
+min_reviews = 30
+
+[past_demand]
+strong_bsr = 8000
+weak_bsr = 100000
+
+[resurrection]
+gap_risk_each = 25
+seller_active_risk = 40
+high_risk = 60
+
+[weights]
+dead_duration = 30
+social_proof = 20
+past_demand = 30
+low_resurrection_risk = 20
+current_demand = 10
+
+[verdict]
+verified_min = 70
+possible_min = 45

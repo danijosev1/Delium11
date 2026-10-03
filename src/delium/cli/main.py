@@ -1263,6 +1263,10 @@ def scan_main(
         bool,
         typer.Option("--yes", "-y", help="Skip the cost confirmation (non-interactive, no TTY)."),
     ] = False,
+    include_zombies: Annotated[
+        bool,
+        typer.Option("--zombies", help="Also run a small zombie-listing pass (off by default)."),
+    ] = False,
 ) -> None:
     """Run a daily scan (interactive: shows the projected cost and confirms)."""
     if ctx.invoked_subcommand is not None:
@@ -1307,6 +1311,7 @@ def scan_main(
         scheduled=scheduled,
         light_finalists=light_mode,
         enrich_limit=enrich_limit,
+        include_zombies=include_zombies,
     )
     clients = _build_scan_clients(config, light=light_mode)
 
@@ -1558,6 +1563,123 @@ def _build_scan_clients(config: object, *, light: bool = False) -> ScanClients:
 
         enrich = _enrich
     return ScanClients(keepa_factory=keepa_factory, dfs_factory=dfs_factory, enrich_finalist=enrich)
+
+
+@app.command()
+def zombies(
+    marketplaces: Annotated[
+        str, typer.Option("--marketplaces", help="Comma-separated, e.g. UK,CA.")
+    ] = "UK,CA",
+    min_dead_months: Annotated[
+        float, typer.Option("--min-dead-months", help="Minimum continuous out-of-stock months.")
+    ] = 6.0,
+    min_reviews: Annotated[
+        int, typer.Option("--min-reviews", help="Review floor (social proof).")
+    ] = 50,
+    min_rating: Annotated[float, typer.Option("--min-rating", help="Star rating floor.")] = 4.0,
+    top: Annotated[int, typer.Option("--top", help="How many top candidates to keep.")] = 20,
+    sweep_size: Annotated[
+        int, typer.Option("--sweep-size", help="Raw ASINs to bring back from the finder.")
+    ] = 100,
+    check_demand: Annotated[
+        bool,
+        typer.Option("--check-demand", help="DataForSEO SERP for the top candidates (PAID)."),
+    ] = False,
+    budget_cap: Annotated[
+        int | None,
+        typer.Option("--budget-cap", help="Abort if projected Keepa tokens exceed this."),
+    ] = None,
+    max_spend: Annotated[
+        float | None, typer.Option("--max-spend", help="Abort if projected USD exceed this.")
+    ] = None,
+    yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Skip the cost confirmation prompt.")
+    ] = False,
+) -> None:
+    """Find out-of-stock-but-reviewed listings and verify they are truly dead
+    (zombies) — with compliance flags and a suggested, policy-safe route."""
+    from delium.discovery import zombies as zmod
+
+    initialize_database()
+    config = load_config()
+    mps = tuple(_validate_marketplace(m) for m in marketplaces.split(",") if m.strip())
+    keepa_factory, dfs_factory = _build_provider_factories()
+    params = zmod.ZombieParams(
+        marketplaces=mps,
+        min_dead_months=min_dead_months,
+        min_reviews=min_reviews,
+        min_rating=min_rating,
+        sweep_target=sweep_size,
+        per_page=max(sweep_size, 50),
+        top_n=top,
+        budget_cap_tokens=budget_cap,
+        max_spend_usd=max_spend,
+        check_demand=check_demand,
+    )
+    clients = zmod.ZombieClients(keepa_factory=keepa_factory, dfs_factory=dfs_factory)
+
+    def _confirm(p: zmod.ZombieCostProjection) -> bool:
+        console.print(
+            f"[bold]Projected cost[/bold]: ~{p.total_tokens} Keepa tokens "
+            f"({p.finder_tokens} finder + {p.hydrate_tokens} hydrate) + ${p.total_usd:.2f} "
+            f"DataForSEO{' (demand check)' if check_demand else ''}."
+        )
+        for note in p.notes:
+            console.print(f"  [yellow]{note}[/yellow]")
+        return bool(typer.confirm("Proceed and spend?"))
+
+    try:
+        with get_connection() as conn:
+            report = zmod.run_zombies(
+                conn,
+                params=params,
+                config=config,
+                clients=clients,
+                confirm=None if yes else _confirm,
+            )
+    except zmod.ZombieAbortedError as exc:
+        console.print(f"[bold red]Zombies aborted:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+    _render_zombies(report)
+
+
+def _render_zombies(report: object) -> None:
+    from delium.discovery.zombies import ZombieReport
+
+    assert isinstance(report, ZombieReport)
+    console.print(
+        f"[bold]Zombies[/bold]  ·  markets {', '.join(report.marketplaces)}  ·  "
+        f"swept {report.swept} → hydrated {report.hydrated} → {len(report.results)} ranked"
+    )
+    for note in report.notes:
+        console.print(f"  [yellow]{note}[/yellow]")
+    console.print(f"[bold]Cost[/bold]: {report.keepa_tokens} Keepa tokens · ${report.data_usd:.2f}")
+    if not report.results:
+        console.print("  [dim]no candidates[/dim]")
+        return
+    _colour = {
+        "Verified zombie": "green",
+        "Possibly temporary": "yellow",
+        "Not a zombie": "dim",
+    }
+    for i, r in enumerate(report.results, start=1):
+        colour = _colour.get(r.verdict.value, "white")
+        score = "—" if r.score is None else f"{r.score:.0f}"
+        console.print(
+            f"\n  {i:>2}. [{colour}]{r.asin}[/{colour}] [{r.marketplace}]  "
+            f"[{colour}]{r.verdict.value}[/{colour}]  score {score} · {r.confidence.value} conf"
+        )
+        for c in r.components:
+            if c.score is not None:
+                console.print(f"      {c.name:<22} {c.score:>5.0f}  [dim]{c.detail}[/dim]")
+        if r.missing:
+            console.print(f"      [dim]unknown: {', '.join(r.missing)}[/dim]")
+        if r.reasons:
+            console.print(f"      [italic]{r.reasons[-1]}[/italic]", markup=False)
+        console.print(f"      [bold]Brand[/bold]: {r.compliance.brand_label}")
+        for route in r.compliance.routes:
+            console.print(f"      → {route}", markup=False)
+        console.print(f"      [yellow]{r.compliance.manual_check}[/yellow]", markup=False)
 
 
 def _render_scan(report: object) -> None:

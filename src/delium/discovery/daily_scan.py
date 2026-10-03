@@ -120,6 +120,11 @@ class ScanParams:
     #    differentiation_status "pending" ("differentiation pending" in the UI).
     light_finalists: bool = False
     enrich_limit: int = 5
+    # Optional, OFF by default: also run a small zombie-listing pass (out-of-stock
+    # but still reviewed) for the same marketplaces and attach a summary to the
+    # report. Additive — it never changes the main funnel or verdicts.
+    include_zombies: bool = False
+    zombie_sweep: int = 50
 
 
 @dataclass(frozen=True)
@@ -235,13 +240,18 @@ def project_costs(
         )
         fin_llm = round(params.top_n * config.budgets.max_llm_usd_per_validate, 2)
 
-    stages = (
+    stages = [
         StageCost(1, "sweep", sweep_tokens, 0.0, 0.0),
         StageCost(2, "hydrate", hydrate_tokens, 0.0, 0.0),
         StageCost(5, "competitor_sets", comp_tokens, comp_usd, 0.0),
         StageCost(7, "finalists", 0, fin_data, fin_llm),
-    )
-    return CostProjection(stages=stages, notes=tuple(notes))
+    ]
+    if params.include_zombies:
+        from delium.providers.keepa import finder_token_estimate as _fte
+
+        z_tokens = len(active_mps) * _fte(params.zombie_sweep) + params.zombie_sweep * 2
+        stages.append(StageCost(9, "zombies", z_tokens, 0.0, 0.0))
+    return CostProjection(stages=tuple(stages), notes=tuple(notes))
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +400,15 @@ def run_scan(
         repository.update_scan(conn, scan_id, status="failed", notes=notes)
         conn.commit()  # persist progress + failed state before the caller's rollback
         raise
+
+    if params.include_zombies and clients.keepa_factory is not None:
+        try:
+            z_note = _run_zombie_pass(conn, params, config, clients, as_of)
+            notes.append(z_note)
+            repository.update_scan(conn, scan_id, notes=notes)
+        except Exception as exc:  # noqa: BLE001 - the optional pass never fails the scan
+            notes.append(f"zombie pass skipped: {exc}")
+            repository.update_scan(conn, scan_id, notes=notes)
 
     total_tokens = repository.run_token_total(conn, run_id)
     total_usd = repository.run_cost_total(conn, run_id)
@@ -725,6 +744,41 @@ def _stage_sweep(
     )
     out.notes = notes
     return out
+
+
+def _run_zombie_pass(
+    conn: sqlite3.Connection,
+    params: ScanParams,
+    config: DeliumConfig,
+    clients: ScanClients,
+    as_of: date,
+) -> str:
+    """Small, additive zombie-listing pass for the scan's marketplaces. Returns a
+    one-line summary note. Never touches the main funnel or verdicts."""
+    from delium.analysis.zombies import ZombieVerdict
+    from delium.discovery.zombies import ZombieClients, ZombieParams, run_zombies
+
+    conn.commit()  # release the write lock before zombie hydrate opens its own connection
+    zparams = ZombieParams(
+        marketplaces=params.marketplaces,
+        sweep_target=params.zombie_sweep,
+        per_page=max(params.zombie_sweep, 50),
+        top_n=min(10, params.zombie_sweep),
+        scheduled=params.scheduled,
+    )
+    report = run_zombies(
+        conn,
+        params=zparams,
+        config=config,
+        clients=ZombieClients(keepa_factory=clients.keepa_factory, dfs_factory=clients.dfs_factory),
+        as_of=as_of,
+        confirm=None,
+    )
+    verified = [r for r in report.results if r.verdict is ZombieVerdict.VERIFIED]
+    top = ", ".join(r.asin for r in verified[:5])
+    return f"zombies: {len(verified)} verified of {len(report.results)} candidates" + (
+        f" ({top})" if top else ""
+    )
 
 
 def _category_ids_for(profile: ResearchProfile, marketplace: str) -> tuple[list[int], str | None]:

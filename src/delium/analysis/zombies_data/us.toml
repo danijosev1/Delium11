@@ -1,0 +1,44 @@
+# Zombie-listing thresholds — ABSOLUTE scales, EXTERNAL DATA (not hardcoded,
+# not batch-relative). A verification score means the SAME thing across days.
+#
+# ⚠️ ALL VALUES ARE ILLUSTRATIVE and must be calibrated against real outcomes
+# before they are trustworthy. Bump `version` on any change.
+#
+# A "zombie" = long-term out of stock, still strongly reviewed, with proven
+# past demand, and unlikely to be restocked. Missing data lowers confidence and
+# can never, on its own, make a listing "Verified" (it caps at "Possibly
+# temporary"). Thresholds are per-marketplace; this is the US baseline.
+
+version = "us-2026"
+
+[duration]
+# Continuous current out-of-stock run, measured up to `as_of`.
+min_months = 6      # below this it may just be a temporary stockout
+ideal_months = 24   # a 2-year gap scores the duration component at 100
+
+[social_proof]
+min_rating = 4.0    # stars (Keepa current_RATING >= 40)
+min_reviews = 50    # review floor (also the finder current_COUNT_REVIEWS_gte)
+
+[past_demand]
+# BSR observed WHILE IN STOCK (proven demand). Lower = more demand.
+strong_bsr = 20000   # <= this ⇒ demand component ~100
+weak_bsr = 200000    # >= this ⇒ demand component ~0
+
+[resurrection]
+# Higher risk = more likely to come back ⇒ not a safe zombie.
+gap_risk_each = 25       # risk points per historical restock gap
+seller_active_risk = 40  # original seller still selling elsewhere ⇒ +risk
+high_risk = 60           # at/above this the verdict is capped at "Possibly temporary"
+
+[weights]
+# Relative importances over the AVAILABLE components (renormalized; missing drop).
+dead_duration = 30
+social_proof = 20
+past_demand = 30
+low_resurrection_risk = 20
+current_demand = 10   # only present for the top candidates (DataForSEO SERP)
+
+[verdict]
+verified_min = 70   # score >= this AND all gates pass ⇒ Verified zombie
+possible_min = 45   # score >= this ⇒ Possibly temporary; below ⇒ Not a zombie

@@ -141,6 +141,19 @@ def _run(params: ScanParams, clients: ScanClients, resume: str | None = None):  
 # ---------------------------------------------------------------------------
 # Full funnel + stage ordering
 # ---------------------------------------------------------------------------
+def test_optional_zombie_pass_attaches_a_note(initialized_db: Path) -> None:
+    # The zombie pass is additive and off by default; with --zombies it runs a
+    # small pass and attaches a summary note (the fixture products are in stock,
+    # so 0 verified — the point is the pass runs without disturbing the scan).
+    transport = RoutingKeepa(FINDER_ASINS)
+    clients = ScanClients(keepa_factory=_keepa_factory(transport))
+    report = _run(
+        ScanParams(marketplaces=("US",), sweep_target=50, top_n=3, include_zombies=True), clients
+    )
+    assert report.status == "complete"
+    assert any(n.startswith("zombies:") for n in report.notes)
+
+
 def test_full_funnel_runs_all_stages_in_order(initialized_db: Path) -> None:
     transport = RoutingKeepa(FINDER_ASINS)
     clients = ScanClients(keepa_factory=_keepa_factory(transport))

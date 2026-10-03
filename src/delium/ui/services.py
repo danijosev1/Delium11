@@ -1055,6 +1055,85 @@ def _loads_json(value: str | None) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Zombie listings (Find → Zombies + the workspace "Zombie check" panel)
+# ---------------------------------------------------------------------------
+def find_zombies(
+    marketplaces: tuple[str, ...],
+    config: DeliumConfig,
+    *,
+    min_dead_months: float = 6.0,
+    min_reviews: int = 50,
+    min_rating: float = 4.0,
+    top: int = 20,
+    check_demand: bool = False,
+) -> Any:
+    """Run the zombie discovery (Keepa Product Finder → cache-first hydrate →
+    verify). Pressing Run in the UI is the spend consent, so no extra confirm."""
+    from delium.discovery import zombies as zmod
+
+    initialize_database()
+    keepa, dfs = _provider_factories()
+    params = zmod.ZombieParams(
+        marketplaces=marketplaces,
+        min_dead_months=min_dead_months,
+        min_reviews=min_reviews,
+        min_rating=min_rating,
+        top_n=top,
+        check_demand=check_demand,
+    )
+    clients = zmod.ZombieClients(keepa_factory=keepa, dfs_factory=dfs)
+    with get_connection() as conn:
+        return zmod.run_zombies(conn, params=params, config=config, clients=clients, confirm=None)
+
+
+def zombie_check(asin: str, marketplace: str, config: DeliumConfig) -> Any:
+    """Verify one already-fetched listing as a zombie (cache-first, no network).
+    Returns None if the product's history is not cached yet (run a Deep dive)."""
+    from datetime import date as _date
+
+    from delium.analysis.zombies import compute_zombie, load_zombie_data
+    from delium.discovery.zombies import zombie_evidence_from_raw
+    from delium.ingestion import cached_raw_product
+
+    initialize_database()
+    with get_connection() as conn:
+        raw = cached_raw_product(conn, asin.strip().upper(), marketplace)
+    if raw is None:
+        return None
+    ev = zombie_evidence_from_raw(
+        raw, asin=asin.strip().upper(), marketplace=marketplace, as_of=_date.today()
+    )
+    return compute_zombie(ev, load_zombie_data(marketplace))
+
+
+def zombie_timeline_series(asin: str, marketplace: str) -> list[dict[str, Any]]:
+    """Step points [{date, in_stock}] from the cached NEW/offer-count history, for
+    the out-of-stock timeline chart. Empty when nothing is cached."""
+    from delium.ingestion import cached_raw_product
+    from delium.providers.keepa import (
+        _CSV_COUNT_NEW,
+        _CSV_NEW,
+        keepa_minutes_to_date,
+        raw_csv_series,
+    )
+
+    initialize_database()
+    with get_connection() as conn:
+        raw = cached_raw_product(conn, asin.strip().upper(), marketplace)
+    if raw is None:
+        return []
+    csv: Any = raw.get("csv") or []
+    new = raw_csv_series(csv, _CSV_NEW)
+    use_count = not new
+    source = raw_csv_series(csv, _CSV_COUNT_NEW) if use_count else new
+    points: list[dict[str, Any]] = []
+    for km, value in sorted(source):
+        in_stock = value > 0 if use_count else value >= 0
+        points.append({"date": keepa_minutes_to_date(km), "in_stock": 1 if in_stock else 0})
+    return points
+
+
+# ---------------------------------------------------------------------------
 # Calibration (Daily Scan, Part 1) — stored-data comparison against Keepa
 # ---------------------------------------------------------------------------
 def calibration_report(

@@ -871,9 +871,93 @@ def page_home() -> None:
 # ---------------------------------------------------------------------------
 # Find (Emerging / Keyword / Discover / Cross-market / History)
 # ---------------------------------------------------------------------------
+_ZOMBIE_COLOUR = {
+    "Verified zombie": "green",
+    "Possibly temporary": "orange",
+    "Not a zombie": "gray",
+}
+
+
+def _render_zombie_result(r: Any, *, key: str) -> None:
+    """One zombie result as a card: verdict, evidence, compliance flags, route."""
+    colour = _ZOMBIE_COLOUR.get(r.verdict.value, "blue")
+    score = "—" if r.score is None else f"{r.score:.0f}"
+    with st.container(border=True):
+        st.markdown(
+            f"**{r.asin}** [{r.marketplace}] — :{colour}[{r.verdict.value}] · "
+            f"score {score} · {r.confidence.value} confidence"
+        )
+        cols = st.columns(len(r.components) or 1)
+        for col, c in zip(cols, r.components, strict=False):
+            col.metric(c.name.replace("_", " "), "—" if c.score is None else f"{c.score:.0f}")
+            col.caption(c.detail)
+        if r.missing:
+            st.caption(f"Unknown (lowers confidence): {', '.join(r.missing)}")
+        if r.reasons:
+            st.write(r.reasons[-1])
+        st.markdown(f"**Brand:** {r.compliance.brand_label}")
+        for route in r.compliance.routes:
+            st.markdown(f"- {route}")
+        st.warning(r.compliance.manual_check)
+        if st.button("Open in workspace", key=f"zomb_open_{key}"):
+            _goto("Product", ws_asin=r.asin, ws_mp=r.marketplace)
+
+
+def page_zombies() -> None:
+    st.subheader("Zombie listings")
+    st.caption(
+        "Out-of-stock-but-reviewed listings, verified as truly dead (demand proof for a NEW "
+        "listing of your own). Running this spends Keepa tokens (Product Finder + hydrate)."
+    )
+    config = _config()
+    c1, c2, c3, c4 = st.columns(4)
+    markets = c1.multiselect("Marketplaces", _MARKETPLACES, default=["UK", "CA"], key="zomb_mp")
+    min_months = c2.number_input(
+        "Min dead months", min_value=1.0, value=6.0, step=1.0, key="zomb_m"
+    )
+    min_reviews = c3.number_input("Min reviews", min_value=1, value=50, step=10, key="zomb_r")
+    top = c4.number_input("Top N", min_value=1, value=20, step=5, key="zomb_top")
+    check_demand = st.checkbox(
+        "Also check current demand (DataForSEO SERP for the top candidates — extra paid calls)",
+        key="zomb_demand",
+    )
+    if st.button("Run zombie search", type="primary", key="zomb_run"):
+        if not markets:
+            st.warning("Pick at least one marketplace.")
+            return
+        with st.spinner("Searching Keepa for dead-but-reviewed listings…"):
+            try:
+                report = services.find_zombies(
+                    tuple(markets),
+                    config,
+                    min_dead_months=float(min_months),
+                    min_reviews=int(min_reviews),
+                    top=int(top),
+                    check_demand=bool(check_demand),
+                )
+            except Exception as exc:  # noqa: BLE001 - surface, never crash the page
+                st.error(f"Zombie search failed: {exc}")
+                return
+        st.session_state["zomb_report"] = report
+    report = st.session_state.get("zomb_report")
+    if report is None:
+        return
+    for note in report.notes:
+        st.caption(note)
+    st.markdown(
+        f"**{len(report.results)}** candidates · swept {report.swept} → hydrated {report.hydrated} "
+        f"· {report.keepa_tokens} tokens · ${report.data_usd:.2f}"
+    )
+    if not report.results:
+        st.info("No candidates — try lowering the review floor or another marketplace.")
+    for i, r in enumerate(report.results):
+        _render_zombie_result(r, key=str(i))
+
+
 _FIND_MODES = {
     "Emerging": page_emerging,
     "Keyword": page_keyword_research,
+    "Zombies": page_zombies,
     "Black Box (Discover)": page_discover,
     "Cross-market": page_cross_market,
     "History": page_history,
@@ -923,6 +1007,7 @@ def page_product() -> None:
             "Reviews & ideas",
             "Profit",
             "Risk & verdict",
+            "Zombie check",
         ]
     )
     with tabs[0]:
@@ -939,6 +1024,30 @@ def page_product() -> None:
         _ws_profit(ws)
     with tabs[6]:
         _ws_risk(ws)
+    with tabs[7]:
+        _ws_zombie(asin, marketplace, config)
+
+
+def _ws_zombie(asin: str, marketplace: str, config: Any) -> None:
+    """Zombie check panel: out-of-stock timeline chart, verdict, evidence,
+    compliance flags, and the suggested route."""
+    st.caption(
+        "Is this a long-dead listing (out of stock but still reviewed)? Uses the cached Keepa "
+        "history — run a Deep dive first if it is empty."
+    )
+    result = services.zombie_check(asin, marketplace, config)
+    if result is None:
+        st.info(
+            f"No cached Keepa history for {asin} in {marketplace}. Run a Deep dive to fetch it."
+        )
+        return
+    series = services.zombie_timeline_series(asin, marketplace)
+    if series:
+        df = pd.DataFrame(series)
+        df["date"] = pd.to_datetime(df["date"])
+        st.markdown("**Availability (1 = in stock, 0 = out of stock)**")
+        st.line_chart(df.set_index("date")["in_stock"])
+    _render_zombie_result(result, key=f"ws_{asin}_{marketplace}")
 
 
 def _workspace_actions(ws: Any, marketplace: str, config: Any) -> None:

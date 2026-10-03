@@ -61,6 +61,27 @@ def _request_key(marketplace: str, asin: str) -> str:
     return f"{_PROVIDER}:{_ENDPOINT}:{marketplace}:{asin}"
 
 
+def cached_raw_product(
+    conn: sqlite3.Connection, asin: str, marketplace: str
+) -> dict[str, object] | None:
+    """The newest cached RAW Keepa product dict for (asin, marketplace), or None.
+
+    Reads the persisted `raw_fetches` payload (the full Keepa `/product` response,
+    including the `csv` history with its -1 out-of-stock sentinels) WITHOUT a
+    network call — the zombie detector needs the raw csv that the normalized
+    history drops. Returns None if nothing is cached or the product was not found."""
+    row = repository.latest_raw_fetch(conn, _PROVIDER, _request_key(marketplace, asin))
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (ValueError, TypeError, KeyError):
+        return None
+    if not isinstance(payload, dict) or payload.get("found") is False:
+        return None
+    return payload
+
+
 def _latest(rows: list[sqlite3.Row], column: str) -> int | None:
     """Most recent non-null value of `column` across ascending-ordered history."""
     for row in reversed(rows):

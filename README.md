@@ -228,6 +228,26 @@ one-line "why", and Open / Shortlist / Reject actions). A filter bar narrows by
 confidence, category, price band, marketplace and sales source. (Keyboard
 shortcuts were skipped: Streamlit has no reliable cross-browser shortcut API.)
 
+### Zombie listings (`delium zombies`)
+
+Find listings that are **out of stock long-term** but still strongly reviewed
+and with proven past demand, and verify they are truly dead (demand proof for
+launching your own NEW listing). Keepa only.
+
+```bash
+delium zombies --marketplaces UK,CA
+delium zombies --marketplaces UK --min-dead-months 12 --min-reviews 100 --top 10
+delium zombies --marketplaces UK --check-demand   # + DataForSEO SERP (PAID) for the top N
+```
+
+Each result carries a verdict (**Verified zombie / Possibly temporary / Not a
+zombie**), the evidence numbers, and **compliance flags** — a brand flag, a
+policy-safe route (default: launch your own on a NEW listing; a revival route
+only when the brand is generic; never a different product on an existing ASIN),
+and a trademark/policy manual-check reminder. Also available as **Find →
+Zombies** and a **Zombie check** tab in the Product workspace, and as an opt-in
+`delium scan --zombies` pass. Full details and thresholds: `docs/zombies.md`.
+
 ## Configuration
 
 - `config/config.toml` — assumptions, preferences, score weights, gates (see

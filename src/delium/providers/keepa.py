@@ -85,6 +85,7 @@ def keepa_domain(marketplace: str) -> int:
 _CSV_AMAZON = 0  # Amazon price, cents
 _CSV_NEW = 1  # marketplace New price, cents
 _CSV_SALES = 3  # sales rank (BSR)
+_CSV_COUNT_NEW = 11  # number of new offers (0 / -1 == none → out of stock)
 _CSV_RATING = 16  # rating, 0-50 (i.e. 45 == 4.5 stars)
 _CSV_COUNT_REVIEWS = 17  # review count
 
@@ -194,6 +195,27 @@ def _csv_series(csv: Sequence[Any], index: int) -> list[tuple[str, int]]:
         if value is None or value < 0:
             continue
         out.append((keepa_minutes_to_date(int(km)), int(value)))
+    return out
+
+
+def raw_csv_series(csv: Sequence[Any], index: int) -> list[tuple[int, int]]:
+    """Return [(keepa_minute, value)] change-points for one csv metric, KEEPING
+    Keepa's -1 sentinels (a -1 in the NEW/offer-count series marks a no-offer /
+    out-of-stock transition). Used by the zombie detector, which needs the gaps
+    that `_csv_series` deliberately drops. Minutes are returned raw so durations
+    can be computed precisely."""
+    if index >= len(csv):
+        return []
+    arr = csv[index]
+    if not arr:
+        return []
+    out: list[tuple[int, int]] = []
+    for i in range(0, len(arr) - 1, 2):
+        km = arr[i]
+        value = arr[i + 1]
+        if km is None or value is None:
+            continue
+        out.append((int(km), int(value)))
     return out
 
 

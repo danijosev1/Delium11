@@ -1,0 +1,34 @@
+# Zombie-listing thresholds — UK (amazon.co.uk). Smaller catalogue than the US,
+# so the same unit demand sits at a lower BSR, and a lower review floor still
+# means real social proof. ILLUSTRATIVE until calibrated. See us.toml for the
+# field-by-field explanation.
+
+version = "uk-2026"
+
+[duration]
+min_months = 6
+ideal_months = 24
+
+[social_proof]
+min_rating = 4.0
+min_reviews = 40
+
+[past_demand]
+strong_bsr = 10000
+weak_bsr = 120000
+
+[resurrection]
+gap_risk_each = 25
+seller_active_risk = 40
+high_risk = 60
+
+[weights]
+dead_duration = 30
+social_proof = 20
+past_demand = 30
+low_resurrection_risk = 20
+current_demand = 10
+
+[verdict]
+verified_min = 70
+possible_min = 45
