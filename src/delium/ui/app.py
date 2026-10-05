@@ -21,6 +21,33 @@ from delium.ui import costs, credentials, format, services
 _MARKETPLACES = ["US", "UK", "CA", "AU", "IN"]
 
 
+def _link_config() -> dict[str, Any]:
+    """`column_config` rendering the amazon_url / keepa_url columns as clickable
+    links (opens in a new tab). Safe to pass to any table that includes those
+    columns; tables without them ignore it."""
+    return {
+        "amazon_url": st.column_config.LinkColumn("Amazon", display_text="Open ↗"),
+        "keepa_url": st.column_config.LinkColumn("Keepa", display_text="Keepa ↗"),
+    }
+
+
+def _amazon_md(asin: str, marketplace: str, *, text: str | None = None) -> str:
+    """Markdown for a card: '[title-or-ASIN](amazon) · ASIN `B0…` · [Keepa](keepa)'.
+    Falls back to plain text when no link is available for the marketplace."""
+    from delium.links import amazon_url, keepa_url
+
+    amz = amazon_url(asin, marketplace)
+    kpa = keepa_url(asin, marketplace)
+    label = text or asin
+    head = f"[{label}]({amz})" if amz else label
+    parts = [head]
+    if text:  # keep the ASIN visible as smaller plain text when the title is the link
+        parts.append(f"`{asin}`")
+    if kpa:
+        parts.append(f"[Keepa ↗]({kpa})")
+    return " · ".join(parts)
+
+
 def _config() -> Any:
     return load_config()
 
@@ -206,6 +233,7 @@ def page_product_lookup() -> None:
         return
 
     st.subheader(view.title or view.asin)
+    st.markdown(_amazon_md(view.asin, view.marketplace, text="Open on Amazon ↗"))
     facts = {
         "ASIN": view.asin,
         "Brand": view.brand or "—",
@@ -356,7 +384,7 @@ def page_discover() -> None:
     rows = format.discovery_rows(report, parents)
     if rows:
         st.subheader("Ranked candidates (variations collapsed by parent)")
-        st.dataframe(rows, width="stretch", hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True, column_config=_link_config())
         _open_workspace_picker(ranked_asins, marketplace, key="disc")
 
     if report.killed:
@@ -365,7 +393,12 @@ def page_discover() -> None:
             "Every killed candidate with the exact rule(s) and observed vs. threshold value."
         )
         facts = services.discovery_product_facts(report)
-        st.dataframe(format.discovery_killed_rows(report, facts), width="stretch", hide_index=True)
+        st.dataframe(
+            format.discovery_killed_rows(report, facts, marketplace),
+            width="stretch",
+            hide_index=True,
+            column_config=_link_config(),
+        )
 
     if not rows:
         # Explain WHY nothing was ranked, precisely — the old message wrongly
@@ -465,18 +498,19 @@ def page_emerging() -> None:
             "lowers confidence, it is not scored as 0."
         )
         st.dataframe(
-            format.emerging_rich_rows(list(report.ranked), facts, parents),
+            format.emerging_rich_rows(list(report.ranked), facts, parents, marketplace),
             width="stretch",
             hide_index=True,
+            column_config=_link_config(),
         )
         _open_workspace_picker([c.asin for c in report.ranked], marketplace, key="em")
         _emerging_cards(report, facts)
     else:
         st.info("No emerging candidates survived scoring.")
-    killed = format.emerging_killed_rows(list(report.killed))
+    killed = format.emerging_killed_rows(list(report.killed), marketplace)
     if killed:
         st.subheader("Emerging but hard-killed (excluded, reasons shown)")
-        st.dataframe(killed, width="stretch", hide_index=True)
+        st.dataframe(killed, width="stretch", hide_index=True, column_config=_link_config())
 
 
 def _emerging_cards(report: Any, facts: dict[str, Any]) -> None:
@@ -549,7 +583,7 @@ def page_cross_market() -> None:
     parents = services.parent_map([c.source_asin for c in candidates], source)
     rows = format.cross_market_rows(candidates, parents)
     if rows:
-        st.dataframe(rows, width="stretch", hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True, column_config=_link_config())
     else:
         st.info(
             "No qualifying candidates. Fetch source products/keywords first "
@@ -564,7 +598,7 @@ def page_history() -> None:
     st.subheader("Recent validations")
     vals = format.validation_rows(services.recent_validations())
     if vals:
-        st.dataframe(vals, width="stretch", hide_index=True)
+        st.dataframe(vals, width="stretch", hide_index=True, column_config=_link_config())
     else:
         st.caption("none yet")
 
@@ -575,10 +609,12 @@ def page_history() -> None:
             f"{r['created_at']} · {r['marketplace']} · {r['page_size']} scanned" for r in em_runs
         ]
         idx = st.selectbox("Emerging run", range(len(em_runs)), format_func=lambda i: labels[i])
-        cands = format.emerging_candidate_rows(services.emerging_candidates(em_runs[idx]["run_id"]))
-        st.dataframe(cands, width="stretch", hide_index=True) if cands else st.caption(
-            "no candidates"
+        cands = format.emerging_candidate_rows(
+            services.emerging_candidates(em_runs[idx]["run_id"]), em_runs[idx]["marketplace"]
         )
+        st.dataframe(
+            cands, width="stretch", hide_index=True, column_config=_link_config()
+        ) if cands else st.caption("no candidates")
     else:
         st.caption("none yet")
 
@@ -772,6 +808,7 @@ def _render_inbox_card(config: Any, scan_id: str, card: Any) -> None:
             img_col.caption("no image")
         title = card.title or card.asin
         body_col.markdown(f"**#{card.rank or '—'} · {title}**")
+        body_col.markdown(_amazon_md(card.asin, card.marketplace, text="Open on Amazon ↗"))
         meta = f"{card.brand or '—'} · {card.asin} · {card.marketplace}"
         body_col.caption(meta)
         m1, m2, m3, m4 = body_col.columns(4)
@@ -849,11 +886,13 @@ def page_home() -> None:
                         "status": r["status"],
                         "notes": r["notes"] or "",
                         "updated": r["updated_at"],
+                        **format.link_cols(r["asin"], r["marketplace"]),
                     }
                     for r in shortlist
                 ],
                 width="stretch",
                 hide_index=True,
+                column_config=_link_config(),
             )
             _open_workspace_picker([r["asin"] for r in shortlist], "US", key="home_short")
         else:
@@ -862,7 +901,12 @@ def page_home() -> None:
         st.markdown("**Top opportunities matching your profile**")
         top = summary["top_opportunities"]
         if top:
-            st.dataframe(format.validation_rows(top), width="stretch", hide_index=True)
+            st.dataframe(
+                format.validation_rows(top),
+                width="stretch",
+                hide_index=True,
+                column_config=_link_config(),
+            )
             _open_workspace_picker([r["asin"] for r in top], "US", key="home_top")
         else:
             st.caption("No validated candidates yet — run a Find or Validate.")
@@ -887,6 +931,7 @@ def _render_zombie_result(r: Any, *, key: str) -> None:
             f"**{r.asin}** [{r.marketplace}] — :{colour}[{r.verdict.value}] · "
             f"score {score} · {r.confidence.value} confidence"
         )
+        st.markdown(_amazon_md(r.asin, r.marketplace, text="Open on Amazon ↗"))
         cols = st.columns(len(r.components) or 1)
         for col, c in zip(cols, r.components, strict=False):
             col.metric(c.name.replace("_", " "), "—" if c.score is None else f"{c.score:.0f}")
@@ -1002,6 +1047,8 @@ def page_product() -> None:
         return
 
     ws = services.workspace(asin, marketplace, config)
+    _title = getattr(ws, "title", None)
+    st.markdown(_amazon_md(ws.asin, marketplace, text=(_title or "Open on Amazon") + " ↗"))
     if not ws.found:
         st.warning(
             f"{ws.asin} has not been fetched in {marketplace} yet. Run a Deep dive below to "
@@ -1358,11 +1405,13 @@ def _settings_calibration() -> None:
                 "keepa_fee_$": None
                 if p.fee.keepa_fee_cents is None
                 else round(p.fee.keepa_fee_cents / 100, 2),
+                **format.link_cols(p.asin, marketplace),
             }
             for p in report.products
         ],
         width="stretch",
         hide_index=True,
+        column_config=_link_config(),
     )
     st.subheader("Suggested adjustments (not applied)")
     st.dataframe(

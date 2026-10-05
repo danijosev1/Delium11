@@ -235,6 +235,9 @@ def test_discovery_and_cross_market_rows() -> None:
     )
     rows = format.discovery_rows(report)
     assert len(rows) == 1 and rows[0]["asin"] == "B1" and rows[0]["via"] == "serp"
+    # Clickable product links are added per row (for LinkColumn + CSV export).
+    assert rows[0]["amazon_url"] == "https://www.amazon.com/dp/B1"
+    assert rows[0]["keepa_url"] == "https://keepa.com/#!product/1-B1"
 
     cand = SimpleNamespace(
         source_asin="B9",
@@ -258,6 +261,9 @@ def test_discovery_and_cross_market_rows() -> None:
     )
     cm = format.cross_market_rows([cand])
     assert cm[0]["route"] == "US→AU" and cm[0]["title"] == "Widget"
+    # Links use the SOURCE asin + marketplace (US here, so Keepa is present).
+    assert cm[0]["amazon_url"] == "https://www.amazon.com/dp/B9"
+    assert cm[0]["keepa_url"] == "https://keepa.com/#!product/1-B9"
 
 
 # ---------------------------------------------------------------------------

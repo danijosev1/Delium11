@@ -20,6 +20,7 @@ from delium.config import ConfigError, load_config
 from delium.database import initialize_database, repository
 from delium.database.connection import get_connection
 from delium.ingestion import CrossMarketCandidate
+from delium.links import amazon_url
 from delium.providers import ProviderError, ReviewProviderChain, build_review_provider
 from delium.providers.dataforseo import DataForSeoClient
 from delium.providers.keepa import KeepaClient
@@ -458,6 +459,9 @@ def _render_discovery(report: object, limit: int) -> None:
                 f"score {s.score:.0f}  ·  {s.verdict.value.upper()}  ·  "
                 f"{s.confidence.level.value} conf  ·  via {sources}{flag}"
             )
+            _url = amazon_url(ec.asin, ec.marketplace.value)
+            if _url:
+                console.print(f"      {_url}", markup=False)
     else:
         console.print("\n[yellow]No candidates survived to scoring.[/yellow]")
 
@@ -941,6 +945,9 @@ def _render_emerging(report: object) -> None:
                 f"opportunity {s.score:.0f} · [bold]{s.verdict.value.upper()}[/bold] · "
                 f"{s.confidence.level.value} conf{flag}"
             )
+            _url = amazon_url(c.asin, report.marketplace.value)
+            if _url:
+                console.print(f"    {_url}", markup=False)
             console.print(f"    [dim]{', '.join(c.emergence.reasons)}[/dim]")
             console.print(
                 "    [dim]run `delium diagnose` for the per-pillar breakdown and next action.[/dim]"
@@ -1687,6 +1694,9 @@ def _render_zombies(report: object) -> None:
             f"\n  {i:>2}. [{colour}]{r.asin}[/{colour}] [{r.marketplace}]  "
             f"[{colour}]{r.verdict.value}[/{colour}]  score {score} · {r.confidence.value} conf"
         )
+        _url = amazon_url(r.asin, r.marketplace)
+        if _url:
+            console.print(f"      {_url}", markup=False)
         for c in r.components:
             if c.score is not None:
                 console.print(f"      {c.name:<22} {c.score:>5.0f}  [dim]{c.detail}[/dim]")
@@ -1738,6 +1748,9 @@ def _render_scan(report: object) -> None:
             f"  {f['rank']:>2}. [green]{f['asin']}[/green] [{f['marketplace']}]  "
             f"sellability {sell} · {f['confidence']} conf · diff {f['differentiation']}"
         )
+        _url = amazon_url(f["asin"], f["marketplace"])
+        if _url:
+            console.print(f"      {_url}", markup=False)
         if f["reason"]:
             console.print(f"      [dim]{f['reason']}[/dim]", markup=False)
     console.print("\n[bold]Emerging categories[/bold]:")

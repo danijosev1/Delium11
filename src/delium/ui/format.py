@@ -12,6 +12,19 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from delium.links import amazon_url, keepa_url
+
+
+def link_cols(asin: str | None, marketplace: str | None) -> dict[str, str | None]:
+    """The `amazon_url` / `keepa_url` columns for a product row (both None when the
+    marketplace is unknown or Keepa lacks it). Used by every table builder so the
+    UI can render clickable links and the CSV export carries the URLs."""
+    return {
+        "amazon_url": amazon_url(asin, marketplace),
+        "keepa_url": keepa_url(asin, marketplace),
+    }
+
+
 # Verdict → (display label, hex colour). Covers deterministic Buy/Test/Avoid and
 # the cross-market verdict vocabulary.
 _VERDICT_COLORS: dict[str, tuple[str, str]] = {
@@ -184,10 +197,13 @@ def _discovery_row(ec: Any, *, parent: str, variations: int) -> dict[str, Any]:
         "confidence": s.confidence.level.value,
         "needs_data": bool(s.insufficient_data),
         "via": ",".join(src.value for src in ec.candidate.sources),
+        **link_cols(ec.asin, ec.marketplace.value),
     }
 
 
-def discovery_killed_rows(report: Any, facts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+def discovery_killed_rows(
+    report: Any, facts: dict[str, dict[str, Any]], marketplace: str | None = None
+) -> list[dict[str, Any]]:
     """Every cheap-killed candidate with the exact rule(s) + observed/threshold
     values. Title/price/BSR come from `facts` (the hydrated product), since the
     kill happens on that product row, not the SERP row."""
@@ -199,6 +215,7 @@ def discovery_killed_rows(report: Any, facts: dict[str, dict[str, Any]]) -> list
         rule = "; ".join(f"{k.rule_id} {k.name}" for k in triggered) or (ec.kill_rule or "")
         actual = "; ".join(k.actual for k in triggered if k.actual)
         threshold = "; ".join(k.threshold for k in triggered if k.threshold)
+        mp = marketplace or getattr(getattr(ec, "marketplace", None), "value", None)
         rows.append(
             {
                 "asin": ec.asin,
@@ -209,6 +226,7 @@ def discovery_killed_rows(report: Any, facts: dict[str, dict[str, Any]]) -> list
                 "actual": actual,
                 "threshold": threshold,
                 "reason": ec.notes[0] if ec.notes else "",
+                **link_cols(ec.asin, mp),
             }
         )
     return rows
@@ -288,10 +306,11 @@ def _cross_market_row(c: Any, *, parent: str, variations: int) -> dict[str, Any]
         "target_demand": round(te.target_demand_score, 0),
         "demand_credible": bool(te.demand_credible),
         "competition_gap": round(r.market_gap.competition_gap, 0),
+        **link_cols(c.source_asin, c.source_marketplace.value),
     }
 
 
-def emerging_rows(candidates: list[Any]) -> list[dict[str, Any]]:
+def emerging_rows(candidates: list[Any], marketplace: str | None = None) -> list[dict[str, Any]]:
     """Scored emerging candidates → table rows (emergence + opportunity)."""
     rows: list[dict[str, Any]] = []
     for c in candidates:
@@ -307,6 +326,7 @@ def emerging_rows(candidates: list[Any]) -> list[dict[str, Any]]:
                 "verdict": None if s is None else s.verdict.value,
                 "confidence": None if s is None else s.confidence.level.value,
                 "why": "; ".join(c.emergence.reasons),
+                **link_cols(c.asin, marketplace),
             }
         )
     return rows
@@ -338,6 +358,7 @@ def emerging_rich_rows(
     candidates: list[Any],
     facts: dict[str, dict[str, Any]],
     parents: dict[str, str | None],
+    marketplace: str | None = None,
 ) -> list[dict[str, Any]]:
     """Readable emerging table: one row per PARENT listing (variations collapsed),
     with facts + every pillar score/confidence + verdict. `facts` and `parents`
@@ -381,11 +402,14 @@ def emerging_rich_rows(
         row["confidence"] = None if s is None else s.confidence.level.value
         row["flag"] = "established brand" if getattr(c, "established_brand", False) else ""
         row["kill_gate"] = _kill_gate_reasons(s)
+        row.update(link_cols(c.asin, marketplace))
         rows.append(row)
     return rows
 
 
-def emerging_killed_rows(candidates: list[Any]) -> list[dict[str, Any]]:
+def emerging_killed_rows(
+    candidates: list[Any], marketplace: str | None = None
+) -> list[dict[str, Any]]:
     """Emerging-but-killed candidates → table rows with the exact kill reason."""
     return [
         {
@@ -395,12 +419,15 @@ def emerging_killed_rows(candidates: list[Any]) -> list[dict[str, Any]]:
             else round(c.emergence.emergence_score, 0),
             "kill_rule": c.evaluated.kill_rule,
             "reason": c.evaluated.notes[0] if c.evaluated.notes else "",
+            **link_cols(c.asin, marketplace),
         }
         for c in candidates
     ]
 
 
-def emerging_candidate_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+def emerging_candidate_rows(
+    rows: list[sqlite3.Row], marketplace: str | None = None
+) -> list[dict[str, Any]]:
     """Persisted emerging_candidates rows → table (History page)."""
     return [
         {
@@ -411,6 +438,7 @@ def emerging_candidate_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
             "opportunity": r["opportunity_score"],
             "verdict": r["verdict"],
             "kill_rule": r["kill_rule"],
+            **link_cols(r["asin"], marketplace),
         }
         for r in rows
     ]
@@ -442,6 +470,7 @@ def validation_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
             ),
             "confidence": r["confidence"],
             "needs_data": bool(r["insufficient_data"]),
+            **link_cols(r["asin"], r["marketplace"]),
         }
         for r in rows
     ]
