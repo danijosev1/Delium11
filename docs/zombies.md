@@ -20,17 +20,34 @@ units were verified against the official backend request struct
 
 | Field | Type | Meaning in the zombie sweep |
 |---|---|---|
-| `current_COUNT_NEW_lte` | Integer | `0` ⇒ **no current new offers** |
+| `current_COUNT_NEW_lte` | Integer | `0` ⇒ **no current new offers** (primary dead signal) |
 | `current_RATING_gte` | Integer (0–50) | rating floor — 4.0★ ⇒ `40` |
 | `current_COUNT_REVIEWS_gte` | Integer | review floor (social proof) |
-| `outOfStockPercentage90_NEW_gte` | Integer | % of the last 90 days with no NEW offer |
-| `buyBoxIsAmazon` | Boolean | `false` ⇒ exclude Amazon-held buy box |
+| `outOfStockPercentage90_NEW_gte` | Integer | % of the last 90 days with no NEW offer — **optional** |
 | `productType` | Byte[] | `[0]` standard physical only |
 | `page` / `perPage` | int | paging |
 | `sort` | String[][] | `[["current_COUNT_REVIEWS","desc"]]` — strongest social proof first |
 
-There is **no price or sales-rank band**: a dead listing has no current NEW
-price, so those filters would exclude every candidate.
+**We do NOT send `buyBoxIsAmazon=false`.** That Boolean matches only listings
+that *have* a (non-Amazon) buy box, so it excludes the very listings we want — a
+dead listing has **no buy box at all**. Amazon-sold listings are excluded
+**after hydration** instead, from the Amazon offer history (the Amazon price
+series currently carrying an offer ⇒ not a zombie). The
+`outOfStockPercentage90_NEW_gte` filter is **optional**: if the full selection
+returns 0, the sweep **retries once without it** (core-only) so one over-strict
+filter can't zero out the result. There is **no price or sales-rank band**: a
+dead listing has no current NEW price.
+
+### Empty-result diagnostics
+
+Every finder call records a diagnostic (shown in the CLI and under the UI result
+line, logged as a WARNING on failure/0): the Keepa **HTTP status** and **error
+body** (never the key), Keepa's **totalResults** for the query, the **exact
+filters sent**, whether the **core-only fallback** was used, and the **skip
+reason** when a call was not made (over cap, missing key, marketplace not
+covered). Finder tokens are counted in the reported total even when 0 candidates
+are swept, so an empty run no longer misleadingly shows "0 tokens".
+
 
 Candidates are then **hydrated** (batched, cache-first Keepa `/product`). The
 availability history is read from the **raw** `csv` series — the normalized

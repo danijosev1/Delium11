@@ -1653,6 +1653,8 @@ def _render_zombies(report: object) -> None:
     )
     for note in report.notes:
         console.print(f"  [yellow]{note}[/yellow]")
+    for diag in report.diagnostics:
+        console.print(f"  [dim]finder[/dim] {diag.summary()}", markup=False)
     console.print(f"[bold]Cost[/bold]: {report.keepa_tokens} Keepa tokens · ${report.data_usd:.2f}")
     if not report.results:
         console.print("  [dim]no candidates[/dim]")

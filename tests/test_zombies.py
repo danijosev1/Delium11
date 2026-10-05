@@ -231,13 +231,24 @@ def test_manual_check_names_us_office() -> None:
 # ---------------------------------------------------------------------------
 def test_zombie_finder_selection_fields() -> None:
     sel = build_zombie_finder_selection(ZombieFinderConfig(min_rating=4.0, min_reviews=40))
-    assert sel["current_COUNT_NEW_lte"] == 0  # no current new offers
+    assert sel["current_COUNT_NEW_lte"] == 0  # no current new offers (primary dead signal)
     assert sel["current_RATING_gte"] == 40  # 4.0★ on Keepa's 0-50 scale
     assert sel["current_COUNT_REVIEWS_gte"] == 40
     assert sel["outOfStockPercentage90_NEW_gte"] == 90
-    assert sel["buyBoxIsAmazon"] is False
     assert sel["productType"] == [0]
     assert "current_NEW_gte" not in sel  # no price band — dead listings have no price
+    # buyBoxIsAmazon=false would exclude listings with NO buy box (i.e. every dead
+    # listing). It must NOT be sent; Amazon is excluded after hydration instead.
+    assert "buyBoxIsAmazon" not in sel
+
+
+def test_zombie_finder_core_only_drops_optional_oos_filter() -> None:
+    sel = build_zombie_finder_selection(
+        ZombieFinderConfig(min_rating=4.0, min_reviews=40), core_only=True
+    )
+    assert "outOfStockPercentage90_NEW_gte" not in sel  # dropped for the fallback retry
+    assert sel["current_COUNT_NEW_lte"] == 0  # core dead-signal kept
+    assert "buyBoxIsAmazon" not in sel
 
 
 # ---------------------------------------------------------------------------
@@ -422,3 +433,189 @@ def test_zombie_body_decodes_from_gzip_and_computes_oos(monkeypatch: pytest.Monk
     assert ev.timeline.last_offer_date == date(2023, 1, 1)
     assert ev.rating == 4.6 and ev.reviews == 820
     assert compute_zombie(ev, load_zombie_data("uk")).verdict is ZombieVerdict.VERIFIED
+
+
+# ---------------------------------------------------------------------------
+# BUGFIX: no buyBoxIsAmazon; post-hydration Amazon exclusion; empty diagnostics
+# ---------------------------------------------------------------------------
+def _amazon_sold_body(asin: str) -> dict[str, Any]:
+    """A reviewed listing with NO new offers but Amazon currently selling (the
+    Amazon price series ends with a live price) — must be excluded as a zombie."""
+    new = _changes((date(2019, 1, 1), 2999), (date(2023, 1, 1), -1))
+    csv = _zombie_csv(new, _changes((date(2019, 6, 1), 4000)), rating=46, reviews=820)
+    csv[0] = [_km(date(2024, 1, 1)), 2500]  # Amazon in stock NOW
+    return {"asin": asin, "title": "Silicone Mat", "brand": None, "csv": csv}
+
+
+class SelectionRoutedKeepa:
+    """Routes /query by what the selection contains, so a test can make the full
+    selection return 0 and the core-only fallback return results (or vice-versa)."""
+
+    def __init__(
+        self,
+        *,
+        full: dict[str, dict[str, Any]] | None = None,
+        core: dict[str, dict[str, Any]] | None = None,
+        total_results_full: int = 0,
+        error_status: int | None = None,
+    ) -> None:
+        self.full = full or {}
+        self.core = core or {}
+        self.total_results_full = total_results_full
+        self.error_status = error_status
+        self.queries: list[dict[str, Any]] = []
+        self.tokens_left = 9000
+
+    def request_json(self, url: str, params: Any) -> HttpResult:
+        if "/query" in url:
+            import json as _json
+
+            sel = _json.loads(params["selection"])
+            self.queries.append(sel)
+            if self.error_status is not None:
+                return HttpResult(
+                    self.error_status,
+                    {
+                        "error": {"type": "invalidParameter", "message": "bad filter"},
+                        "tokensLeft": self.tokens_left,
+                    },
+                )
+            has_oos = "outOfStockPercentage90_NEW_gte" in sel
+            bodies = self.full if has_oos else self.core
+            total = self.total_results_full if has_oos else len(bodies)
+            return HttpResult(
+                200,
+                {
+                    "asinList": list(bodies),
+                    "totalResults": total,
+                    "tokensConsumed": 11,
+                    "tokensLeft": self.tokens_left,
+                },
+            )
+        if "/token" in url:
+            return HttpResult(200, {"tokensLeft": self.tokens_left, "refillRate": 20})
+        asins = str(params.get("asin", "")).split(",")
+        pool = {**self.full, **self.core}
+        return HttpResult(
+            200,
+            {
+                "tokensConsumed": len(asins),
+                "tokensLeft": self.tokens_left,
+                "products": [pool[a] for a in asins if a in pool],
+            },
+        )
+
+
+def _routed_factory(transport: SelectionRoutedKeepa):  # type: ignore[no-untyped-def]
+    return lambda mp: KeepaClient("k", transport=transport, sleep=lambda _s: None, marketplace=mp)
+
+
+def test_amazon_sold_listing_excluded_after_hydration(initialized_db: Path) -> None:
+    from delium.config.models import DeliumConfig
+    from delium.discovery import zombies as zmod
+
+    bodies = {"B0AMZ0001": _amazon_sold_body("B0AMZ0001")}
+    transport = FakeZombieKeepa(bodies)
+    with get_connection() as conn:
+        report = zmod.run_zombies(
+            conn,
+            params=zmod.ZombieParams(marketplaces=("UK",), sweep_target=10, top_n=10),
+            config=DeliumConfig(),
+            clients=zmod.ZombieClients(keepa_factory=_factory(transport)),
+            as_of=AS_OF,
+        )
+    # It is swept + hydrated (finder can't filter Amazon-with-no-buybox), but the
+    # verdict excludes it because Amazon is selling now.
+    assert report.hydrated == 1
+    r = report.results[0]
+    assert r.evidence.amazon_on_listing is True
+    assert r.verdict is ZombieVerdict.NOT_A_ZOMBIE
+
+
+def test_empty_result_records_finder_diagnostics_and_counts_tokens(initialized_db: Path) -> None:
+    from delium.config.models import DeliumConfig
+    from delium.discovery import zombies as zmod
+
+    transport = SelectionRoutedKeepa(full={}, core={}, total_results_full=0)
+    with get_connection() as conn:
+        report = zmod.run_zombies(
+            conn,
+            params=zmod.ZombieParams(marketplaces=("CA", "US"), sweep_target=10, top_n=10),
+            config=DeliumConfig(),
+            clients=zmod.ZombieClients(keepa_factory=_routed_factory(transport)),
+            as_of=AS_OF,
+        )
+    assert report.results == []
+    # Finder tokens are counted even though 0 were swept (the "0 tokens" bug).
+    assert report.keepa_tokens > 0
+    # One diagnostic per active marketplace, each with the filters + total_results.
+    diags = {d.marketplace: d for d in report.diagnostics}
+    assert set(diags) == {"CA", "US"}
+    ca = diags["CA"]
+    assert ca.returned == 0
+    assert ca.total_results is None  # Keepa's 0 maps to None; the summary says "unknown"
+    assert ca.used_fallback is True  # retried core-only after the full selection was empty
+    assert "current_COUNT_NEW_lte" in ca.filters
+    assert "outOfStockPercentage90_NEW_gte" not in ca.filters  # the fallback dropped it
+    assert "Filters sent" in ca.summary()
+
+
+def test_fallback_without_oos_filter_recovers_results(initialized_db: Path) -> None:
+    from delium.config.models import DeliumConfig
+    from delium.discovery import zombies as zmod
+
+    # Full selection (with outOfStockPercentage90_NEW_gte) returns nothing; the
+    # core-only fallback finds the zombie.
+    body = {"B0CORE001": _zombie_body("B0CORE001", brand=None, dead_since=date(2023, 1, 1))}
+    transport = SelectionRoutedKeepa(full={}, core=body, total_results_full=0)
+    with get_connection() as conn:
+        report = zmod.run_zombies(
+            conn,
+            params=zmod.ZombieParams(marketplaces=("UK",), sweep_target=10, top_n=10),
+            config=DeliumConfig(),
+            clients=zmod.ZombieClients(keepa_factory=_routed_factory(transport)),
+            as_of=AS_OF,
+        )
+    assert report.hydrated == 1
+    assert report.diagnostics[0].used_fallback is True
+    assert report.results[0].asin == "B0CORE001"
+
+
+def test_finder_http_error_surfaced_in_diagnostics(initialized_db: Path) -> None:
+    from delium.config.models import DeliumConfig
+    from delium.discovery import zombies as zmod
+
+    transport = SelectionRoutedKeepa(error_status=400)
+    with get_connection() as conn:
+        report = zmod.run_zombies(
+            conn,
+            params=zmod.ZombieParams(marketplaces=("UK",), sweep_target=10, top_n=10),
+            config=DeliumConfig(),
+            clients=zmod.ZombieClients(keepa_factory=_routed_factory(transport)),
+            as_of=AS_OF,
+        )
+    assert report.results == []
+    diag = report.diagnostics[0]
+    assert diag.error is not None
+    assert "HTTP 400" in diag.error  # Keepa status surfaced
+    assert "k" not in diag.error.split()  # the API key is never in the message
+    assert "failed" in diag.summary().lower()
+
+
+def test_missing_keepa_key_records_skip_reason(initialized_db: Path) -> None:
+    from delium.config.models import DeliumConfig
+    from delium.discovery import zombies as zmod
+
+    with get_connection() as conn:
+        report = zmod.run_zombies(
+            conn,
+            params=zmod.ZombieParams(marketplaces=("UK", "CA"), sweep_target=10),
+            config=DeliumConfig(),
+            clients=zmod.ZombieClients(keepa_factory=None),
+            as_of=AS_OF,
+        )
+    assert report.results == []
+    assert {d.marketplace for d in report.diagnostics} == {"UK", "CA"}
+    assert all(
+        d.skipped_reason and "not configured" in d.skipped_reason for d in report.diagnostics
+    )

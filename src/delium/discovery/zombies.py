@@ -109,6 +109,36 @@ class ZombieCostProjection:
         return None
 
 
+@dataclass(frozen=True)
+class FinderDiagnostic:
+    """Why a marketplace's finder call produced what it did — surfaced in the CLI
+    and UI so an empty result is never silent. Never carries the API key."""
+
+    marketplace: str
+    skipped_reason: str | None = None  # set when the call was NOT made
+    http_status: int | None = None
+    error: str | None = None  # Keepa's error body (status/tokensLeft/message)
+    total_results: int | None = None  # Keepa's totalResults for the query
+    returned: int = 0  # ASINs the query returned
+    used_fallback: bool = False  # retried without the optional OOS filter
+    filters: dict[str, Any] = field(default_factory=dict)  # the exact selection sent
+
+    def summary(self) -> str:
+        if self.skipped_reason is not None:
+            return f"{self.marketplace}: skipped — {self.skipped_reason}"
+        if self.error is not None:
+            return f"{self.marketplace}: Keepa finder failed — {self.error}"
+        tot = "unknown" if self.total_results is None else f"{self.total_results}"
+        note = (
+            f"{self.marketplace}: finder returned {self.returned} of {tot} matching"
+            f"{' (core-only fallback)' if self.used_fallback else ''}"
+        )
+        if self.returned == 0:
+            keys = ", ".join(f"{k}={self.filters[k]}" for k in sorted(self.filters))
+            note += f". Filters sent: {keys}"
+        return note
+
+
 @dataclass
 class ZombieReport:
     run_id: str
@@ -119,6 +149,7 @@ class ZombieReport:
     keepa_tokens: int = 0
     data_usd: float = 0.0
     notes: list[str] = field(default_factory=list)
+    diagnostics: list[FinderDiagnostic] = field(default_factory=list)
 
     @property
     def verified(self) -> list[ZombieResult]:
@@ -211,15 +242,25 @@ def run_zombies(
     active_mps = [m for m in params.marketplaces if m not in _NO_KEEPA]
     projection = project_costs(params)
     report.notes.extend(projection.notes)
+    for m in params.marketplaces:
+        if m in _NO_KEEPA:
+            report.diagnostics.append(
+                FinderDiagnostic(marketplace=m, skipped_reason=f"Keepa has no {m} data")
+            )
     over = projection.over_caps(params)
     if over is not None:
+        for m in active_mps:
+            report.diagnostics.append(FinderDiagnostic(marketplace=m, skipped_reason=over))
         repository.finish_run(conn, run_id, status="failed")
         raise ZombieAbortedError(over)
     if not active_mps:
         repository.finish_run(conn, run_id, status="failed")
         raise ZombieAbortedError("no Keepa-covered marketplaces requested")
     if clients.keepa_factory is None:
-        report.notes.append("Keepa is not configured — the zombie search needs the Product Finder.")
+        reason = "Keepa is not configured — the zombie search needs the Product Finder."
+        report.notes.append(reason)
+        for m in active_mps:
+            report.diagnostics.append(FinderDiagnostic(marketplace=m, skipped_reason=reason))
         repository.finish_run(conn, run_id, status="complete")
         return report
     if not params.scheduled and confirm is not None and not confirm(projection):
@@ -227,8 +268,13 @@ def run_zombies(
         raise ZombieAbortedError("declined at confirmation")
 
     results: list[ZombieResult] = []
+    finder_tokens = 0
     for mp in active_mps:
-        results.extend(_sweep_marketplace(conn, mp, params, config, clients, run_id, as_of, report))
+        mp_results, mp_tokens = _sweep_marketplace(
+            conn, mp, params, config, clients, run_id, as_of, report
+        )
+        results.extend(mp_results)
+        finder_tokens += mp_tokens
 
     results.sort(key=lambda r: r.score if r.score is not None else -1.0, reverse=True)
     top = results[: params.top_n]
@@ -238,7 +284,10 @@ def run_zombies(
         top = _enrich_current_demand(conn, top, params, config, clients, run_id)
 
     report.results = top
-    report.keepa_tokens = repository.run_token_total(conn, run_id)
+    # Finder calls are not persisted to raw_fetches, so count their tokens here on
+    # top of the hydrate tokens the run ledger records (otherwise a sweep that
+    # returns 0 misleadingly shows "0 tokens").
+    report.keepa_tokens = finder_tokens + repository.run_token_total(conn, run_id)
     report.data_usd = round(repository.run_cost_total(conn, run_id), 4)
     repository.finish_run(conn, run_id, status="complete")
     return report
@@ -253,7 +302,9 @@ def _sweep_marketplace(
     run_id: str,
     as_of: date,
     report: ZombieReport,
-) -> list[ZombieResult]:
+) -> tuple[list[ZombieResult], int]:
+    """Finder → cache-first hydrate → verify for one marketplace. Returns
+    (results, finder_tokens_consumed) and records a FinderDiagnostic."""
     from delium.ingestion import cached_raw_product, hydrate_products
     from delium.providers.base import ProviderError
 
@@ -265,16 +316,50 @@ def _sweep_marketplace(
         out_of_stock_pct_90=params.out_of_stock_pct_90,
     )
     selection = build_zombie_finder_selection(cfg, per_page=params.per_page)
+    finder_tokens = 0
     try:
         finder = client.product_finder(selection)
     except ProviderError as exc:
-        log.warning("zombie finder failed (%s): %s", mp, exc)
-        report.notes.append(f"finder failed for {mp}: {exc}")
-        return []
+        log.warning("zombie finder failed (%s): %s | filters=%s", mp, exc, selection)
+        report.diagnostics.append(
+            FinderDiagnostic(marketplace=mp, error=str(exc), filters=selection)
+        )
+        return [], finder_tokens
+    finder_tokens += finder.tokens_consumed
+    used_fallback = False
+
+    # If the full selection returns nothing, retry once WITHOUT the optional
+    # out-of-stock-percentage filter (it can over-restrict), so one strict filter
+    # can't zero out the sweep. The fallback attempt becomes the reported result.
+    if not finder.asins and "outOfStockPercentage90_NEW_gte" in selection:
+        core = build_zombie_finder_selection(cfg, per_page=params.per_page, core_only=True)
+        try:
+            retry = client.product_finder(core)
+            finder_tokens += retry.tokens_consumed
+            finder, selection, used_fallback = retry, core, True
+        except ProviderError as exc:
+            log.warning("zombie finder fallback failed (%s): %s", mp, exc)
+
     asins = list(finder.asins)[: params.sweep_target]
     report.swept += len(asins)
+    report.diagnostics.append(
+        FinderDiagnostic(
+            marketplace=mp,
+            http_status=finder.http_status,
+            total_results=finder.total_results,
+            returned=len(asins),
+            used_fallback=used_fallback,
+            filters=selection,
+        )
+    )
     if not asins:
-        return []
+        log.warning(
+            "zombie finder returned 0 (%s): total_results=%s filters=%s",
+            mp,
+            finder.total_results,
+            selection,
+        )
+        return [], finder_tokens
 
     conn.commit()  # release the write lock before ingestion opens its own connection
     hydrate_products(asins, run_id=run_id, client=client, config=config)
@@ -294,7 +379,7 @@ def _sweep_marketplace(
 
             thresholds_eff = replace(thresholds, min_months=params.min_dead_months)
         out.append(compute_zombie(ev, thresholds_eff))
-    return out
+    return out, finder_tokens
 
 
 def _enrich_current_demand(

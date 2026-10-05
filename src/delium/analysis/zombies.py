@@ -501,34 +501,41 @@ class ZombieFinderConfig:
     min_rating: float = 4.0
     min_reviews: int = 50
     out_of_stock_pct_90: int = 90  # % of the last 90 days with no NEW offer
-    exclude_amazon: bool = True
     sort_field: str = "current_COUNT_REVIEWS"
 
 
 def build_zombie_finder_selection(
-    cfg: ZombieFinderConfig, *, page: int = 0, per_page: int = 50
+    cfg: ZombieFinderConfig, *, page: int = 0, per_page: int = 50, core_only: bool = False
 ) -> dict[str, Any]:
     """Keepa `/query` selection for out-of-stock-but-reviewed listings. Field
     names/types verified against github.com/keepacom/api_backend
     ProductFinderRequest:
-      current_COUNT_NEW_lte (Integer)   — 0 ⇒ no current new offers
+      current_COUNT_NEW_lte (Integer)   — 0 ⇒ no current new offers (primary
+                                          dead-listing signal)
       current_RATING_gte (Integer, 0-50)— rating floor (4.0★ ⇒ 40)
       current_COUNT_REVIEWS_gte (Integer)
-      outOfStockPercentage90_NEW_gte (Integer) — OOS share of the last 90 days
-      buyBoxIsAmazon (Boolean)          — exclude Amazon-held buy box
+      outOfStockPercentage90_NEW_gte (Integer) — OOS share of the last 90 days;
+                                          OPTIONAL (dropped on the fallback retry)
       productType (Byte[]) / page / perPage / sort (String[][])
-    No price/sales band: a dead listing has no NEW price, so those filters would
-    exclude every candidate."""
+
+    We do NOT send `buyBoxIsAmazon=false`: that Boolean matches only listings
+    that HAVE a (non-Amazon) buy box, so it excludes the very listings we want —
+    dead ones have no buy box at all. Amazon-sold listings are excluded AFTER
+    hydration from the Amazon offer history instead (see `zombie_evidence_from_raw`).
+    No price/sales band either: a dead listing has no NEW price.
+
+    `core_only=True` drops the optional OOS-percentage filter, used as a fallback
+    retry when the full selection returns 0 (so one over-strict optional filter
+    can't zero out the sweep)."""
     selection: dict[str, Any] = {
         "current_COUNT_NEW_lte": 0,
         "current_RATING_gte": int(round(cfg.min_rating * 10)),
         "current_COUNT_REVIEWS_gte": int(cfg.min_reviews),
-        "outOfStockPercentage90_NEW_gte": int(cfg.out_of_stock_pct_90),
         "productType": [0],
         "page": page,
         "perPage": per_page,
         "sort": [[cfg.sort_field, "desc"]],  # strongest social proof first
     }
-    if cfg.exclude_amazon:
-        selection["buyBoxIsAmazon"] = False
+    if not core_only and cfg.out_of_stock_pct_90 > 0:
+        selection["outOfStockPercentage90_NEW_gte"] = int(cfg.out_of_stock_pct_90)
     return selection

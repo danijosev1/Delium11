@@ -948,8 +948,19 @@ def page_zombies() -> None:
         f"**{len(report.results)}** candidates · swept {report.swept} → hydrated {report.hydrated} "
         f"· {report.keepa_tokens} tokens · ${report.data_usd:.2f}"
     )
+    # Always surface WHY — the exact per-marketplace finder outcome (status,
+    # error body, totalResults, filters sent, or the skip reason).
+    if report.diagnostics:
+        with st.expander("Finder diagnostics", expanded=not report.results):
+            for diag in report.diagnostics:
+                st.markdown(f"- {diag.summary()}")
+                if diag.filters and diag.returned == 0 and diag.skipped_reason is None:
+                    st.caption(f"filters: {diag.filters}")
     if not report.results:
-        st.info("No candidates — try lowering the review floor or another marketplace.")
+        st.info(
+            "No candidates — see the finder diagnostics above for why (0 matches, a Keepa "
+            "error, or a skipped marketplace). Try lowering the review floor."
+        )
     for i, r in enumerate(report.results):
         _render_zombie_result(r, key=str(i))
 
