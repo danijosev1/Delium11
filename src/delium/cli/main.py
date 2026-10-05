@@ -1581,6 +1581,9 @@ def zombies(
     sweep_size: Annotated[
         int, typer.Option("--sweep-size", help="Raw ASINs to bring back from the finder.")
     ] = 100,
+    pages: Annotated[
+        int, typer.Option("--pages", help="How many finder pages to pull per marketplace.")
+    ] = 1,
     check_demand: Annotated[
         bool,
         typer.Option("--check-demand", help="DataForSEO SERP for the top candidates (PAID)."),
@@ -1599,18 +1602,31 @@ def zombies(
     """Find out-of-stock-but-reviewed listings and verify they are truly dead
     (zombies) — with compliance flags and a suggested, policy-safe route."""
     from delium.discovery import zombies as zmod
+    from delium.discovery.daily_scan import _category_ids_for
+    from delium.profile import store as profile_store
 
     initialize_database()
     config = load_config()
     mps = tuple(_validate_marketplace(m) for m in marketplaces.split(",") if m.strip())
     keepa_factory, dfs_factory = _build_provider_factories()
+    # Slice by the active Research Profile's preferred categories, resolved
+    # per-marketplace exactly like the scan finder (US ids never sent to UK/CA).
+    with get_connection() as conn:
+        profile = profile_store.load_active(conn)
+    category_ids: dict[str, list[int]] = {}
+    for m in mps:
+        ids, _note = _category_ids_for(profile, m)
+        if ids:
+            category_ids[m] = ids
     params = zmod.ZombieParams(
         marketplaces=mps,
         min_dead_months=min_dead_months,
         min_reviews=min_reviews,
         min_rating=min_rating,
+        category_ids=category_ids,
         sweep_target=sweep_size,
         per_page=max(sweep_size, 50),
+        pages=pages,
         top_n=top,
         budget_cap_tokens=budget_cap,
         max_spend_usd=max_spend,

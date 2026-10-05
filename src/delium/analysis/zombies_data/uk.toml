@@ -32,3 +32,9 @@ current_demand = 10
 [verdict]
 verified_min = 70
 possible_min = 45
+
+[finder]
+# Finder-stage prefilters (Keepa /query). The ≥6-month continuous outage is still
+# verified AFTER hydration from history — these only shrink the candidate pool.
+out_of_stock_pct_90 = 100    # NEW out-of-stock % of the last 90 days (the "dead" prefilter)
+amazon_oos_pct_90 = 90       # Amazon out-of-stock % — excludes Amazon-sold listings

@@ -1065,19 +1065,31 @@ def find_zombies(
     min_reviews: int = 50,
     min_rating: float = 4.0,
     top: int = 20,
+    pages: int = 1,
     check_demand: bool = False,
 ) -> Any:
     """Run the zombie discovery (Keepa Product Finder → cache-first hydrate →
     verify). Pressing Run in the UI is the spend consent, so no extra confirm."""
     from delium.discovery import zombies as zmod
+    from delium.discovery.daily_scan import _category_ids_for
+    from delium.profile import store as profile_store
 
     initialize_database()
     keepa, dfs = _provider_factories()
+    with get_connection() as conn:
+        profile = profile_store.load_active(conn)
+    category_ids: dict[str, list[int]] = {}
+    for m in marketplaces:
+        ids, _note = _category_ids_for(profile, m)
+        if ids:
+            category_ids[m] = ids
     params = zmod.ZombieParams(
         marketplaces=marketplaces,
         min_dead_months=min_dead_months,
         min_reviews=min_reviews,
         min_rating=min_rating,
+        category_ids=category_ids,
+        pages=pages,
         top_n=top,
         check_demand=check_demand,
     )

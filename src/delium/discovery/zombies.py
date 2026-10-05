@@ -65,9 +65,15 @@ class ZombieParams:
     min_dead_months: float = 6.0
     min_reviews: int = 50
     min_rating: float = 4.0
-    out_of_stock_pct_90: int = 90
+    # None ⇒ use the per-marketplace zombies_data defaults (NEW / Amazon OOS %).
+    out_of_stock_pct_90: int | None = None
+    amazon_oos_pct_90: int | None = None
+    # Per-marketplace preferred category ids (resolved by the caller from the
+    # active Research Profile, same as the scan finder); empty ⇒ no category slice.
+    category_ids: dict[str, list[int]] = field(default_factory=dict)
     sweep_target: int = 100  # max ASINs to bring back from the finder
     per_page: int = 100
+    pages: int = 1  # how many finder pages to pull per marketplace
     top_n: int = 20
     budget_cap_tokens: int | None = None
     max_spend_usd: float | None = None
@@ -164,7 +170,7 @@ def project_costs(params: ZombieParams) -> ZombieCostProjection:
         for m in params.marketplaces
         if m in _NO_KEEPA
     )
-    finder_tokens = len(active) * finder_token_estimate(params.per_page)
+    finder_tokens = len(active) * max(1, params.pages) * finder_token_estimate(params.per_page)
     hydrate_tokens = params.sweep_target * 2  # ~2 tokens/product, worst case all missed
     dfs_usd = round(params.top_n * 3 * _DFS_CALL_USD, 2) if params.check_demand else 0.0
     return ZombieCostProjection(finder_tokens, hydrate_tokens, dfs_usd, notes)
@@ -304,67 +310,95 @@ def _sweep_marketplace(
     report: ZombieReport,
 ) -> tuple[list[ZombieResult], int]:
     """Finder → cache-first hydrate → verify for one marketplace. Returns
-    (results, finder_tokens_consumed) and records a FinderDiagnostic."""
+    (results, finder_tokens_consumed) and records a FinderDiagnostic per page."""
     from delium.ingestion import cached_raw_product, hydrate_products
     from delium.providers.base import ProviderError
 
     assert clients.keepa_factory is not None
     client = cast(KeepaClient, clients.keepa_factory(mp))
+    thresholds = load_zombie_data(mp)
+    # Finder prefilters: the per-marketplace zombies_data defaults, overridden by
+    # any explicit caller values.
     cfg = ZombieFinderConfig(
         min_rating=params.min_rating,
         min_reviews=params.min_reviews,
-        out_of_stock_pct_90=params.out_of_stock_pct_90,
+        out_of_stock_pct_90=(
+            params.out_of_stock_pct_90
+            if params.out_of_stock_pct_90 is not None
+            else thresholds.finder_oos_pct_90
+        ),
+        amazon_oos_pct_90=(
+            params.amazon_oos_pct_90
+            if params.amazon_oos_pct_90 is not None
+            else thresholds.finder_amazon_oos_pct_90
+        ),
     )
-    selection = build_zombie_finder_selection(cfg, per_page=params.per_page)
+    cat_ids = params.category_ids.get(mp) or None
+
     finder_tokens = 0
-    try:
-        finder = client.product_finder(selection)
-    except ProviderError as exc:
-        log.warning("zombie finder failed (%s): %s | filters=%s", mp, exc, selection)
-        report.diagnostics.append(
-            FinderDiagnostic(marketplace=mp, error=str(exc), filters=selection)
+    asins: list[str] = []
+    seen: set[str] = set()
+    for page in range(max(1, params.pages)):
+        if len(asins) >= params.sweep_target:
+            break
+        selection = build_zombie_finder_selection(
+            cfg, page=page, per_page=params.per_page, category_ids=cat_ids
         )
-        return [], finder_tokens
-    finder_tokens += finder.tokens_consumed
-    used_fallback = False
-
-    # If the full selection returns nothing, retry once WITHOUT the optional
-    # out-of-stock-percentage filter (it can over-restrict), so one strict filter
-    # can't zero out the sweep. The fallback attempt becomes the reported result.
-    if not finder.asins and "outOfStockPercentage90_NEW_gte" in selection:
-        core = build_zombie_finder_selection(cfg, per_page=params.per_page, core_only=True)
         try:
-            retry = client.product_finder(core)
-            finder_tokens += retry.tokens_consumed
-            finder, selection, used_fallback = retry, core, True
+            finder = client.product_finder(selection)
         except ProviderError as exc:
-            log.warning("zombie finder fallback failed (%s): %s", mp, exc)
+            log.warning("zombie finder failed (%s p%s): %s | filters=%s", mp, page, exc, selection)
+            report.diagnostics.append(
+                FinderDiagnostic(marketplace=mp, error=str(exc), filters=selection)
+            )
+            break
+        finder_tokens += finder.tokens_consumed
+        used_fallback = False
+        # If the full selection returns nothing, retry once WITHOUT the optional
+        # Amazon-exclusion filter (it carries Keepa's no-data/-1 skip risk), so one
+        # strict filter can't zero the sweep. Post-hydration Amazon check backstops.
+        if not finder.asins and "outOfStockPercentage90_gte" in selection:
+            core = build_zombie_finder_selection(
+                cfg, page=page, per_page=params.per_page, category_ids=cat_ids, core_only=True
+            )
+            try:
+                retry = client.product_finder(core)
+                finder_tokens += retry.tokens_consumed
+                finder, selection, used_fallback = retry, core, True
+            except ProviderError as exc:
+                log.warning("zombie finder fallback failed (%s p%s): %s", mp, page, exc)
 
-    asins = list(finder.asins)[: params.sweep_target]
+        page_asins = [a for a in finder.asins if a not in seen]
+        seen.update(page_asins)
+        asins.extend(page_asins)
+        report.diagnostics.append(
+            FinderDiagnostic(
+                marketplace=mp,
+                http_status=finder.http_status,
+                total_results=finder.total_results,
+                returned=len(page_asins),
+                used_fallback=used_fallback,
+                filters=selection,
+            )
+        )
+        if not finder.asins:
+            log.warning(
+                "zombie finder returned 0 (%s p%s): total_results=%s filters=%s",
+                mp,
+                page,
+                finder.total_results,
+                selection,
+            )
+            break  # no more pages will have data
+
+    asins = asins[: params.sweep_target]
     report.swept += len(asins)
-    report.diagnostics.append(
-        FinderDiagnostic(
-            marketplace=mp,
-            http_status=finder.http_status,
-            total_results=finder.total_results,
-            returned=len(asins),
-            used_fallback=used_fallback,
-            filters=selection,
-        )
-    )
     if not asins:
-        log.warning(
-            "zombie finder returned 0 (%s): total_results=%s filters=%s",
-            mp,
-            finder.total_results,
-            selection,
-        )
         return [], finder_tokens
 
     conn.commit()  # release the write lock before ingestion opens its own connection
     hydrate_products(asins, run_id=run_id, client=client, config=config)
 
-    thresholds = load_zombie_data(mp)
     out: list[ZombieResult] = []
     for asin in asins:
         raw = cached_raw_product(conn, asin, mp)

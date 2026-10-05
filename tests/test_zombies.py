@@ -230,25 +230,51 @@ def test_manual_check_names_us_office() -> None:
 # Finder selection (fields verified against keepacom/api_backend)
 # ---------------------------------------------------------------------------
 def test_zombie_finder_selection_fields() -> None:
-    sel = build_zombie_finder_selection(ZombieFinderConfig(min_rating=4.0, min_reviews=40))
-    assert sel["current_COUNT_NEW_lte"] == 0  # no current new offers (primary dead signal)
+    sel = build_zombie_finder_selection(
+        ZombieFinderConfig(min_rating=4.0, min_reviews=40, out_of_stock_pct_90=100),
+        category_ids=[3760901],
+    )
     assert sel["current_RATING_gte"] == 40  # 4.0★ on Keepa's 0-50 scale
     assert sel["current_COUNT_REVIEWS_gte"] == 40
-    assert sel["outOfStockPercentage90_NEW_gte"] == 90
+    assert sel["outOfStockPercentage90_NEW_gte"] == 100  # the dead prefilter
+    assert sel["outOfStockPercentage90_gte"] == 90  # AMAZON OOS — excludes Amazon-sold
+    assert sel["categories_include"] == [3760901]  # per-marketplace category slice
     assert sel["productType"] == [0]
+    assert sel["sort"] == [["current_COUNT_REVIEWS", "desc"]]
+    # current_COUNT_NEW_lte removed: live Keepa /query returned 0 for dead listings.
+    assert "current_COUNT_NEW_lte" not in sel
+    # buyBoxIsAmazon=false would exclude listings with NO buy box (every dead one).
+    assert "buyBoxIsAmazon" not in sel
     assert "current_NEW_gte" not in sel  # no price band — dead listings have no price
-    # buyBoxIsAmazon=false would exclude listings with NO buy box (i.e. every dead
-    # listing). It must NOT be sent; Amazon is excluded after hydration instead.
-    assert "buyBoxIsAmazon" not in sel
 
 
-def test_zombie_finder_core_only_drops_optional_oos_filter() -> None:
+def test_zombie_finder_core_only_keeps_dead_prefilter_drops_amazon() -> None:
     sel = build_zombie_finder_selection(
-        ZombieFinderConfig(min_rating=4.0, min_reviews=40), core_only=True
+        ZombieFinderConfig(min_rating=4.0, min_reviews=40, out_of_stock_pct_90=100),
+        core_only=True,
     )
-    assert "outOfStockPercentage90_NEW_gte" not in sel  # dropped for the fallback retry
-    assert sel["current_COUNT_NEW_lte"] == 0  # core dead-signal kept
+    # The NEW dead-prefilter is CORE (it works); the Amazon-exclusion is dropped.
+    assert sel["outOfStockPercentage90_NEW_gte"] == 100
+    assert "outOfStockPercentage90_gte" not in sel
+    assert "current_COUNT_NEW_lte" not in sel
     assert "buyBoxIsAmazon" not in sel
+
+
+def test_zombie_finder_amazon_exclusion_field_is_unprefixed_oos() -> None:
+    # The Amazon-exclusion prefilter is the UNPREFIXED outOfStockPercentage90_gte
+    # (the Amazon series; outOfStockPercentage90_AMAZON_* does not exist in Keepa).
+    on = build_zombie_finder_selection(ZombieFinderConfig(amazon_oos_pct_90=90))
+    assert on["outOfStockPercentage90_gte"] == 90
+    off = build_zombie_finder_selection(ZombieFinderConfig(amazon_oos_pct_90=0))
+    assert "outOfStockPercentage90_gte" not in off
+
+
+def test_zombie_finder_defaults_come_from_zombie_data() -> None:
+    from delium.analysis.zombies import load_zombie_data
+
+    t = load_zombie_data("uk")
+    assert t.finder_oos_pct_90 == 100
+    assert t.finder_amazon_oos_pct_90 == 90
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +370,8 @@ def test_run_zombies_end_to_end_verifies_and_flags(initialized_db: Path) -> None
     import json as _json
 
     decoded = _json.loads(sel["selection"])
-    assert decoded["current_COUNT_NEW_lte"] == 0
+    assert decoded["outOfStockPercentage90_NEW_gte"] == 100  # the dead prefilter
+    assert "current_COUNT_NEW_lte" not in decoded  # removed (matched 0 dead listings)
     # Compliance: the generic listing offers a revival route; the branded one does not.
     gen = next(r for r in report.results if r.asin == "B0GEN00001")
     brand = next(r for r in report.results if r.asin == "B0BRND0002")
@@ -480,9 +507,11 @@ class SelectionRoutedKeepa:
                         "tokensLeft": self.tokens_left,
                     },
                 )
-            has_oos = "outOfStockPercentage90_NEW_gte" in sel
-            bodies = self.full if has_oos else self.core
-            total = self.total_results_full if has_oos else len(bodies)
+            # The optional (droppable) filter is the Amazon-exclusion OOS%; the
+            # core-only fallback omits it.
+            has_amazon = "outOfStockPercentage90_gte" in sel
+            bodies = self.full if has_amazon else self.core
+            total = self.total_results_full if has_amazon else len(bodies)
             return HttpResult(
                 200,
                 {
@@ -555,8 +584,10 @@ def test_empty_result_records_finder_diagnostics_and_counts_tokens(initialized_d
     assert ca.returned == 0
     assert ca.total_results is None  # Keepa's 0 maps to None; the summary says "unknown"
     assert ca.used_fallback is True  # retried core-only after the full selection was empty
-    assert "current_COUNT_NEW_lte" in ca.filters
-    assert "outOfStockPercentage90_NEW_gte" not in ca.filters  # the fallback dropped it
+    # The fallback keeps the NEW dead-prefilter and drops the Amazon-exclusion filter.
+    assert "outOfStockPercentage90_NEW_gte" in ca.filters
+    assert "outOfStockPercentage90_gte" not in ca.filters
+    assert "current_COUNT_NEW_lte" not in ca.filters
     assert "Filters sent" in ca.summary()
 
 
@@ -564,8 +595,8 @@ def test_fallback_without_oos_filter_recovers_results(initialized_db: Path) -> N
     from delium.config.models import DeliumConfig
     from delium.discovery import zombies as zmod
 
-    # Full selection (with outOfStockPercentage90_NEW_gte) returns nothing; the
-    # core-only fallback finds the zombie.
+    # Full selection (with the Amazon-exclusion outOfStockPercentage90_gte) returns
+    # nothing; the core-only fallback (Amazon filter dropped) finds the zombie.
     body = {"B0CORE001": _zombie_body("B0CORE001", brand=None, dead_since=date(2023, 1, 1))}
     transport = SelectionRoutedKeepa(full={}, core=body, total_results_full=0)
     with get_connection() as conn:
@@ -619,3 +650,86 @@ def test_missing_keepa_key_records_skip_reason(initialized_db: Path) -> None:
     assert all(
         d.skipped_reason and "not configured" in d.skipped_reason for d in report.diagnostics
     )
+
+
+class PagedKeepa:
+    """A finder that returns a different ASIN per page, so --pages can be tested."""
+
+    def __init__(self, per_page_asins: list[str]) -> None:
+        self.per_page_asins = per_page_asins
+        self.pages_seen: list[int] = []
+
+    def request_json(self, url: str, params: Any) -> HttpResult:
+        if "/query" in url:
+            import json as _json
+
+            sel = _json.loads(params["selection"])
+            page = int(sel.get("page", 0))
+            self.pages_seen.append(page)
+            asins = [self.per_page_asins[page]] if page < len(self.per_page_asins) else []
+            return HttpResult(
+                200,
+                {
+                    "asinList": asins,
+                    "totalResults": len(self.per_page_asins),
+                    "tokensConsumed": 11,
+                    "tokensLeft": 9000,
+                },
+            )
+        if "/token" in url:
+            return HttpResult(200, {"tokensLeft": 9000, "refillRate": 20})
+        asins = str(params.get("asin", "")).split(",")
+        return HttpResult(
+            200,
+            {
+                "tokensConsumed": len(asins),
+                "tokensLeft": 9000,
+                "products": [
+                    _zombie_body(a, brand=None, dead_since=date(2023, 1, 1)) for a in asins if a
+                ],
+            },
+        )
+
+
+def test_pages_option_pulls_multiple_finder_pages(initialized_db: Path) -> None:
+    from delium.config.models import DeliumConfig
+    from delium.discovery import zombies as zmod
+
+    transport = PagedKeepa(["B0PAGE0001", "B0PAGE0002"])
+    with get_connection() as conn:
+        report = zmod.run_zombies(
+            conn,
+            params=zmod.ZombieParams(marketplaces=("UK",), pages=2, sweep_target=10, top_n=10),
+            config=DeliumConfig(),
+            clients=zmod.ZombieClients(
+                keepa_factory=lambda mp: KeepaClient(
+                    "k", transport=transport, sleep=lambda _s: None, marketplace=mp
+                )
+            ),
+            as_of=AS_OF,
+        )
+    assert transport.pages_seen == [0, 1]  # both pages fetched
+    assert report.swept == 2
+    assert {r.asin for r in report.results} == {"B0PAGE0001", "B0PAGE0002"}
+
+
+def test_category_ids_sliced_into_finder_selection(initialized_db: Path) -> None:
+    import json as _json
+
+    from delium.config.models import DeliumConfig
+    from delium.discovery import zombies as zmod
+
+    bodies = {"B0CAT0001": _zombie_body("B0CAT0001", brand=None, dead_since=date(2023, 1, 1))}
+    transport = FakeZombieKeepa(bodies)
+    with get_connection() as conn:
+        zmod.run_zombies(
+            conn,
+            params=zmod.ZombieParams(
+                marketplaces=("UK",), category_ids={"UK": [3760911]}, sweep_target=10
+            ),
+            config=DeliumConfig(),
+            clients=zmod.ZombieClients(keepa_factory=_factory(transport)),
+            as_of=AS_OF,
+        )
+    sel = _json.loads(transport.finder_params[0]["selection"])
+    assert sel["categories_include"] == [3760911]  # per-marketplace category slice

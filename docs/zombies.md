@@ -20,23 +20,44 @@ units were verified against the official backend request struct
 
 | Field | Type | Meaning in the zombie sweep |
 |---|---|---|
-| `current_COUNT_NEW_lte` | Integer | `0` ⇒ **no current new offers** (primary dead signal) |
+| `outOfStockPercentage90_NEW_gte` | Integer | NEW out-of-stock % of the last 90 days — the **dead prefilter** (default 100, in `zombies_data`) |
 | `current_RATING_gte` | Integer (0–50) | rating floor — 4.0★ ⇒ `40` |
 | `current_COUNT_REVIEWS_gte` | Integer | review floor (social proof) |
-| `outOfStockPercentage90_NEW_gte` | Integer | % of the last 90 days with no NEW offer — **optional** |
+| `outOfStockPercentage90_gte` | Integer | the **unprefixed = Amazon** OOS % — high ⇒ Amazon not selling, so it **excludes Amazon-sold** (default 90); **optional** |
+| `categories_include` | long[] | per-marketplace preferred-category ids (when the Research Profile sets them) |
 | `productType` | Byte[] | `[0]` standard physical only |
-| `page` / `perPage` | int | paging |
+| `page` / `perPage` | int | paging (`--pages` pulls more than one page) |
 | `sort` | String[][] | `[["current_COUNT_REVIEWS","desc"]]` — strongest social proof first |
+
+**Live Keepa `/query` results (domain=1 US, `productType` omitted) that drove this
+selection:**
+
+| Query | `totalResults` |
+|---|---|
+| A: `current_COUNT_REVIEWS_gte:50` + `current_RATING_gte:40` | 60,215,000 |
+| B: A + `current_COUNT_NEW_lte:0` | **0** |
+| C: A + `outOfStockPercentage90_NEW_gte:90` | 24,771,900 |
+
+**`current_COUNT_NEW_lte` is removed** (query B → 0): Keepa treats a dead
+listing's current offer count as no-data/`-1`, which range filters skip, so it
+never matched a single zombie. The NEW out-of-stock percentage (query C) is used
+as the dead prefilter instead.
 
 **We do NOT send `buyBoxIsAmazon=false`.** That Boolean matches only listings
 that *have* a (non-Amazon) buy box, so it excludes the very listings we want — a
-dead listing has **no buy box at all**. Amazon-sold listings are excluded
-**after hydration** instead, from the Amazon offer history (the Amazon price
-series currently carrying an offer ⇒ not a zombie). The
-`outOfStockPercentage90_NEW_gte` filter is **optional**: if the full selection
-returns 0, the sweep **retries once without it** (core-only) so one over-strict
-filter can't zero out the result. There is **no price or sales-rank band**: a
-dead listing has no current NEW price.
+dead listing has **no buy box at all**.
+
+**Amazon-sold listings are excluded at the finder stage** with the unprefixed
+`outOfStockPercentage90_gte` (the Amazon series — `outOfStockPercentage90_AMAZON_*`
+does not exist in `ProductFinderRequest.java`). Because this field carries the
+same no-data/`-1` skip risk, it is **optional**: if the full selection returns 0,
+the sweep **retries once without it** (core-only, keeping the NEW dead
+prefilter). The **post-hydration Amazon check** (Amazon price series currently
+carrying an offer ⇒ not a zombie) is the reliable backstop. There is **no price
+or sales-rank band**: a dead listing has no current NEW price.
+
+The finder percentages live in `zombies_data/<marketplace>.toml`
+(`[finder] out_of_stock_pct_90`, `amazon_oos_pct_90`).
 
 ### Empty-result diagnostics
 
@@ -135,11 +156,15 @@ much evidence was present.
 ```bash
 delium zombies --marketplaces UK,CA                 # defaults: 6 months, 50 reviews, top 20
 delium zombies --marketplaces UK --min-dead-months 12 --min-reviews 100 --top 10
+delium zombies --marketplaces UK --pages 3           # pull 3 finder pages per marketplace
 delium zombies --marketplaces UK --check-demand     # + DataForSEO SERP (PAID) for the top N
 ```
 
 A cost/token preflight prints the projected Keepa tokens (finder + hydrate) and
-DataForSEO USD, and asks to confirm before spending (`--yes` skips it).
+DataForSEO USD, and asks to confirm before spending (`--yes` skips it). When the
+active Research Profile sets preferred categories, the sweep is **sliced by
+those category ids per marketplace** (resolved exactly like the scan finder — US
+ids are never sent to UK/CA) via `categories_include`.
 
 ### UI
 
