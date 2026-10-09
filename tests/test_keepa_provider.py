@@ -9,8 +9,15 @@ from delium.providers.base import (
     ProviderResponseError,
 )
 from delium.providers.keepa import (
+    FINDER_MAX_RESULT_DEPTH,
+    FINDER_PER_PAGE_MAX,
+    FINDER_PER_PAGE_MIN,
     KeepaClient,
+    clamp_finder_per_page,
+    finder_depth_ok,
+    finder_token_estimate,
     keepa_minutes_to_date,
+    max_finder_pages,
     normalize_product,
 )
 from keepa_support import (
@@ -20,6 +27,56 @@ from keepa_support import (
     keepa_product_body,
     ok,
 )
+
+
+def _finder_ok(asins: list[str]) -> object:
+    return ok(
+        {"asinList": asins, "totalResults": len(asins), "tokensConsumed": 11, "tokensLeft": 9000}
+    )
+
+
+def test_finder_paging_rule_constants() -> None:
+    assert FINDER_PER_PAGE_MIN == 50
+    assert FINDER_PER_PAGE_MAX == 10000
+    assert FINDER_MAX_RESULT_DEPTH == 10000
+
+
+def test_clamp_finder_per_page_floor_and_ceiling() -> None:
+    assert clamp_finder_per_page(1) == 50  # below the minimum → the minimum
+    assert clamp_finder_per_page(37) == 50  # the UK-scan sub-band case
+    assert clamp_finder_per_page(50) == 50
+    assert clamp_finder_per_page(100) == 100
+    assert clamp_finder_per_page(99999) == 10000  # above the ceiling → the ceiling
+
+
+def test_max_finder_pages_and_depth() -> None:
+    assert max_finder_pages(50) == 200  # 200 * 50 == 10000
+    assert max_finder_pages(100) == 100
+    assert max_finder_pages(10000) == 1
+    assert finder_depth_ok(0, 50) is True
+    assert finder_depth_ok(199, 50) is True  # 200 * 50 == 10000
+    assert finder_depth_ok(200, 50) is False  # 201 * 50 > 10000
+
+
+def test_finder_token_estimate_uses_clamped_per_page() -> None:
+    # A sub-band asking for 37 projects the same as 50 (the real, clamped request).
+    assert finder_token_estimate(37) == finder_token_estimate(50) == 11
+
+
+def test_product_finder_clamps_tiny_per_page_before_sending() -> None:
+    transport = FakeTransport([_finder_ok(["B1"])])
+    client = KeepaClient("k", transport=transport, sleep=lambda _s: None)
+    client.product_finder({"perPage": 37, "page": 0})
+    import json as _json
+
+    sent = _json.loads(transport.calls[-1]["selection"])
+    assert sent["perPage"] == 50  # clamped up to the minimum before the request
+
+
+def test_product_finder_refuses_over_depth_page() -> None:
+    client = KeepaClient("k", transport=FakeTransport([]), sleep=lambda _s: None)
+    with pytest.raises(ProviderResponseError, match="pagination depth"):
+        client.product_finder({"perPage": 50, "page": 200})  # 201 * 50 > 10000
 
 
 def _client(results: list[object], sleeps: list[float] | None = None) -> KeepaClient:

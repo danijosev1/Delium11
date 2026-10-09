@@ -633,6 +633,8 @@ def _stage_sweep(
     active_mps: tuple[str, ...],
     as_of: date,
 ) -> _StageOut:
+    from delium.providers.keepa import FINDER_PER_PAGE_MIN
+
     data = load_emerging_data(config.emerging.data_version)
     overrides = dict(profile.finder_overrides())
     seen: set[tuple[str, str]] = set()
@@ -655,15 +657,22 @@ def _stage_sweep(
         for slice_id in slices:
             cats = [slice_id] if slice_id else []
             selections = build_finder_selections(
-                data, as_of=as_of, category_ids=cats, per_page=params.per_slice, overrides=overrides
+                data,
+                as_of=as_of,
+                category_ids=cats,
+                per_page=params.per_slice,
+                per_page_min=FINDER_PER_PAGE_MIN,
+                overrides=overrides,
             )
-            for sel in selections:
+            n_bands = len(selections)
+            for band_idx, sel in enumerate(selections):
                 if swept >= params.sweep_target:
                     break
                 # Optional finder-level K3 proxy (grams); dropped by the fallback.
                 if profile.max_weight_g is not None and profile.max_weight_g > 0:
                     sel["packageWeight_lte"] = int(profile.max_weight_g)
-                finder, note = _run_finder_with_fallback(client, sel, mp=mp, slice_id=slice_id)
+                label = f"cat {slice_id} band {band_idx + 1}/{n_bands}"
+                finder, note = _run_finder_with_fallback(client, sel, mp=mp, label=label)
                 if note is not None:
                     notes.append(note)
                 if finder is None:
@@ -799,29 +808,30 @@ def _category_ids_for(profile: ResearchProfile, marketplace: str) -> tuple[list[
 
 
 def _run_finder_with_fallback(
-    client: Any, selection: dict[str, Any], *, mp: str, slice_id: int
+    client: Any, selection: dict[str, Any], *, mp: str, label: str
 ) -> tuple[Any, str | None]:
     """Call the Keepa Product Finder; on a rejection (e.g. HTTP 400 from one bad
     optional filter) retry ONCE with only the core selection. Returns
     (FinderResult, note) — note is set when the fallback ran or when both attempts
-    failed (finder is then None). Never raises; one bad filter can't kill a sweep."""
+    failed (finder is then None). Never raises; one bad filter can't kill a sweep.
+    `label` identifies the exact marketplace/category/sub-band for the logs."""
     from delium.providers.base import ProviderError
 
     try:
         return client.product_finder(selection), None
     except ProviderError as exc:
-        log.warning("finder call failed (%s slice %s): %s", mp, slice_id, exc)
+        log.warning("finder call failed (%s %s): %s", mp, label, exc)
         core = _core_finder_selection(selection)
         if core == selection:  # nothing optional left to drop
-            return None, f"finder failed ({mp} slice {slice_id}): {exc}"
+            return None, f"finder failed ({mp} {label}): {exc}"
         try:
             result = client.product_finder(core)
-            note = f"finder retried without optional filters ({mp} slice {slice_id}) after: {exc}"
+            note = f"finder retried without optional filters ({mp} {label}) after: {exc}"
             log.info(note)
             return result, note
         except ProviderError as exc2:
-            log.warning("finder fallback also failed (%s slice %s): %s", mp, slice_id, exc2)
-            return None, f"finder failed even on core selection ({mp} slice {slice_id}): {exc2}"
+            log.warning("finder fallback also failed (%s %s): %s", mp, label, exc2)
+            return None, f"finder failed even on core selection ({mp} {label}): {exc2}"
 
 
 # --- Stage 2: hydrate -------------------------------------------------------

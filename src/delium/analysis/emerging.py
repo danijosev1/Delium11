@@ -190,6 +190,7 @@ def build_finder_selections(
     as_of: date,
     category_ids: list[int],
     per_page: int = 50,
+    per_page_min: int = 1,
     overrides: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     """One Keepa `/query` selection per BSR sub-band (docs/emerging.md sampling).
@@ -197,9 +198,10 @@ def build_finder_selections(
     Splitting [bsr_min, bsr_max] into `sub_bands` log-spaced ranges and sampling
     each fixes the top-edge bias of a single ascending sort (which only ever
     returns the lowest-BSR products). Each sub-band gets an even share of
-    `per_page`; the caller merges the returned ASINs and ranks locally by
-    emergence. `sub_bands = 1` returns a single full-band selection (old behavior).
-    """
+    `per_page` but never below `per_page_min` — the caller passes Keepa's minimum
+    perPage (50) so a narrow split can't drop under the API floor; the caller then
+    merges the returned ASINs and truncates to its target. `sub_bands = 1` returns
+    a single full-band selection (old behavior)."""
     f = data.finder
     ov = overrides or {}
     bsr_min = int(ov.get("bsr_min", f.bsr_min))
@@ -211,11 +213,11 @@ def build_finder_selections(
                 data,
                 as_of=as_of,
                 category_ids=category_ids,
-                per_page=per_page,
+                per_page=max(per_page_min, per_page),
                 overrides=overrides,
             )
         ]
-    per_band = max(1, -(-per_page // bands))  # ceil division, ≥ 1 per band
+    per_band = max(per_page_min, 1, -(-per_page // bands))  # ceil division, ≥ floor
     edges = _log_band_edges(bsr_min, bsr_max, bands)
     selections: list[dict[str, Any]] = []
     for i in range(bands):

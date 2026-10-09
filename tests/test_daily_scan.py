@@ -209,6 +209,24 @@ def test_finder_selection_carries_kill_filters(initialized_db: Path) -> None:
     assert "packageWeight_lte" in sel  # profile max weight pushed into the finder
 
 
+def test_sweep_clamps_per_page_to_keepa_minimum(initialized_db: Path) -> None:
+    # The sweep splits per_slice across 4 sub-bands (~25 each). Every /query must
+    # still request perPage >= 50 (Keepa's floor) — the bug that 400'd the UK scan
+    # with "perPage and page ... too small".
+    import json
+
+    transport = RoutingKeepa(FINDER_ASINS)
+    _run(
+        ScanParams(marketplaces=("US",), sweep_target=150),
+        ScanClients(keepa_factory=_keepa_factory(transport)),
+    )
+    assert transport.finder_params
+    for params in transport.finder_params:
+        sel = json.loads(params["selection"])
+        assert sel["perPage"] >= 50
+        assert (sel["page"] + 1) * sel["perPage"] <= 10000  # within the depth cap
+
+
 # ---------------------------------------------------------------------------
 # Budget abort (before any spend)
 # ---------------------------------------------------------------------------

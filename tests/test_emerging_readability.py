@@ -88,6 +88,20 @@ def test_build_finder_selections_splits_the_bsr_band() -> None:
     assert all(s["perPage"] <= 40 for s in sels)
 
 
+def test_build_finder_selections_floors_per_band_at_the_min() -> None:
+    # Splitting a small sweep (e.g. 150 over 4 sub-bands ⇒ ~38 each) must not drop
+    # below Keepa's perPage minimum; the caller passes per_page_min=50.
+    sels = build_finder_selections(
+        DATA,
+        as_of=date(2026, 6, 1),
+        category_ids=[],
+        per_page=150 // DATA.finder.sub_bands,
+        per_page_min=50,
+    )
+    assert len(sels) == DATA.finder.sub_bands
+    assert all(s["perPage"] == 50 for s in sels)
+
+
 def test_single_sub_band_restores_one_selection() -> None:
     import dataclasses
 

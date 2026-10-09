@@ -44,11 +44,41 @@ KEEPA_TOKEN_URL = "https://api.keepa.com/token"  # token status; costs 0 tokens
 # 10 tokens per request + 1 per 100 ASINs returned.
 _FINDER_BASE_TOKENS = 10
 
+# Keepa Product Finder paging rules (one place; every caller clamps to these).
+# Keepa rejects a /query with HTTP 400 "combination of perPage and page exceeds
+# limit or is too small" when perPage < 50 or when the requested result window
+# (page+1)*perPage runs past the 10,000-result pagination depth. perPage default
+# is 50 (api_backend ProductFinderRequest `perPage = 50`); the ceiling and depth
+# are Keepa's documented deep-pagination cap (keepaapi product_finder: "Keepa
+# limits deep pagination").
+FINDER_PER_PAGE_MIN = 50
+FINDER_PER_PAGE_MAX = 10000
+FINDER_MAX_RESULT_DEPTH = 10000  # (page + 1) * perPage must not exceed this
+
+
+def clamp_finder_per_page(per_page: int) -> int:
+    """perPage clamped into Keepa's allowed [50, 10000] range. A caller that needs
+    fewer ASINs than the minimum still requests the minimum and truncates locally."""
+    return max(FINDER_PER_PAGE_MIN, min(FINDER_PER_PAGE_MAX, int(per_page)))
+
+
+def max_finder_pages(per_page: int) -> int:
+    """How many pages of `per_page` can be fetched before the depth cap. Paging
+    must stop at this many pages: (page + 1) * perPage <= FINDER_MAX_RESULT_DEPTH."""
+    pp = clamp_finder_per_page(per_page)
+    return max(1, FINDER_MAX_RESULT_DEPTH // pp)
+
+
+def finder_depth_ok(page: int, per_page: int) -> bool:
+    """True when fetching `page` (0-based) of `per_page` stays within the cap."""
+    return (page + 1) * clamp_finder_per_page(per_page) <= FINDER_MAX_RESULT_DEPTH
+
 
 def finder_token_estimate(per_page: int) -> int:
     """Estimated Product Finder token cost for one `/query` call returning up to
-    `per_page` ASINs: base 10 + 1 per 100 results (Keepa docs)."""
-    return _FINDER_BASE_TOKENS + ceil(max(0, per_page) / 100)
+    `per_page` ASINs: base 10 + 1 per 100 results (Keepa docs). Uses the clamped
+    perPage so projections match what is actually sent."""
+    return _FINDER_BASE_TOKENS + ceil(clamp_finder_per_page(per_page) / 100)
 
 
 # Keepa timestamps are "Keepa minutes": minutes since the Keepa epoch.
@@ -482,12 +512,25 @@ class KeepaClient:
         selection filter. The selection JSON is passed as a URL parameter; the
         API key is a separate param and is never part of the selection. Response:
         {asinList, totalResults, tokensLeft, tokensConsumed}."""
+        # Safety net: Keepa 400s on perPage < 50 or when the result window runs
+        # past the pagination depth. Clamp perPage here so no caller can send an
+        # out-of-range value; refuse an over-depth page with a clear message
+        # rather than a bare HTTP 400.
+        selection = dict(selection)
+        requested_per_page = int(selection.get("perPage", FINDER_PER_PAGE_MIN))
+        per_page = clamp_finder_per_page(requested_per_page)
+        selection["perPage"] = per_page
+        page = int(selection.get("page", 0))
+        if not finder_depth_ok(page, per_page):
+            raise ProviderResponseError(
+                f"Keepa Product Finder: page {page} × perPage {per_page} exceeds the "
+                f"{FINDER_MAX_RESULT_DEPTH}-result pagination depth; stop paging."
+            )
         params = {
             "key": self._api_key,
             "domain": str(self._domain),
             "selection": json.dumps(selection, separators=(",", ":")),
         }
-        per_page = int(selection.get("perPage", 50))
         self._await_tokens(finder_token_estimate(per_page))
         result = self._request_with_retries(params, url=KEEPA_QUERY_URL)
         return self._parse_finder(result)

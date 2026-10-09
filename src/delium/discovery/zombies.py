@@ -41,7 +41,9 @@ from delium.providers.keepa import (
     _CSV_RATING,
     _CSV_SALES,
     KeepaClient,
+    clamp_finder_per_page,
     finder_token_estimate,
+    max_finder_pages,
     raw_csv_series,
 )
 from delium.utils.logging import get_logger
@@ -170,7 +172,9 @@ def project_costs(params: ZombieParams) -> ZombieCostProjection:
         for m in params.marketplaces
         if m in _NO_KEEPA
     )
-    finder_tokens = len(active) * max(1, params.pages) * finder_token_estimate(params.per_page)
+    pages = min(max(1, params.pages), max_finder_pages(params.per_page))
+    per_page = clamp_finder_per_page(params.per_page)
+    finder_tokens = len(active) * pages * finder_token_estimate(per_page)
     hydrate_tokens = params.sweep_target * 2  # ~2 tokens/product, worst case all missed
     dfs_usd = round(params.top_n * 3 * _DFS_CALL_USD, 2) if params.check_demand else 0.0
     return ZombieCostProjection(finder_tokens, hydrate_tokens, dfs_usd, notes)
@@ -338,11 +342,15 @@ def _sweep_marketplace(
     finder_tokens = 0
     asins: list[str] = []
     seen: set[str] = set()
-    for page in range(max(1, params.pages)):
+    # Clamp perPage to Keepa's [50, 10000] floor/ceiling and never page past the
+    # result-depth cap ((page+1)*perPage <= 10000).
+    per_page = clamp_finder_per_page(params.per_page)
+    pages = min(max(1, params.pages), max_finder_pages(per_page))
+    for page in range(pages):
         if len(asins) >= params.sweep_target:
             break
         selection = build_zombie_finder_selection(
-            cfg, page=page, per_page=params.per_page, category_ids=cat_ids
+            cfg, page=page, per_page=per_page, category_ids=cat_ids
         )
         try:
             finder = client.product_finder(selection)
@@ -359,7 +367,7 @@ def _sweep_marketplace(
         # strict filter can't zero the sweep. Post-hydration Amazon check backstops.
         if not finder.asins and "outOfStockPercentage90_gte" in selection:
             core = build_zombie_finder_selection(
-                cfg, page=page, per_page=params.per_page, category_ids=cat_ids, core_only=True
+                cfg, page=page, per_page=per_page, category_ids=cat_ids, core_only=True
             )
             try:
                 retry = client.product_finder(core)

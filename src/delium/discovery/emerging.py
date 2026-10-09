@@ -43,7 +43,7 @@ from delium.discovery.models import (
 )
 from delium.discovery.pipeline import DfsFactory, KeepaFactory, _evaluate
 from delium.providers.base import ProviderError
-from delium.providers.keepa import KeepaClient, finder_token_estimate
+from delium.providers.keepa import FINDER_PER_PAGE_MIN, KeepaClient, finder_token_estimate
 from delium.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -243,6 +243,7 @@ def run_emerging(
         as_of=as_of,
         category_ids=category_ids,
         per_page=config.emerging.page_size,
+        per_page_min=FINDER_PER_PAGE_MIN,
         overrides=overrides,
     )
     # One finder call per BSR sub-band; merge the ASIN lists (dedup, order-stable)

@@ -713,6 +713,30 @@ def test_pages_option_pulls_multiple_finder_pages(initialized_db: Path) -> None:
     assert {r.asin for r in report.results} == {"B0PAGE0001", "B0PAGE0002"}
 
 
+def test_zombie_paging_capped_by_depth_limit(initialized_db: Path) -> None:
+    # perPage 10000 ⇒ only 1 page fits the 10,000-result depth cap, so a request
+    # for 5 pages is clamped to 1 (never 400s on an over-depth page).
+    from delium.config.models import DeliumConfig
+    from delium.discovery import zombies as zmod
+
+    transport = PagedKeepa(["B0DEPTH001", "B0DEPTH002", "B0DEPTH003"])
+    with get_connection() as conn:
+        zmod.run_zombies(
+            conn,
+            params=zmod.ZombieParams(
+                marketplaces=("UK",), pages=5, per_page=10000, sweep_target=10, top_n=10
+            ),
+            config=DeliumConfig(),
+            clients=zmod.ZombieClients(
+                keepa_factory=lambda mp: KeepaClient(
+                    "k", transport=transport, sleep=lambda _s: None, marketplace=mp
+                )
+            ),
+            as_of=AS_OF,
+        )
+    assert transport.pages_seen == [0]  # capped to a single page by the depth limit
+
+
 def test_category_ids_sliced_into_finder_selection(initialized_db: Path) -> None:
     import json as _json
 
