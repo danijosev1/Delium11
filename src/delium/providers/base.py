@@ -48,6 +48,12 @@ class ProviderResponseError(ProviderError):
     """Unexpected HTTP status or unparseable body."""
 
 
+class ProviderUnsupportedLocationError(ProviderError):
+    """The endpoint does not cover the requested marketplace/location. Raised
+    BEFORE any network call so an unsupported location costs nothing — callers
+    skip the endpoint (e.g. DataForSEO Labs Amazon is US-only)."""
+
+
 @dataclass(frozen=True)
 class HttpResult:
     status: int

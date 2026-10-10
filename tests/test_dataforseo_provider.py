@@ -16,9 +16,12 @@ from delium.providers.base import (
     ProviderNetworkError,
     ProviderRateLimitError,
     ProviderResponseError,
+    ProviderUnsupportedLocationError,
 )
 from delium.providers.dataforseo import (
     DataForSeoClient,
+    labs_amazon_supported,
+    merchant_amazon_supported,
     normalize_keyword_data,
     normalize_phrase,
     normalize_serp,
@@ -165,37 +168,56 @@ def test_dataforseo_unknown_marketplace_rejected() -> None:
 
 
 def test_client_marketplace_sets_location_in_request() -> None:
-    transport = FakePostTransport([ok(volume_body(6000))])
+    # The realistic non-US path is the Merchant Amazon SERP (Labs is US-only); a
+    # UK client must route to UK (2826) with the "en_GB" locale.
+    transport = FakePostTransport([ok(serp_body())])
     client = DataForSeoClient(
-        "login", "pass", transport=transport, sleep=lambda _: None, marketplace="IN"
+        "login", "pass", transport=transport, sleep=lambda _: None, marketplace="UK"
     )
-    assert client.marketplace == "IN"
-    client.search_volume(["baby food tray"])
+    assert client.marketplace == "UK"
+    client.serp("baby food tray")
     _url, body = transport.calls[0]
-    assert body[0]["location_code"] == 2356
-    # Labs endpoint → short ISO code, NOT the "en_IN" locale (the bug that caused
-    # DataForSEO task error 40501 "Invalid Field: 'language_code'").
-    assert body[0]["language_code"] == "en"
+    assert body[0]["location_code"] == 2826
+    assert body[0]["language_code"] == "en_GB"
 
 
-# Expected language_code per endpoint per marketplace (docs-verified 2026-09):
-# the three Labs Amazon endpoints take "en"; the Merchant SERP takes the locale.
-_EXPECTED_LANG = {
-    "US": ("en", "en_US"),
-    "UK": ("en", "en_GB"),
-    "CA": ("en", "en_CA"),
-    "AU": ("en", "en_AU"),
-    "IN": ("en", "en_IN"),
-}
-_LOCATION_CODE = {"US": 2840, "UK": 2826, "CA": 2124, "AU": 2036, "IN": 2356}
+# --- per-endpoint location coverage ---------------------------------------
+# DataForSEO Labs Amazon (volume/related/ranked) is US-only; the Merchant Amazon
+# SERP covers the Amazon storefronts (US/UK/CA/EU). An unsupported marketplace is
+# refused BEFORE any HTTP call, so it never costs anything.
+def test_location_predicates_match_endpoint_coverage() -> None:
+    assert labs_amazon_supported("US") is True
+    for mp in ("UK", "CA", "AU", "IN"):
+        assert labs_amazon_supported(mp) is False
+    # Merchant SERP: the marketplaces Delium wires a location code for and that
+    # the endpoint covers (US/UK/CA). AU/IN are not merchant-served.
+    for mp in ("US", "UK", "CA"):
+        assert merchant_amazon_supported(mp) is True
+    for mp in ("AU", "IN", "ZZ"):
+        assert merchant_amazon_supported(mp) is False
 
 
-@pytest.mark.parametrize("marketplace", ["US", "UK", "CA", "AU", "IN"])
-def test_labs_endpoints_send_iso_language_code(marketplace: str) -> None:
-    """bulk_search_volume / related_keywords / ranked_keywords must send the
-    short ISO language_code ("en"), never the "en_XX" locale."""
-    labs_lang, _serp_lang = _EXPECTED_LANG[marketplace]
-    loc = _LOCATION_CODE[marketplace]
+@pytest.mark.parametrize("marketplace", ["UK", "CA", "AU", "IN"])
+def test_labs_endpoints_refused_for_non_us_without_a_call(marketplace: str) -> None:
+    """The three Labs Amazon endpoints must raise (US-only) before any request —
+    an unsupported location costs nothing (the 40501 'Invalid Field' bug)."""
+    transport = FakePostTransport([ok(volume_body()), ok(related_body()), ok(related_body())])
+    client = DataForSeoClient(
+        "login", "pass", transport=transport, sleep=lambda _: None, marketplace=marketplace
+    )
+    for call in (
+        lambda c: c.search_volume(["baby food tray"]),
+        lambda c: c.related_keywords("baby food tray"),
+        lambda c: c.ranked_keywords("B0AAA00001"),
+    ):
+        with pytest.raises(ProviderUnsupportedLocationError):
+            call(client)
+    assert transport.call_count == 0  # never hit the wire → no DataForSEO cost
+
+
+def test_labs_endpoints_send_iso_language_code() -> None:
+    """For the supported marketplace (US) the three Labs Amazon endpoints send the
+    short ISO language_code ("en"), never the "en_US" locale."""
     for call, response in (
         (lambda c: c.search_volume(["baby food tray"]), volume_body()),
         (lambda c: c.related_keywords("baby food tray"), related_body()),
@@ -203,19 +225,22 @@ def test_labs_endpoints_send_iso_language_code(marketplace: str) -> None:
     ):
         transport = FakePostTransport([ok(response)])
         client = DataForSeoClient(
-            "login", "pass", transport=transport, sleep=lambda _: None, marketplace=marketplace
+            "login", "pass", transport=transport, sleep=lambda _: None, marketplace="US"
         )
         call(client)
         _url, body = transport.calls[0]
-        assert body[0]["location_code"] == loc
-        assert body[0]["language_code"] == labs_lang
+        assert body[0]["location_code"] == 2840
+        assert body[0]["language_code"] == "en"
 
 
-@pytest.mark.parametrize("marketplace", ["US", "UK", "CA", "AU", "IN"])
+# Merchant SERP locale per supported marketplace (docs-verified 2026-10).
+_SERP_LOCALE = {"US": (2840, "en_US"), "UK": (2826, "en_GB"), "CA": (2124, "en_CA")}
+
+
+@pytest.mark.parametrize("marketplace", ["US", "UK", "CA"])
 def test_serp_endpoint_sends_locale_language_code(marketplace: str) -> None:
     """The Merchant Amazon SERP endpoint requires the "en_XX" locale form."""
-    _labs_lang, serp_lang = _EXPECTED_LANG[marketplace]
-    loc = _LOCATION_CODE[marketplace]
+    loc, serp_lang = _SERP_LOCALE[marketplace]
     transport = FakePostTransport([ok(serp_body())])
     client = DataForSeoClient(
         "login", "pass", transport=transport, sleep=lambda _: None, marketplace=marketplace
@@ -224,3 +249,16 @@ def test_serp_endpoint_sends_locale_language_code(marketplace: str) -> None:
     _url, body = transport.calls[0]
     assert body[0]["location_code"] == loc
     assert body[0]["language_code"] == serp_lang
+
+
+@pytest.mark.parametrize("marketplace", ["AU", "IN"])
+def test_serp_refused_for_unsupported_marketplace_without_a_call(marketplace: str) -> None:
+    """A marketplace the Merchant SERP does not cover is refused before any HTTP
+    call — no request, no cost."""
+    transport = FakePostTransport([ok(serp_body())])
+    client = DataForSeoClient(
+        "login", "pass", transport=transport, sleep=lambda _: None, marketplace=marketplace
+    )
+    with pytest.raises(ProviderUnsupportedLocationError):
+        client.serp("baby food tray")
+    assert transport.call_count == 0

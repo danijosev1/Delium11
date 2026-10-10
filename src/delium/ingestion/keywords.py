@@ -25,6 +25,8 @@ from delium.providers.dataforseo import (
     DataForSeoFetch,
     KeywordVolume,
     SerpItem,
+    labs_amazon_supported,
+    merchant_amazon_supported,
     normalize_keyword_data,
     normalize_phrase,
     normalize_serp,
@@ -117,73 +119,118 @@ def fetch_keywords(
     serp_ttl = timedelta(days=config.cache.serp_ttl_days)
     today = datetime.now(UTC).strftime("%Y-%m-%d")
 
-    # 1. Seed search volume — runs first so the seed keyword row exists before
-    #    any serp_ranking (FK) references it.
-    volume_step = _cached_or_fetch(
-        run_id=run_id,
-        endpoint="bulk_search_volume",
-        request_key=_request_key(marketplace, "volume", seed_norm),
-        ttl=kw_ttl,
-        force=force,
-        call=lambda: client.search_volume([seed_norm]),
-    )
-    seed_volume = _seed_volume(normalize_volume(volume_step.body), seed_norm)
-    if volume_step.fetch_id is not None:
-        with get_connection() as conn:
-            repository.upsert_keyword(
-                conn,
-                phrase=seed_norm,
-                fetch_id=volume_step.fetch_id,
-                marketplace=marketplace,
-                volume=seed_volume,
-            )
+    # Endpoint coverage differs by marketplace (one source of truth in the
+    # provider): the Labs Amazon endpoints (volume/related) are US-only, while the
+    # Merchant Amazon SERP covers UK/CA/EU. Skip an unsupported endpoint entirely
+    # — no request, no cost — rather than letting it 400 with "Invalid Field:
+    # 'location_code'".
+    labs_ok = labs_amazon_supported(marketplace)
+    serp_ok = merchant_amazon_supported(marketplace)
+    if not labs_ok:
+        log.info(
+            "fetch_keywords(%s): skipping Labs volume/related — not supported for %s (US-only)",
+            seed_norm,
+            marketplace,
+        )
 
-    # 2. Related keywords.
-    related_step = _cached_or_fetch(
-        run_id=run_id,
-        endpoint="related_keywords",
-        request_key=_request_key(marketplace, "related", seed_norm),
-        ttl=kw_ttl,
-        force=force,
-        call=lambda: client.related_keywords(seed_norm),
-    )
-    related = normalize_keyword_data(related_step.body)
-    if related_step.fetch_id is not None:
-        with get_connection() as conn:
-            for kw in related:
+    seed_volume: int | None = None
+    related: list[KeywordVolume] = []
+    volume_from_cache = True
+    related_from_cache = True
+    volume_cost = 0.0
+    related_cost = 0.0
+
+    # 1. Seed search volume — runs first so the seed keyword row exists before
+    #    any serp_ranking (FK) references it. (Labs Amazon: US only.)
+    if labs_ok:
+        volume_step = _cached_or_fetch(
+            run_id=run_id,
+            endpoint="bulk_search_volume",
+            request_key=_request_key(marketplace, "volume", seed_norm),
+            ttl=kw_ttl,
+            force=force,
+            call=lambda: client.search_volume([seed_norm]),
+        )
+        seed_volume = _seed_volume(normalize_volume(volume_step.body), seed_norm)
+        volume_from_cache = volume_step.from_cache
+        volume_cost = volume_step.cost_usd
+        if volume_step.fetch_id is not None:
+            with get_connection() as conn:
                 repository.upsert_keyword(
                     conn,
-                    phrase=kw.phrase,
-                    fetch_id=related_step.fetch_id,
+                    phrase=seed_norm,
+                    fetch_id=volume_step.fetch_id,
                     marketplace=marketplace,
-                    volume=kw.volume,
+                    volume=seed_volume,
                 )
 
-    # 3. SERP.
-    serp_step = _cached_or_fetch(
-        run_id=run_id,
-        endpoint="amazon_serp",
-        request_key=_request_key(marketplace, "serp", seed_norm),
-        ttl=serp_ttl,
-        force=force,
-        call=lambda: client.serp(seed_norm),
-    )
-    serp = normalize_serp(serp_step.body)
-    if serp_step.fetch_id is not None:
-        with get_connection() as conn:
-            for item in serp:
-                repository.upsert_serp_ranking(
-                    conn,
-                    keyword_phrase=seed_norm,
-                    asin=item.asin,
-                    position=item.position,
-                    sponsored=item.sponsored,
-                    captured_on=today,
-                    marketplace=marketplace,
-                )
+    # 2. Related keywords. (Labs Amazon: US only.)
+    if labs_ok:
+        related_step = _cached_or_fetch(
+            run_id=run_id,
+            endpoint="related_keywords",
+            request_key=_request_key(marketplace, "related", seed_norm),
+            ttl=kw_ttl,
+            force=force,
+            call=lambda: client.related_keywords(seed_norm),
+        )
+        related = normalize_keyword_data(related_step.body)
+        related_from_cache = related_step.from_cache
+        related_cost = related_step.cost_usd
+        if related_step.fetch_id is not None:
+            with get_connection() as conn:
+                for kw in related:
+                    repository.upsert_keyword(
+                        conn,
+                        phrase=kw.phrase,
+                        fetch_id=related_step.fetch_id,
+                        marketplace=marketplace,
+                        volume=kw.volume,
+                    )
 
-    from_cache = volume_step.from_cache and related_step.from_cache and serp_step.from_cache
-    total_cost = volume_step.cost_usd + related_step.cost_usd + serp_step.cost_usd
+    # 3. SERP (Merchant Amazon: US/UK/CA/EU).
+    serp: list[SerpItem] = []
+    serp_from_cache = True
+    serp_cost = 0.0
+    if serp_ok:
+        serp_step = _cached_or_fetch(
+            run_id=run_id,
+            endpoint="amazon_serp",
+            request_key=_request_key(marketplace, "serp", seed_norm),
+            ttl=serp_ttl,
+            force=force,
+            call=lambda: client.serp(seed_norm),
+        )
+        serp = normalize_serp(serp_step.body)
+        serp_from_cache = serp_step.from_cache
+        serp_cost = serp_step.cost_usd
+        if serp_step.fetch_id is not None:
+            with get_connection() as conn:
+                # When Labs was skipped (non-US) the seed keyword row was never
+                # created by steps 1/2, but serp_rankings FK-references it. Attribute
+                # the row to the SERP fetch itself (a logged raw_fetch) — keywords.
+                # fetch_id is NOT NULL, so there is always a real fetch behind it.
+                if not labs_ok:
+                    repository.upsert_keyword(
+                        conn,
+                        phrase=seed_norm,
+                        fetch_id=serp_step.fetch_id,
+                        marketplace=marketplace,
+                        volume=None,
+                    )
+                for item in serp:
+                    repository.upsert_serp_ranking(
+                        conn,
+                        keyword_phrase=seed_norm,
+                        asin=item.asin,
+                        position=item.position,
+                        sponsored=item.sponsored,
+                        captured_on=today,
+                        marketplace=marketplace,
+                    )
+
+    from_cache = volume_from_cache and related_from_cache and serp_from_cache
+    total_cost = volume_cost + related_cost + serp_cost
     log.info(
         "fetch_keywords(%s): %d related, %d serp, cache=%s, cost=$%.4f",
         seed_norm,

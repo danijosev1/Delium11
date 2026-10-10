@@ -50,6 +50,7 @@ from delium.discovery.assembly import build_scoring_input
 from delium.discovery.dedupe import group_by_parent
 from delium.profile.models import ResearchProfile
 from delium.utils.logging import get_logger
+from delium.utils.text import title_to_keyword
 
 log = get_logger(__name__)
 
@@ -286,6 +287,11 @@ class ScanReport:
     funnel: dict[str, int] = field(default_factory=dict)
     stages: list[dict[str, Any]] = field(default_factory=list)
     finalists: list[dict[str, Any]] = field(default_factory=list)
+    # Per-reason counts for every candidate that did NOT reach the finalists, and
+    # the scored-but-not-finalist survivors themselves (so "0 finalists" is always
+    # explained, never silent).
+    breakdown: dict[str, int] = field(default_factory=dict)
+    unranked: list[dict[str, Any]] = field(default_factory=list)
     categories: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     keepa_tokens: int = 0
@@ -1042,7 +1048,9 @@ def _stage_competitor_sets(
     for c in top:
         asin, mp = c["asin"], c["marketplace"]
         conn.commit()  # release the write lock before ingestion opens its own connection
-        seed = _main_keyword(conn, asin, mp)
+        kw = _main_keyword(conn, asin, mp)
+        seed = kw[0] if kw is not None else None
+        kw_source = kw[1] if kw is not None else None
         if seed is not None and clients.dfs_factory is not None:
             try:
                 fetch_keywords(seed, run_id=run_id, client=clients.dfs_factory(mp), config=config)
@@ -1085,6 +1093,8 @@ def _stage_competitor_sets(
                 "incumbent_freshness": ls.incumbent_freshness,
                 "launchability_reason": ls.reason,
                 "competitors": len(comps),
+                "keyword": seed,
+                "keyword_source": kw_source,
             }
         )
         built += 1
@@ -1102,16 +1112,21 @@ def _stage_competitor_sets(
     return _StageOut(input_count=len(scored), output_count=built)
 
 
-def _main_keyword(conn: sqlite3.Connection, asin: str, marketplace: str) -> str | None:
+def _main_keyword(conn: sqlite3.Connection, asin: str, marketplace: str) -> tuple[str, str] | None:
+    """Best seed keyword for a product's competitor-set SERP, and where it came
+    from. Prefers a phrase that already ranked this ASIN (source 'serp'); else
+    derives a deterministic phrase from the title (source 'title'). The title
+    fallback matters outside the US, where DataForSEO Labs reverse-ASIN is
+    unsupported, so a known ranking phrase is rarely available. Returns None only
+    when neither a SERP phrase nor a title exists."""
     phrases = repository.get_serp_keyword_phrases(conn, asin, marketplace)
     if phrases:
-        return phrases[0]
+        return phrases[0], "serp"
     row = repository.get_product(conn, asin, marketplace)
     title = row["title"] if row is not None else None
-    if not title:
-        return None
-    words = [w for w in title.split() if w.isalnum() or "-" in w][:4]
-    return " ".join(words) or None
+    brand = _row_get(row, "brand") if row is not None else None
+    seed = title_to_keyword(title, brand)
+    return (seed, "title") if seed is not None else None
 
 
 # --- Stage 6: rank (sellability) -------------------------------------------
@@ -1137,15 +1152,35 @@ def _stage_rank(
         facts = _loads(c["data"]) or {}
         hist = repository.get_price_bsr_history(conn, asin)
         momentum = product_momentum_score(_own_review_velocity(hist, as_of), weights)
-        eligible = (c["verdict"] or "") != "avoid"
+        # Survivors already cleared the hard kills (killed candidates were removed
+        # at stage 3), so every one of them is eligible to be RANKED by sellability
+        # — "missing = unknown". A product merely missing competition or
+        # differentiation evidence is still ranked on what IS known (its
+        # opportunity score), just with LOW confidence; it is NOT dropped. The
+        # cheap-score verdict ("avoid" from thin data / unavailable gates) is not a
+        # kill and must never exclude a survivor here, which was the bug that
+        # returned zero finalists.
         si = SellabilityInput(
             opportunity_score=c["opportunity_score"],
             price_headroom=facts.get("price_headroom"),
             incumbent_freshness=facts.get("incumbent_freshness"),
             product_momentum=momentum,
-            eligible=eligible,
+            eligible=True,
         )
         ss = compute_sellability(si, weights)
+        meets_conf = _CONF_RANK[ss.confidence] >= _CONF_RANK[params.min_confidence]
+        if ss.score is None:
+            reason = (
+                "Unranked — not enough signal to score sellability "
+                "(no opportunity score yet; needs competition/price evidence)."
+            )
+        elif not meets_conf:
+            reason = (
+                f"Unranked — {ss.confidence.value} confidence is below the "
+                f"{params.min_confidence.value} minimum. {ss.reason}"
+            )
+        else:
+            reason = ss.reason
         repository.upsert_scan_candidate(
             conn,
             scan_id=scan_id,
@@ -1155,11 +1190,23 @@ def _stage_rank(
             stage_reached=6,
             sellability=ss.score,
             confidence=ss.confidence.value,
-            reason=ss.reason,
+            reason=reason,
         )
-        if ss.score is not None and _CONF_RANK[ss.confidence] >= _CONF_RANK[params.min_confidence]:
+        if ss.score is not None and meets_conf:
             ranked_rows.append((ss.score, asin, c))
     ranked_rows.sort(key=lambda t: (-t[0], t[1]))
+    # Survivors that scored but ranked below the top-N cutoff are not finalists;
+    # record why so the report explains every non-finalist, never a silent drop.
+    for pos, (_s, asin, c) in enumerate(ranked_rows[params.top_n :], start=params.top_n + 1):
+        repository.upsert_scan_candidate(
+            conn,
+            scan_id=scan_id,
+            asin=asin,
+            marketplace=c["marketplace"],
+            outcome=c["outcome"],
+            stage_reached=6,
+            reason=f"Ranked #{pos} by sellability — below the top {params.top_n} finalist cutoff.",
+        )
     for i, (_score, asin, c) in enumerate(ranked_rows[: params.top_n], start=1):
         repository.upsert_scan_candidate(
             conn,
@@ -1200,7 +1247,10 @@ def _stage_finalists(
         facts = _loads(c["data"]) or {}
         opp = c["opportunity_score"]
         diff_status = "pending"
-        eligible = (c["verdict"] or "") != "avoid"
+        # A finalist already passed the hard kills; it is eligible unless the
+        # enricher's full validate pass (real reviews + profit + gates) finds a
+        # genuine gate failure. The cheap verdict is not used to exclude here.
+        eligible = True
         if clients.enrich_finalist is not None and idx < enrich_cap:
             conn.commit()  # the enricher runs the validation pipeline on its own connection
             er = clients.enrich_finalist(asin, mp, run_id)
@@ -1299,6 +1349,7 @@ def build_report(conn: sqlite3.Connection, scan_id: str) -> ScanReport:
         "competitor_set": sum(1 for c in all_c if c["launchability"] is not None),
         "finalists": len(inbox),
     }
+    breakdown, unranked = _exclusion_breakdown(all_c)
     return ScanReport(
         scan_id=scan_id,
         status=scan["status"],
@@ -1331,6 +1382,8 @@ def build_report(conn: sqlite3.Connection, scan_id: str) -> ScanReport:
             }
             for c in inbox
         ],
+        breakdown=breakdown,
+        unranked=unranked,
         categories=[
             {"category": c["category"], "score": c["momentum_score"], "reason": c["reason"]}
             for c in cats
@@ -1340,3 +1393,58 @@ def build_report(conn: sqlite3.Connection, scan_id: str) -> ScanReport:
         data_usd=round(float(scan["data_usd"]), 4),
         llm_usd=round(float(scan["llm_usd"]), 4),
     )
+
+
+def _exclusion_breakdown(
+    all_c: list[sqlite3.Row],
+) -> tuple[dict[str, int], list[dict[str, Any]]]:
+    """Explain every candidate that did NOT reach the finalists, so a scan that
+    yields few or zero finalists is never a silent dead end.
+
+    Returns (breakdown, unranked):
+      * breakdown — per-reason counts across the whole funnel tail (hard kills by
+        rule, never-scored, scored-but-unrankable, ranked-below-cutoff).
+      * unranked  — the scored survivors that didn't become finalists, best
+        sellability first, each with the reason recorded at ranking time. These
+        passed the hard kills; they are candidates needing more evidence or a
+        higher rank, NOT rejects."""
+    breakdown: dict[str, int] = {}
+    unranked: list[dict[str, Any]] = []
+
+    def bump(key: str) -> None:
+        breakdown[key] = breakdown.get(key, 0) + 1
+
+    for c in all_c:
+        outcome = c["outcome"]
+        if outcome == "finalist":
+            continue
+        if outcome == "killed":
+            bump(f"hard kill: {c['kill_rule'] or 'rule'}")
+        elif outcome == "swept":
+            bump("swept — not hydrated")
+        elif outcome == "hydrated":
+            bump("survived kills — not scored (no scoring input)")
+        elif outcome in ("scored", "competitor_set", "ranked"):
+            reason = c["reason"] or ""
+            if c["sellability"] is None:
+                bump("scored — unrankable (needs evidence)")
+            elif reason.startswith("Ranked #"):
+                bump("ranked — below finalist cutoff")
+            elif "confidence is below" in reason:
+                bump("scored — below the confidence floor")
+            else:
+                bump("scored — not a finalist")
+            unranked.append(
+                {
+                    "asin": c["asin"],
+                    "marketplace": c["marketplace"],
+                    "sellability": c["sellability"],
+                    "confidence": c["confidence"],
+                    "reason": c["reason"],
+                }
+            )
+        else:
+            bump(f"other: {outcome}")
+
+    unranked.sort(key=lambda u: (u["sellability"] is None, -(u["sellability"] or 0.0), u["asin"]))
+    return breakdown, unranked

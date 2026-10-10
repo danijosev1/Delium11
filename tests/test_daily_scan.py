@@ -555,3 +555,73 @@ def test_min_confidence_high_filters_finalists(initialized_db: Path) -> None:
     )
     assert report.funnel["finalists"] == 0
     assert report.status == "complete"
+    # But a HIGH floor must not make the scan a silent dead end: the three scored
+    # survivors are explained (below the confidence floor) and surfaced as unranked
+    # candidates needing evidence — never dropped without a reason.
+    assert report.breakdown.get("scored — below the confidence floor") == 3
+    assert len(report.unranked) == 3
+    assert all(
+        "confidence is below the high minimum" in u["reason"].lower() for u in report.unranked
+    )
+
+
+# ---------------------------------------------------------------------------
+# FIX 2 — rank eligibility: a survivor with an "avoid" verdict (thin data /
+# unavailable gates, NOT a hard kill) is still RANKED by sellability, with LOW
+# confidence. This is the bug that turned 78 scored → 0 finalists.
+# ---------------------------------------------------------------------------
+def test_avoid_verdict_survivor_is_still_ranked(initialized_db: Path) -> None:
+    from delium.discovery.daily_scan import _stage_rank
+
+    with get_connection() as conn:
+        profile = _profile(conn)
+        run_id = repository.insert_run(conn, command="scan", input_="US")
+        scan_id = repository.create_scan(
+            conn,
+            run_id=run_id,
+            marketplaces=["US"],
+            profile_id=profile.id,
+            profile_name=profile.name,
+            params="{}",
+        )
+        # A survivor that passed the hard kills but was marked AVOID at cheap
+        # scoring (e.g. an unavailable gate on thin data). It has a real cheap score.
+        repository.upsert_scan_candidate(
+            conn,
+            scan_id=scan_id,
+            asin="B0AVOID0001",
+            marketplace="US",
+            outcome="scored",
+            stage_reached=4,
+            cheap_score=62.0,
+            opportunity_score=62.0,
+            confidence="low",
+            verdict="avoid",
+        )
+        conn.commit()
+
+        out = _stage_rank(conn, scan_id, ScanParams(marketplaces=("US",), top_n=5), CFG, profile)
+
+        assert out.output_count == 1  # the AVOID survivor was ranked, not dropped
+        ranked = repository.get_scan_candidates(conn, scan_id, outcome="ranked")
+        assert [c["asin"] for c in ranked] == ["B0AVOID0001"]
+        row = ranked[0]
+        assert row["sellability"] is not None  # scored on what IS known (opportunity)
+        assert row["confidence"] == "low"  # missing signals → LOW badge, not exclusion
+        assert row["rank"] == 1
+
+
+def test_report_breakdown_explains_every_non_finalist(initialized_db: Path) -> None:
+    # top_n=1 over three survivors: 1 finalist, 2 ranked-below-cutoff. The report
+    # must always account for the non-finalists.
+    transport = RoutingKeepa(FINDER_ASINS)
+    report = _run(
+        ScanParams(marketplaces=("US",), top_n=1, sweep_target=50),
+        ScanClients(keepa_factory=_keepa_factory(transport)),
+    )
+    assert report.funnel["finalists"] == 1
+    assert report.breakdown.get("ranked — below finalist cutoff") == 2
+    assert len(report.unranked) == 2
+    assert all("finalist cutoff" in u["reason"] for u in report.unranked)
+    # Every unranked row is inspectable (has an ASIN + marketplace for a link).
+    assert all(u["asin"] and u["marketplace"] == "US" for u in report.unranked)

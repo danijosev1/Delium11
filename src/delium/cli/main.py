@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from delium import __version__
 from delium.config import ConfigError, load_config
@@ -1745,18 +1746,51 @@ def _render_scan(report: object) -> None:
     for f in report.finalists:
         sell = "—" if f["sellability"] is None else f"{f['sellability']:.0f}"
         console.print(
-            f"  {f['rank']:>2}. [green]{f['asin']}[/green] [{f['marketplace']}]  "
+            f"  {f['rank']:>2}. [green]{escape(f['asin'])}[/green] [{escape(f['marketplace'])}]  "
             f"sellability {sell} · {f['confidence']} conf · diff {f['differentiation']}"
         )
         _url = amazon_url(f["asin"], f["marketplace"])
         if _url:
             console.print(f"      {_url}", markup=False)
         if f["reason"]:
-            console.print(f"      [dim]{f['reason']}[/dim]", markup=False)
+            console.print(f"      [dim]{escape(str(f['reason']))}[/dim]")
+
+    # Always explain the funnel tail — anything that did not reach the finalists.
+    if report.breakdown:
+        console.print("\n[bold]Not finalists — why[/bold]:")
+        for reason, n in sorted(report.breakdown.items(), key=lambda kv: (-kv[1], kv[0])):
+            console.print(f"  {n:>4} · {escape(reason)}")
+
+    # Scored survivors that passed the hard kills but didn't make the cutoff (or
+    # need more evidence). Shown with links so they're easy to inspect — these are
+    # candidates, not rejects. Cap the printed rows; the breakdown has full counts.
+    if report.unranked:
+        shown = report.unranked[:15]
+        console.print(
+            f"\n[bold]Unranked — needs evidence or a higher rank[/bold] "
+            f"(top {len(shown)} of {len(report.unranked)}):"
+        )
+        for u in shown:
+            sell = "—" if u["sellability"] is None else f"{u['sellability']:.0f}"
+            conf = u["confidence"] or "—"
+            console.print(
+                f"  [yellow]{escape(u['asin'])}[/yellow] [{escape(u['marketplace'])}]  "
+                f"sellability {sell} · {conf} conf"
+            )
+            _url = amazon_url(u["asin"], u["marketplace"])
+            if _url:
+                console.print(f"      {_url}", markup=False)
+            if u["reason"]:
+                console.print(f"      [dim]{escape(str(u['reason']))}[/dim]")
+
     console.print("\n[bold]Emerging categories[/bold]:")
+    if not report.categories:
+        console.print("  [dim]none[/dim]")
     for c in report.categories:
         score = "—" if c["score"] is None else f"{c['score']:.0f}"
-        console.print(f"  [cyan]{c['category']}[/cyan] {score}/100 — {c['reason']}", markup=False)
+        console.print(
+            f"  [cyan]{escape(str(c['category']))}[/cyan] {score}/100 — {escape(str(c['reason']))}"
+        )
 
 
 @app.command()

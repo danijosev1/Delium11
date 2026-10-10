@@ -28,6 +28,7 @@ from delium.providers.base import (
     ProviderNetworkError,
     ProviderRateLimitError,
     ProviderResponseError,
+    ProviderUnsupportedLocationError,
     UrllibTransport,
 )
 from delium.utils.logging import get_logger
@@ -78,6 +79,36 @@ def dataforseo_location(marketplace: str) -> tuple[int, str, str]:
             f"DataForSEO: unsupported marketplace {marketplace!r} "
             f"(known: {', '.join(sorted(_MARKETPLACE_LOCATIONS))})."
         ) from exc
+
+
+# Per-endpoint location coverage (official DataForSEO docs, verified 2026-10):
+#   - DataForSEO Labs Amazon (bulk_search_volume / related_keywords /
+#     ranked_keywords): "Amazon and Bing locations and languages are currently
+#     limited to the US/English" → US only. A non-US location_code returns task
+#     error 40501 "Invalid Field: 'location_code'".
+#     (docs.dataforseo.com/v3/dataforseo_labs/locations_and_languages/)
+#   - Merchant Amazon SERP (merchant/amazon/products/live/advanced) covers the
+#     Amazon storefront marketplaces (US, UK, CA, DE, FR, IT, ES, …).
+#     (docs.dataforseo.com/v3/merchant/amazon/locations/)
+# The merchant set is intersected with the marketplaces Delium actually wires a
+# location code for (`_MARKETPLACE_LOCATIONS`): US/UK/CA today. DataForSEO merchant
+# covers more storefronts, but a marketplace with no location-code mapping cannot
+# be addressed, so claiming it here would be false. AU/IN are deliberately absent
+# — the merchant endpoint does not serve those Amazon stores.
+_LABS_AMAZON_LOCATIONS: frozenset[str] = frozenset({"US"})
+_MERCHANT_AMAZON_LOCATIONS: frozenset[str] = frozenset({"US", "UK", "CA"})
+
+
+def labs_amazon_supported(marketplace: str) -> bool:
+    """True when the DataForSEO Labs Amazon endpoints cover this marketplace
+    (US-only today). Callers check this to SKIP the call entirely for others —
+    no request, no cost."""
+    return marketplace in _LABS_AMAZON_LOCATIONS
+
+
+def merchant_amazon_supported(marketplace: str) -> bool:
+    """True when the Merchant Amazon SERP endpoint covers this marketplace."""
+    return marketplace in _MERCHANT_AMAZON_LOCATIONS
 
 
 # DataForSEO status codes in [20000, 30000) are success.
@@ -256,6 +287,15 @@ class DataForSeoClient:
     def marketplace(self) -> str:
         return self._marketplace
 
+    def _require_labs(self) -> None:
+        """Guard the Labs Amazon endpoints (US-only). Raises BEFORE any HTTP call,
+        so an unsupported marketplace never spends."""
+        if not labs_amazon_supported(self._marketplace):
+            raise ProviderUnsupportedLocationError(
+                f"DataForSEO Labs Amazon endpoints are US-only; {self._marketplace!r} is not "
+                "supported (no call made)."
+            )
+
     @classmethod
     def from_env(
         cls,
@@ -281,6 +321,7 @@ class DataForSeoClient:
     def search_volume(self, keywords: Sequence[str]) -> DataForSeoFetch:
         if not keywords:
             raise ValueError("search_volume requires at least one keyword.")
+        self._require_labs()
         body = [
             {
                 "keywords": [normalize_phrase(k) for k in keywords],
@@ -297,6 +338,7 @@ class DataForSeoClient:
         )
 
     def related_keywords(self, seed: str, *, depth: int = 2, limit: int = 100) -> DataForSeoFetch:
+        self._require_labs()
         body = [
             {
                 "keyword": normalize_phrase(seed),
@@ -316,6 +358,7 @@ class DataForSeoClient:
 
     def ranked_keywords(self, asin: str, *, limit: int = 100) -> DataForSeoFetch:
         """Reverse-ASIN: keywords a given ASIN ranks for."""
+        self._require_labs()
         body = [
             {
                 "asin": asin,
@@ -333,6 +376,10 @@ class DataForSeoClient:
         )
 
     def serp(self, keyword: str) -> DataForSeoFetch:
+        if not merchant_amazon_supported(self._marketplace):
+            raise ProviderUnsupportedLocationError(
+                f"DataForSEO Merchant Amazon SERP does not cover {self._marketplace!r}."
+            )
         body = [
             {
                 "keyword": normalize_phrase(keyword),
