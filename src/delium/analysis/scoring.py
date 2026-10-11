@@ -23,6 +23,7 @@ from delium.analysis.curves import clamp, norm
 from delium.analysis.models import (
     Confidence,
     ConfigSnapshot,
+    GateEligibility,
     GateResult,
     KillResult,
     PillarScore,
@@ -891,6 +892,38 @@ def _decide_verdict(
     if not basis:
         basis.append(f"score {score:.1f} in Test band [{v.test_min:.0f}, {v.buy_min:.0f})")
     return Verdict.TEST, tuple(basis)
+
+
+# hard gate → the pillar whose availability says whether its evidence was PRESENT.
+# A hard gate not mapped here is treated as present-evidence when it fails (there
+# are none today beyond G1/G3; G5 is handled separately — it never forces AVOID).
+_HARD_GATE_PILLAR = {"G1": "profitability", "G3": "risk"}
+
+
+def gate_eligibility(scored: ScoredOpportunity) -> GateEligibility:
+    """Classify a scored opportunity's HARD-gate failures (scoring-model §10) for
+    the sellability stage: a gate that failed on PRESENT evidence (e.g. G1 with a
+    real profit model whose margin/ROI/payback is below threshold) is a genuine
+    disqualification → EXCLUDE; a gate that failed only because its input was
+    MISSING (no profit model, no risk report) is "missing = unknown" → still
+    rankable, named in `pending_gates` for a 'pending' label.
+
+    G5 (Strategist) is ignored — it only ever blocks a would-be Buy, never forces
+    AVOID, so it must not exclude from ranking. Pure (no I/O, no config)."""
+    available = {p.pillar: p.available for p in scored.pillars}
+    pending: list[str] = []
+    for g in scored.gates:
+        if not g.hard or g.gate_id == "G5" or g.passed is not False:
+            continue
+        pillar = _HARD_GATE_PILLAR.get(g.gate_id)
+        evidence_present = available.get(pillar, True) if pillar is not None else True
+        if evidence_present:
+            actual = g.actual or "fails"
+            threshold = g.threshold or "threshold"
+            reason = f"gate failed: {g.gate_id} {g.name} ({actual} vs required {threshold})"
+            return GateEligibility(g.gate_id, reason, tuple(pending))
+        pending.append(g.gate_id)
+    return GateEligibility(None, None, tuple(pending))
 
 
 # ---------------------------------------------------------------------------

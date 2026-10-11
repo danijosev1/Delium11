@@ -36,8 +36,8 @@ from delium.analysis.emerging import (
     load_emerging_data,
 )
 from delium.analysis.launchability import Competitor, compute_launchability, load_launchability_data
-from delium.analysis.models import Confidence, Marketplace
-from delium.analysis.scoring import score_opportunity
+from delium.analysis.models import Confidence, GateEligibility, Marketplace
+from delium.analysis.scoring import gate_eligibility, score_opportunity
 from delium.analysis.sellability import (
     SellabilityInput,
     compute_sellability,
@@ -972,6 +972,28 @@ def _monthly_sold(conn: sqlite3.Connection, asin: str, marketplace: str) -> int 
     return _row_get(row, "monthly_sold") if row is not None else None
 
 
+def _gate_block_facts(elig: GateEligibility) -> dict[str, str] | None:
+    """The JSON-serializable gate-block record stored on a candidate when a hard
+    gate failed on PRESENT evidence (→ excluded from ranking). None otherwise."""
+    if not elig.excluded:
+        return None
+    return {"gate": elig.blocked_gate or "", "reason": elig.blocked_reason or "gate failed"}
+
+
+# Hard-gate id → the evidence a ranked-but-pending candidate is still waiting on.
+_PENDING_EVIDENCE = {"G1": "profit model", "G3": "risk report"}
+
+
+def _pending_label(pending: object) -> str:
+    """A ' pending: <evidence>' suffix for a ranked survivor whose hard gate(s)
+    could not be evaluated for lack of input ("missing = unknown"). Empty when
+    nothing is pending."""
+    if not isinstance(pending, list) or not pending:
+        return ""
+    names = [_PENDING_EVIDENCE.get(str(g), str(g)) for g in pending]
+    return " pending: " + ", ".join(names)
+
+
 # --- Stage 4: cheap scoring -------------------------------------------------
 def _stage_cheap_score(
     conn: sqlite3.Connection, scan_id: str, config: DeliumConfig, profile: ResearchProfile
@@ -994,6 +1016,7 @@ def _stage_cheap_score(
         if inp is None:
             continue
         scored = score_opportunity(inp, config)
+        elig = gate_eligibility(scored)
         facts = {
             "category": prod["category_path"] if prod is not None else None,
             "price_cents": price,
@@ -1002,6 +1025,12 @@ def _stage_cheap_score(
             "age_days": _age_days(hist, as_of),
             "emergence": _emergence_score(conn, asin, as_of, config),
             "review_velocity": _own_review_velocity(hist, as_of),
+            # A hard gate that failed on PRESENT evidence (e.g. G1 with a real
+            # profit model below threshold) is a genuine disqualification — it must
+            # exclude the product from ranking, never ride through as an unvalidated
+            # finalist. A gate that failed only for a MISSING input is "unknown".
+            "gate_block": _gate_block_facts(elig),
+            "gate_pending": list(elig.pending_gates),
         }
         scored_n += 1
         repository.upsert_scan_candidate(
@@ -1077,7 +1106,18 @@ def _stage_competitor_sets(
         inp, _ = build_scoring_input(
             conn, asin, Marketplace(mp), config, profit_overrides=overrides
         )
-        opp = score_opportunity(inp, config).score if inp is not None else c["opportunity_score"]
+        facts = _loads(c["data"]) or {}
+        if inp is not None:
+            scored_opp = score_opportunity(inp, config)
+            opp = scored_opp.score
+            # Re-evaluate the gate block now the competition/risk evidence exists —
+            # a gate that was 'pending' on missing data may now be a real pass or a
+            # real fail, and a real fail here must exclude (never ride through).
+            elig = gate_eligibility(scored_opp)
+            facts["gate_block"] = _gate_block_facts(elig)
+            facts["gate_pending"] = list(elig.pending_gates)
+        else:
+            opp = c["opportunity_score"]
         comps = [_build_competitor(conn, a, mp, as_of) for a in comp_asins]
         target_price = _target_price_cents(profile, price)
         ls = compute_launchability(
@@ -1086,7 +1126,6 @@ def _stage_competitor_sets(
             thresholds=launch_data,
             established_brands=frozenset(emerging.established_brands),
         )
-        facts = _loads(c["data"]) or {}
         facts.update(
             {
                 "price_headroom": ls.price_headroom,
@@ -1152,14 +1191,32 @@ def _stage_rank(
         facts = _loads(c["data"]) or {}
         hist = repository.get_price_bsr_history(conn, asin)
         momentum = product_momentum_score(_own_review_velocity(hist, as_of), weights)
-        # Survivors already cleared the hard kills (killed candidates were removed
-        # at stage 3), so every one of them is eligible to be RANKED by sellability
-        # — "missing = unknown". A product merely missing competition or
-        # differentiation evidence is still ranked on what IS known (its
-        # opportunity score), just with LOW confidence; it is NOT dropped. The
-        # cheap-score verdict ("avoid" from thin data / unavailable gates) is not a
-        # kill and must never exclude a survivor here, which was the bug that
-        # returned zero finalists.
+        # Survivors already cleared the hard KILLS (killed candidates were removed
+        # at stage 3). Sellability then ranks them on what IS known — "missing =
+        # unknown": a product merely missing competition/differentiation evidence
+        # is still ranked (its opportunity score), just with LOW confidence. The
+        # ONE exception is a hard GATE that failed on PRESENT evidence (e.g. G1 with
+        # a real profit model whose margin is below threshold) — that is a genuine
+        # disqualification, recorded at scoring time, and it must exclude the
+        # product so an unprofitable item never rides through as an unvalidated
+        # finalist. A gate that failed only for a MISSING input does not exclude.
+        block = facts.get("gate_block")
+        if isinstance(block, dict):
+            ss = compute_sellability(
+                SellabilityInput(opportunity_score=c["opportunity_score"], eligible=False), weights
+            )
+            repository.upsert_scan_candidate(
+                conn,
+                scan_id=scan_id,
+                asin=asin,
+                marketplace=mp,
+                outcome=c["outcome"],
+                stage_reached=6,
+                sellability=None,
+                confidence=ss.confidence.value,
+                reason=f"Excluded — {block.get('reason', 'gate failed')}.",
+            )
+            continue
         si = SellabilityInput(
             opportunity_score=c["opportunity_score"],
             price_headroom=facts.get("price_headroom"),
@@ -1180,7 +1237,7 @@ def _stage_rank(
                 f"{params.min_confidence.value} minimum. {ss.reason}"
             )
         else:
-            reason = ss.reason
+            reason = ss.reason + _pending_label(facts.get("gate_pending"))
         repository.upsert_scan_candidate(
             conn,
             scan_id=scan_id,
@@ -1426,7 +1483,14 @@ def _exclusion_breakdown(
             bump("survived kills — not scored (no scoring input)")
         elif outcome in ("scored", "competitor_set", "ranked"):
             reason = c["reason"] or ""
-            if c["sellability"] is None:
+            if reason.startswith("Excluded — gate failed:"):
+                # "...gate failed: G1 Profit gate (…)" → group by the gate id; the
+                # full reason with the numbers stays on the unranked row below.
+                gate = reason.split("gate failed:", 1)[1].strip().split(" ", 1)[0]
+                bump(f"excluded — gate failed ({gate})")
+            elif reason.startswith("Excluded —"):
+                bump("excluded — did not pass a gate")
+            elif c["sellability"] is None:
                 bump("scored — unrankable (needs evidence)")
             elif reason.startswith("Ranked #"):
                 bump("ranked — below finalist cutoff")

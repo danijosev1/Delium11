@@ -1033,6 +1033,23 @@ class ScoredOpportunity:
         return self.verdict is Verdict.AVOID and not self.insufficient_data
 
 
+@dataclass(frozen=True)
+class GateEligibility:
+    """Why a scored opportunity should be RANKED or EXCLUDED at the sellability
+    stage, distinguishing a hard gate that failed on PRESENT evidence (a real
+    disqualification → exclude) from one that failed only because an input was
+    MISSING ("missing = unknown" → still rankable, with a 'pending' label). A
+    survivor has already cleared the hard kills; this decides the gate half."""
+
+    blocked_gate: str | None  # e.g. "G1" — a hard gate failed on evidence that was present
+    blocked_reason: str | None  # human reason with the numbers, or None
+    pending_gates: tuple[str, ...]  # hard gates that failed only for a missing input
+
+    @property
+    def excluded(self) -> bool:
+        return self.blocked_gate is not None
+
+
 # ---------------------------------------------------------------------------
 # Cross-market discovery engine (docs/cross-market.md). Detects products proven
 # in one Amazon marketplace that look underpenetrated but credibly demanded in

@@ -625,3 +625,116 @@ def test_report_breakdown_explains_every_non_finalist(initialized_db: Path) -> N
     assert all("finalist cutoff" in u["reason"] for u in report.unranked)
     # Every unranked row is inspectable (has an ASIN + marketplace for a link).
     assert all(u["asin"] and u["marketplace"] == "US" for u in report.unranked)
+
+
+# ---------------------------------------------------------------------------
+# FIX (follow-up) — a hard gate that FAILED on PRESENT evidence (e.g. G1 with a
+# real profit model below threshold) must EXCLUDE the survivor from ranking,
+# never ride through as an unvalidated finalist. A gate that failed only for a
+# MISSING input keeps the "ranked LOW, pending" behaviour.
+# ---------------------------------------------------------------------------
+def _new_scan(conn, profile) -> str:  # type: ignore[no-untyped-def]
+    run_id = repository.insert_run(conn, command="scan", input_="US")
+    return repository.create_scan(
+        conn,
+        run_id=run_id,
+        marketplaces=["US"],
+        profile_id=profile.id,
+        profile_name=profile.name,
+        params="{}",
+    )
+
+
+def _seed_scored(conn, scan_id, asin, opp, *, data=None) -> None:  # type: ignore[no-untyped-def]
+    repository.upsert_scan_candidate(
+        conn,
+        scan_id=scan_id,
+        asin=asin,
+        marketplace="US",
+        outcome="scored",
+        stage_reached=4,
+        cheap_score=opp,
+        opportunity_score=opp,
+        confidence="low",
+        verdict="avoid",
+        data=data or {},
+    )
+
+
+_G1_BLOCK = {
+    "gate_block": {
+        "gate": "G1",
+        "reason": "gate failed: G1 Profit gate (margin 3% vs required margin ≥ 30%)",
+    }
+}
+
+
+def test_present_evidence_gate_failure_is_excluded_not_ranked(initialized_db: Path) -> None:
+    from delium.discovery.daily_scan import _stage_rank, build_report
+
+    with get_connection() as conn:
+        profile = _profile(conn)
+        scan_id = _new_scan(conn, profile)
+        _seed_scored(conn, scan_id, "B0GOOD0001", 70.0)  # no gate block → ranks
+        _seed_scored(conn, scan_id, "B0BADG0001", 68.0, data=_G1_BLOCK)  # G1 on real numbers
+        conn.commit()
+
+        out = _stage_rank(conn, scan_id, ScanParams(marketplaces=("US",), top_n=5), CFG, profile)
+        assert out.output_count == 1  # only the un-blocked survivor ranks
+
+        ranked = repository.get_scan_candidates(conn, scan_id, outcome="ranked")
+        assert [c["asin"] for c in ranked] == ["B0GOOD0001"]
+
+        blocked = next(
+            c
+            for c in repository.get_scan_candidates(conn, scan_id, outcome="scored")
+            if c["asin"] == "B0BADG0001"
+        )
+        assert blocked["sellability"] is None  # excluded — not scored on sellability
+        assert blocked["reason"].startswith("Excluded — gate failed: G1")
+        assert "30%" in blocked["reason"]  # the required threshold is shown
+
+        report = build_report(conn, scan_id)
+    assert report.breakdown.get("excluded — gate failed (G1)") == 1
+    excluded = next(u for u in report.unranked if u["asin"] == "B0BADG0001")
+    assert "gate failed: G1" in excluded["reason"] and excluded["marketplace"] == "US"
+
+
+def test_missing_input_gate_keeps_ranked_low_with_pending_label(initialized_db: Path) -> None:
+    from delium.discovery.daily_scan import _stage_rank
+
+    with get_connection() as conn:
+        profile = _profile(conn)
+        scan_id = _new_scan(conn, profile)
+        # G1 could not be evaluated (no profit model) → pending, NOT a block.
+        _seed_scored(conn, scan_id, "B0PEND0001", 60.0, data={"gate_pending": ["G1"]})
+        conn.commit()
+
+        out = _stage_rank(conn, scan_id, ScanParams(marketplaces=("US",), top_n=5), CFG, profile)
+        assert out.output_count == 1  # still ranked (missing = unknown)
+
+        ranked = repository.get_scan_candidates(conn, scan_id, outcome="ranked")
+        assert [c["asin"] for c in ranked] == ["B0PEND0001"]
+        assert ranked[0]["sellability"] is not None
+        assert "pending: profit model" in ranked[0]["reason"]
+
+
+def test_mixed_batch_excludes_gate_failure_and_keeps_order(initialized_db: Path) -> None:
+    from delium.discovery.daily_scan import _stage_rank
+
+    with get_connection() as conn:
+        profile = _profile(conn)
+        scan_id = _new_scan(conn, profile)
+        _seed_scored(conn, scan_id, "B0HIGH0002", 80.0)  # best sellability → rank 1
+        _seed_scored(conn, scan_id, "B0MID00001", 70.0)  # → rank 2
+        _seed_scored(conn, scan_id, "B0BEST0003", 95.0, data=_G1_BLOCK)  # highest opp, but excluded
+        conn.commit()
+
+        _stage_rank(conn, scan_id, ScanParams(marketplaces=("US",), top_n=5), CFG, profile)
+        ranked = repository.get_scan_candidates(conn, scan_id, outcome="ranked")
+
+    by_rank = sorted(ranked, key=lambda c: c["rank"])
+    # The highest-opportunity product is EXCLUDED (G1 on real numbers), and the
+    # remaining two rank by sellability — the gate decides membership, not score.
+    assert [c["asin"] for c in by_rank] == ["B0HIGH0002", "B0MID00001"]
+    assert all(c["asin"] != "B0BEST0003" for c in ranked)
