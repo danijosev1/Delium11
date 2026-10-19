@@ -131,7 +131,8 @@ export interface CrossMarketRow {
   title: string;
   source: Marketplace;
   target: Marketplace;
-  score: number;
+  /** null when the verdict is INSUFFICIENT_DATA (no target evidence to score). */
+  score: number | null;
   verdict:
     | "STRONG_OPPORTUNITY"
     | "OPPORTUNITY_TO_VALIDATE"
@@ -139,7 +140,7 @@ export interface CrossMarketRow {
     | "WEAK_TRANSFER"
     | "INSUFFICIENT_DATA";
   confidence: Confidence;
-  match: "EXACT" | "STRONG" | "PROBABLE" | "WEAK";
+  match: "EXACT" | "STRONG" | "PROBABLE" | "WEAK" | "UNMATCHED";
   note: string;
 }
 

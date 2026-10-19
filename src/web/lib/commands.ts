@@ -6,28 +6,91 @@ export interface CommandSpec {
   title: string;
   description: string;
   command: string;
-  keepsTokens?: number;
+  tokens?: number;
   usd?: number;
   llmUsd?: number;
   confirm: boolean;
   notes?: string[];
 }
 
+export interface ScanOptions {
+  enrichLimit?: number;
+  full?: boolean;
+  top?: number;
+  marketplaces?: string[];
+  zombies?: boolean;
+}
+
+/** Worst-case per-finalist costs from README §Daily Scan cost model. */
+const DATA_PER_FINALIST_LIGHT = 0.33;
+const DATA_PER_FINALIST_FULL = 3.03;
+const LLM_PER_FINALIST = 1.0;
+
 const fmt = (n: number) => (n === 0 ? "$0.00" : `$${n.toFixed(2)}`);
+
+/**
+ * Projected worst case for one marketplace. Each extra marketplace adds its own
+ * sweep + hydrate; the real CLI prints the exact figure in preflight.
+ */
+export function scanProjection(profile: ResearchProfile, o: ScanOptions = {}) {
+  const finalists = o.full ? o.top ?? 10 : o.enrichLimit ?? 5;
+  const sweepTokens = Math.round(profile.sweepSize * 0.15) + 11;
+  const hydrateTokens = profile.sweepSize * 2;
+  const competitorTokens = profile.competitorSets * 20;
+  const serpUsd = profile.competitorSets * 0.03;
+  const finalistUsd = finalists * (o.full ? DATA_PER_FINALIST_FULL : DATA_PER_FINALIST_LIGHT);
+  const llmUsd = finalists * LLM_PER_FINALIST;
+  return {
+    finalists,
+    sweepTokens,
+    hydrateTokens,
+    competitorTokens,
+    totalTokens: sweepTokens + hydrateTokens + competitorTokens,
+    serpUsd,
+    finalistUsd,
+    llmUsd,
+    totalUsd: serpUsd + finalistUsd + llmUsd,
+  };
+}
+
+/** Largest light-mode enrich limit (5 → 1) whose projection fits the profile's USD cap. */
+export function fittingEnrichLimit(profile: ResearchProfile): number {
+  for (let e = 5; e >= 1; e--) {
+    if (scanProjection(profile, { enrichLimit: e }).totalUsd <= profile.scanUsdCap) return e;
+  }
+  return 1;
+}
+
+export function scanCommand(profile: ResearchProfile, o: ScanOptions = {}): string {
+  const mps = (o.marketplaces ?? profile.marketplaces).join(",");
+  const parts = ["uv run delium scan", `--marketplaces ${mps}`];
+  if (o.top) parts.push(`--top ${o.top}`);
+  parts.push(
+    `--budget-cap ${profile.scanTokenCap}`,
+    `--max-spend ${profile.scanUsdCap}`,
+    `--sweep-size ${profile.sweepSize}`,
+    `--competitor-sets ${profile.competitorSets}`
+  );
+  parts.push(o.full ? "--full" : `--light --enrich-limit ${o.enrichLimit ?? 5}`);
+  if (o.zombies) parts.push("--zombies");
+  return parts.join(" ");
+}
 
 export function buildCommands(profile: ResearchProfile, product?: Product): CommandSpec[] {
   const mp = profile.marketplaces.join(",");
   const asin = product?.asin ?? "B0EXAMPLE1";
+  const enrich = fittingEnrichLimit(profile);
+  const scan = scanProjection(profile, { enrichLimit: enrich });
 
   return [
     {
       id: "discover",
       group: "Discovery",
       title: "Discover a niche",
-      description: "Related keywords → SERP top-10 → Keepa quick stats → Scout agent clusters candidates.",
+      description:
+        "Related keywords → SERP top-10 → Keepa quick stats → Scout agent clusters candidates.",
       command: `uv run delium discover "silicone baby food tray"`,
       usd: 0.3,
-      tokens: undefined,
       confirm: true,
       notes: ["Cheap and wide. No review fetching at this tier."],
     },
@@ -35,7 +98,7 @@ export function buildCommands(profile: ResearchProfile, product?: Product): Comm
       id: "emerging",
       group: "Discovery",
       title: "Emerging products",
-      description: "Keepa Product Finder sweep across BSR sub-bands, then emerging→scoring.",
+      description: "Keepa Product Finder sweep across BSR sub-bands, then the existing kills + scoring.",
       command: `uv run delium emerging --marketplaces ${mp}`,
       tokens: 210,
       usd: 0,
@@ -47,19 +110,22 @@ export function buildCommands(profile: ResearchProfile, product?: Product): Comm
       title: "Daily Scan (light)",
       description:
         "Resumable, budget-gated funnel: sweep → hydrate → hard kill → cheap score → competitor sets → rank → finalists.",
-      command: `uv run delium scan --marketplaces ${mp} --budget-cap ${profile.scanTokenCap} --max-spend ${profile.scanUsdCap} --sweep-size ${profile.sweepSize} --competitor-sets ${profile.competitorSets} --light`,
-      tokens: profile.scanTokenCap,
-      usd: 6.65,
-      llmUsd: 5,
+      command: scanCommand(profile, { enrichLimit: enrich }),
+      tokens: scan.totalTokens,
+      usd: Math.round((scan.serpUsd + scan.finalistUsd) * 100) / 100,
+      llmUsd: scan.llmUsd,
       confirm: true,
-      notes: ["Light mode finalists ≈ $6.65 worst case, typically ~$1–2 with a warm cache."],
+      notes: [
+        `Enrich limit ${enrich} is the largest that fits your ${fmt(profile.scanUsdCap)} cap on the worst-case projection.`,
+        "Typically ~$1–2 per scan with a warm cache.",
+      ],
     },
     {
       id: "validate",
       group: "Validation",
       title: `Validate ${asin}`,
       description:
-        "The deep dive: fetch (target + 20 competitors + ~400 reviews) → deterministic compute → Analyst + Review Miner + Strategist → report.",
+        "The deep dive: target + 20 competitors + ~400 reviews → deterministic compute → Analyst + Review Miner + Strategist → report.",
       command: `uv run delium validate ${asin}`,
       usd: 2.5,
       llmUsd: 1.0,
@@ -84,13 +150,13 @@ export function buildCommands(profile: ResearchProfile, product?: Product): Comm
       command: `uv run delium calibrate --refresh`,
       tokens: 2,
       confirm: true,
-      notes: ["Diagnostic only — it never changes a curve, fee, weight, kill or gate."],
+      notes: ["~2 tokens per product. Diagnostic only — never changes a curve, fee, weight, kill or gate."],
     },
     {
       id: "zombies",
       group: "Signals",
       title: "Zombie listings",
-      description: "Out-of-stock long-term, strongly reviewed, proven past demand — verified demand proof.",
+      description: "Out of stock long-term, strongly reviewed, proven past demand — verified demand proof.",
       command: `uv run delium zombies --marketplaces ${mp} --check-demand`,
       tokens: 420,
       usd: 0.6,
@@ -115,7 +181,7 @@ export function buildCommands(profile: ResearchProfile, product?: Product): Comm
       confirm: false,
     },
     {
-      id: "schedule stats",
+      id: "schedule-status",
       group: "Maintenance",
       title: "Scheduler status",
       description: "macOS launchd agent state, run times, last run and log tail.",
@@ -144,30 +210,10 @@ export function buildCommands(profile: ResearchProfile, product?: Product): Comm
   ];
 }
 
-export function scanProjection(profile: ResearchProfile) {
-  const sweepTokens = Math.round(profile.sweepSize * 0.15) + 11;
-  const hydrateTokens = profile.sweepSize * 2;
-  const competitorTokens = profile.competitorSets * 20;
-  const serpUsd = profile.competitorSets * 0.03;
-  const lightFinalists = 5;
-  const finalistUsd = lightFinalists * 0.33;
-  const llmUsd = lightFinalists * 1.0;
-  return {
-    sweepTokens,
-    hydrateTokens,
-    competitorTokens,
-    totalTokens: sweepTokens + hydrateTokens + competitorTokens,
-    serpUsd,
-    finalistUsd,
-    llmUsd,
-    totalUsd: serpUsd + finalistUsd + llmUsd,
-  };
-}
-
 export function formatCostLine(c: CommandSpec) {
   const parts: string[] = [];
   if (c.tokens) parts.push(`${c.tokens.toLocaleString()} Keepa tokens`);
-  if (c.usd != null) parts.push(`${fmt(c.usd)} data`);
+  if (c.usd) parts.push(`${fmt(c.usd)} data`);
   if (c.llmUsd) parts.push(`${fmt(c.llmUsd)} LLM`);
   return parts.length ? parts.join(" · ") : "free (cached / DB only)";
 }

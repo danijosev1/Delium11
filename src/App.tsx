@@ -1,3 +1,4 @@
+import React from "react";
 import { StoreProvider, useStore } from "./web/state/store";
 import { useHashRoute } from "./web/lib/router";
 import Sidebar, { MobileNav } from "./web/components/Sidebar";
@@ -23,7 +24,7 @@ function Shell() {
   const seg = path.split("/").filter(Boolean);
   const { activeProfile } = useStore();
 
-  let page;
+  let page: React.ReactNode;
   switch (seg[0]) {
     case undefined:
       page = <CommandCenter />;
@@ -46,7 +47,10 @@ function Shell() {
     default:
       page = (
         <div className="p-10 text-slate-600">
-          Page not found. <a href="#/" className="text-emerald-700 underline">Back to Command Center</a>
+          Page not found.{" "}
+          <a href="#/" className="text-emerald-700 underline">
+            Back to Command Center
+          </a>
         </div>
       );
   }
