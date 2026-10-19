@@ -63,7 +63,6 @@ import {
   cx,
   scoreTone,
 } from "../components/ui";
-import { Find } from "./_stub";
 
 export default function Workspace({ asin }: { asin?: string }) {
   const store = useStore();
@@ -92,7 +91,7 @@ export default function Workspace({ asin }: { asin?: string }) {
 }
 
 function Picker() {
-  const { products } = useStore();
+  const { products, activeProfile } = useStore();
   return (
     <div className="mx-auto max-w-7xl space-y-6 p-4 md:p-8">
       <PageHeader
@@ -101,7 +100,7 @@ function Picker() {
       />
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         {products.map((p) => {
-          const a = analyse(p, useStore().activeProfile);
+          const a = analyse(p, activeProfile);
           return (
             <Card key={p.asin} className="flex flex-col p-4">
               <div className="flex gap-3">
@@ -541,7 +540,7 @@ function Keywords({ product }: { product: Product }) {
         <Stat
           label="Top share"
           value={pct(topShare)}
-          hint={concentrationFlag ? "> 60% → K15 keyword-concentration risk" : "spread across the cluster"}
+          hint={concentrationFlag ? "> 60% → keyword-concentration risk" : "spread across the cluster"}
         />
       </div>
 
@@ -550,8 +549,7 @@ function Keywords({ product }: { product: Product }) {
           <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />
           <p className="text-sm text-amber-900">
             Over 60% of the cluster volume sits in a single phrase — the risk engine applies a{" "}
-            <code className="font-mono">keyword_concentration</code> deduction of −
-            {CONFIG.pillars_placeholder ?? 15}.
+            <code className="font-mono">keyword_concentration</code> deduction of −15.
           </p>
         </Card>
       )}
